@@ -194,7 +194,7 @@ async def websocket_endpoint(
                 traceback.print_exc()
                 try:
                     await send_message(websocket, "error", {"message": str(e)})
-                except:
+                except Exception:
                     pass  # Connection already closed
                 break  # Exit loop on error
 

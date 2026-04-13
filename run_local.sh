@@ -35,7 +35,7 @@ mkdir -p volumes data/recordings data/temp
 # Run the application
 export PORT=${PORT:-8418}
 echo "Starting speaker diarization app locally..."
-echo "Web UI: http://localhost:$PORT/gradio"
+echo "Docs: http://localhost:$PORT/docs"
 echo "API: http://localhost:$PORT"
 echo "API Docs: http://localhost:$PORT/docs"
 echo ""

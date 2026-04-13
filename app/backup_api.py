@@ -240,7 +240,7 @@ async def list_profiles():
                     "segments_count": len(data.get("segments", [])),
                     "created_at": datetime.fromtimestamp(os.stat(filepath).st_ctime).isoformat()
                 })
-        except:
+        except (json.JSONDecodeError, OSError, KeyError):
             continue
 
     profiles.sort(key=lambda x: x["name"])
@@ -377,7 +377,7 @@ async def list_checkpoints(profile_name: str):
                     "segments_count": len(data.get("segments", [])),
                     "created_at": datetime.fromtimestamp(os.stat(filepath).st_ctime).isoformat()
                 })
-        except:
+        except (json.JSONDecodeError, OSError, KeyError):
             continue
 
     checkpoints.sort(key=lambda x: x["timestamp"], reverse=True)

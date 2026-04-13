@@ -71,7 +71,7 @@ class ConfigManager:
         Returns updated settings.
         """
         # Update settings object
-        current = self._settings.dict()
+        current = self._settings.model_dump()
         current.update(updates)
         self._settings = VoiceSettings(**current)
 
@@ -84,7 +84,7 @@ class ConfigManager:
         """Save settings to config file"""
         os.makedirs(os.path.dirname(self.config_file), exist_ok=True)
         with open(self.config_file, 'w') as f:
-            json.dump(self._settings.dict(), f, indent=2)
+            json.dump(self._settings.model_dump(), f, indent=2)
 
 
 # Global config manager instance

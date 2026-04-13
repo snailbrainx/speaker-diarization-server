@@ -44,7 +44,7 @@ COPY app/ /app/app/
 RUN mkdir -p /app/data /app/volumes /app/backups
 
 # Expose port
-EXPOSE 8000
+EXPOSE 8418
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1

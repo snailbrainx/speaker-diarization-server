@@ -88,9 +88,9 @@ async def update_conversation(
     if not conversation:
         raise HTTPException(status_code=404, detail="Conversation not found")
 
-    if update_data.title:
+    if update_data.title is not None:
         conversation.title = update_data.title
-    if update_data.status:
+    if update_data.status is not None:
         conversation.status = update_data.status
 
     db.commit()
@@ -139,9 +139,11 @@ async def reprocess_conversation(
     speakers = db.query(Speaker).all()
     known_speakers = [(s.id, s.name, s.get_embedding()) for s in speakers]
 
-    # Process audio (works with both WAV and MP3!)
-    # Threshold from .env - optimal default 0.20 based on ground truth testing (0 misidentifications + 50% matching)
-    threshold = float(os.getenv("SPEAKER_THRESHOLD", "0.20"))
+    # Get threshold from config (consistent with all other endpoints)
+    from .config import get_config
+    config = get_config()
+    settings = config.get_settings()
+    threshold = settings.speaker_threshold
     result = await asyncio.to_thread(
         engine.transcribe_with_diarization,
         conversation.audio_path,

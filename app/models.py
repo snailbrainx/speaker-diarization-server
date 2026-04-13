@@ -204,7 +204,7 @@ class ConversationSegment(Base):
             try:
                 import json
                 return json.loads(self.words_data)
-            except:
+            except (json.JSONDecodeError, TypeError):
                 return None
         return None
 

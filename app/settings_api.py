@@ -58,7 +58,7 @@ async def update_voice_settings(updates: SettingsUpdateRequest):
     config = get_config()
 
     # Only include non-None values in update
-    update_dict = {k: v for k, v in updates.dict().items() if v is not None}
+    update_dict = {k: v for k, v in updates.model_dump().items() if v is not None}
 
     if not update_dict:
         raise HTTPException(status_code=400, detail="No settings provided to update")
@@ -81,7 +81,7 @@ async def reset_voice_settings():
     try:
         # Reset to defaults
         default_settings = VoiceSettings()
-        updated_settings = config.update_settings(default_settings.dict())
+        updated_settings = config.update_settings(default_settings.model_dump())
         return updated_settings
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error resetting settings: {str(e)}")

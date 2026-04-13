@@ -4,7 +4,7 @@ MCP (Model Context Protocol) API Endpoint
 Standard MCP server over HTTP (SSE transport) at /mcp endpoint.
 
 Allows AI agents to connect from anywhere on the network:
-- Flowise: {"url": "http://10.x.x.x:8000/mcp", "transport": "http"}
+- Flowise: {"url": "http://10.x.x.x:8418/mcp", "transport": "http"}
 - Other MCP clients via HTTP
 
 Features:
@@ -23,10 +23,17 @@ from typing import Optional, Any, Dict
 import httpx
 import json
 import asyncio
+import os
 from datetime import datetime
 
 from .database import get_db
 from .models import Speaker, Conversation, ConversationSegment
+
+
+def _get_base_url():
+    """Get the base URL for internal API calls."""
+    port = os.getenv("PORT", "8418")
+    return f"http://localhost:{port}/api/v1"
 
 
 router = APIRouter(tags=["MCP"])
@@ -105,7 +112,7 @@ async def identify_speaker_in_segment(
 
     System will automatically update all matching past segments.
     """
-    async with httpx.AsyncClient(base_url="http://localhost:8000/api/v1") as client:
+    async with httpx.AsyncClient(base_url=_get_base_url()) as client:
         try:
             response = await client.post(
                 f"/conversations/{conversation_id}/segments/{segment_id}/identify",
@@ -128,7 +135,7 @@ async def identify_speaker_in_segment(
             try:
                 error_data = e.response.json()
                 error_detail = error_data.get("detail", str(e))
-            except:
+            except Exception:
                 error_detail = e.response.text or str(e)
             return {"error": f"Failed to identify speaker: {error_detail}", "status_code": e.response.status_code}
         except httpx.HTTPError as e:
@@ -207,7 +214,7 @@ async def list_conversations(skip: int = 0, limit: int = 10, db: Session = None)
 
 async def rename_speaker(speaker_id: int, new_name: str) -> dict:
     """Rename speaker (updates all past segments)"""
-    async with httpx.AsyncClient(base_url="http://localhost:8000/api/v1") as client:
+    async with httpx.AsyncClient(base_url=_get_base_url()) as client:
         try:
             response = await client.patch(
                 f"/speakers/{speaker_id}/rename",
@@ -221,7 +228,7 @@ async def rename_speaker(speaker_id: int, new_name: str) -> dict:
 
 async def delete_speaker(speaker_id: int) -> dict:
     """Delete speaker profile"""
-    async with httpx.AsyncClient(base_url="http://localhost:8000/api/v1") as client:
+    async with httpx.AsyncClient(base_url=_get_base_url()) as client:
         try:
             response = await client.delete(f"/speakers/{speaker_id}")
             response.raise_for_status()
@@ -232,7 +239,7 @@ async def delete_speaker(speaker_id: int) -> dict:
 
 async def reprocess_conversation(conversation_id: int) -> dict:
     """Re-analyze conversation with current speaker profiles"""
-    async with httpx.AsyncClient(base_url="http://localhost:8000/api/v1") as client:
+    async with httpx.AsyncClient(base_url=_get_base_url()) as client:
         try:
             response = await client.post(f"/conversations/{conversation_id}/reprocess")
             response.raise_for_status()
@@ -243,7 +250,7 @@ async def reprocess_conversation(conversation_id: int) -> dict:
 
 async def update_conversation_title(conversation_id: int, title: str) -> dict:
     """Update conversation title"""
-    async with httpx.AsyncClient(base_url="http://localhost:8000/api/v1") as client:
+    async with httpx.AsyncClient(base_url=_get_base_url()) as client:
         try:
             response = await client.patch(
                 f"/conversations/{conversation_id}",
@@ -475,7 +482,7 @@ async def mcp_info():
         "tools_count": len(TOOLS),
         "connection": {
             "example": {
-                "url": "http://localhost:8000/mcp",
+                "url": f"http://localhost:{os.getenv('PORT', '8418')}/mcp",
                 "transport": "http"
             }
         }
