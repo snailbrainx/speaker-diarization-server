@@ -211,31 +211,9 @@ async def delete_speaker(speaker_id: int, db: Session = Depends(get_db)):
 @router.delete("/speakers/unknown/all")
 async def delete_all_unknown_speakers(db: Session = Depends(get_db)):
     """Delete all speakers with names starting with 'Unknown_'"""
-    from .models import SpeakerEmotionProfile, ConversationSegment
+    from .services import delete_unknown_speakers
 
-    unknown_speakers = db.query(Speaker).filter(
-        Speaker.name.like("Unknown_%")
-    ).all()
-
-    deleted_count = len(unknown_speakers)
-    speaker_ids = [s.id for s in unknown_speakers]
-
-    # 1. Set speaker_id to NULL in segments (SQLite FK constraint is NO ACTION, not SET NULL)
-    if speaker_ids:
-        db.query(ConversationSegment).filter(
-            ConversationSegment.speaker_id.in_(speaker_ids)
-        ).update({"speaker_id": None}, synchronize_session=False)
-
-    # 2. Delete emotion profiles
-    for speaker in unknown_speakers:
-        db.query(SpeakerEmotionProfile).filter(
-            SpeakerEmotionProfile.speaker_id == speaker.id
-        ).delete(synchronize_session=False)
-
-    # 3. Delete speakers
-    for speaker in unknown_speakers:
-        db.delete(speaker)
-
+    deleted_count, _ = delete_unknown_speakers(db)
     db.commit()
 
     return {
@@ -324,55 +302,15 @@ async def process_audio(
             )
 
         # Create conversation segments
+        from .services import create_segment_from_result
         for seg in result["segments"]:
-            # Determine speaker
-            speaker_id = None
-            speaker_name = seg["speaker"]
-            confidence = seg.get("confidence", 0.0)
-
-            if seg.get("is_known"):
-                # Find speaker by name
-                speaker = db.query(Speaker).filter(Speaker.name == speaker_name).first()
-                if speaker:
-                    speaker_id = speaker.id
-            else:
-                # Auto-enroll unknown speakers with embeddings (enables clustering)
-                embedding = seg.get("embedding")
-                if embedding is not None and speaker_name and speaker_name.startswith("Unknown_"):
-                    from .diarization import auto_enroll_unknown_speaker
-                    speaker_id, speaker_name = auto_enroll_unknown_speaker(
-                        embedding, db, threshold=threshold
-                    )
-                    # Update confidence since we're using the enrolled speaker
-                    confidence = 1.0 if speaker_id else confidence
-
-            # Serialize word-level data if available
-            words_json = json.dumps(seg["words"]) if seg.get("words") else None
-
-            segment = ConversationSegment(
+            create_segment_from_result(
+                seg=seg,
                 conversation_id=conversation.id,
-                speaker_id=speaker_id,
-                speaker_name=speaker_name,
-                text=seg.get("text", ""),
-                start_time=start_time + timedelta(seconds=seg["start"]),
-                end_time=start_time + timedelta(seconds=seg["end"]),
-                start_offset=seg["start"],
-                end_offset=seg["end"],
-                confidence=confidence,
-                emotion_category=seg.get("emotion_category"),
-                emotion_confidence=seg.get("emotion_confidence"),
-                detector_breakdown=json.dumps(seg["detector_breakdown"]) if seg.get("detector_breakdown") else None,
-                words_data=words_json,  # Include word-level confidence
-                avg_logprob=seg.get("avg_logprob")
+                conv_start=start_time,
+                db=db,
+                threshold=threshold,
             )
-
-            # Store embeddings for fast recalculation (no audio re-extraction needed)
-            if seg.get("embedding") is not None:
-                segment.set_speaker_embedding(seg["embedding"])
-            if seg.get("emotion_embedding") is not None:
-                segment.set_emotion_embedding(seg["emotion_embedding"])
-
-            db.add(segment)
 
         # Update conversation metadata
         conversation.status = "completed"
