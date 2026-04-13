@@ -3,6 +3,7 @@ from sqlalchemy.orm import Session
 from typing import List, Optional
 import os
 import shutil
+import asyncio
 from datetime import datetime, timedelta
 import json
 import torch
@@ -114,8 +115,8 @@ async def enroll_speaker(
         else:
             extraction_path = temp_path
 
-        # Extract embedding
-        embedding = engine.extract_embedding(extraction_path)
+        # Extract embedding (run in thread to avoid blocking event loop)
+        embedding = await asyncio.to_thread(engine.extract_embedding, extraction_path)
 
         # Create speaker in database
         speaker = Speaker(name=name)
@@ -305,16 +306,18 @@ async def process_audio(
         settings = config.get_settings()
         threshold = settings.speaker_threshold
 
-        # Process audio with transcription
+        # Process audio with transcription (run in thread to avoid blocking event loop)
         if enable_transcription:
-            result = engine.transcribe_with_diarization(
+            result = await asyncio.to_thread(
+                engine.transcribe_with_diarization,
                 file_path,
                 known_speakers,
                 threshold=threshold,
                 db_session=db
             )
         else:
-            result = engine.process_audio_with_recognition(
+            result = await asyncio.to_thread(
+                engine.process_audio_with_recognition,
                 file_path,
                 known_speakers,
                 threshold=threshold

@@ -171,9 +171,30 @@ async def root():
 if __name__ == "__main__":
     # Start FastAPI server
     print("Starting server...")
+
+    # Check for SSL certificates (enables HTTPS/WSS)
+    # Try local path first, then Docker path
+    script_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    local_cert = os.path.join(script_dir, "certs", "cert.pem")
+    local_key = os.path.join(script_dir, "certs", "key.pem")
+
+    if os.path.exists(local_cert) and os.path.exists(local_key):
+        ssl_cert, ssl_key = local_cert, local_key
+    else:
+        ssl_cert = "/app/certs/cert.pem"
+        ssl_key = "/app/certs/key.pem"
+
+    ssl_opts = {}
+    if os.path.exists(ssl_cert) and os.path.exists(ssl_key):
+        ssl_opts = {"ssl_certfile": ssl_cert, "ssl_keyfile": ssl_key}
+        print("🔒 SSL enabled - server will use HTTPS/WSS")
+    else:
+        print("⚠️  No SSL certs found - server will use HTTP/WS")
+
     uvicorn.run(
         app,
         host="0.0.0.0",
-        port=8000,
-        log_level="info"
+        port=int(os.getenv("PORT", "8418")),
+        log_level="info",
+        **ssl_opts
     )

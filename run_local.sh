@@ -18,6 +18,7 @@ export WHISPER_CACHE_DIR="$SCRIPT_DIR/volumes/whisper_cache"
 # Set data paths for local development (not Docker /app paths)
 export DATA_PATH="$SCRIPT_DIR/data"
 export VOLUMES_PATH="$SCRIPT_DIR/volumes"
+export DATABASE_URL="sqlite:///$SCRIPT_DIR/volumes/speakers.db"
 
 # Activate virtual environment
 source venv/bin/activate
@@ -32,7 +33,7 @@ echo "cuDNN/cuBLAS libraries: $CUDNN_PATH"
 mkdir -p volumes data/recordings data/temp
 
 # Run the application
-export PORT=${PORT:-8000}
+export PORT=${PORT:-8418}
 echo "Starting speaker diarization app locally..."
 echo "Web UI: http://localhost:$PORT/gradio"
 echo "API: http://localhost:$PORT"

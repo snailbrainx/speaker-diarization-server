@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import func
 from typing import List, Optional
 from datetime import datetime, timedelta
+import asyncio
 import json
 import os
 import subprocess
@@ -141,7 +142,8 @@ async def reprocess_conversation(
     # Process audio (works with both WAV and MP3!)
     # Threshold from .env - optimal default 0.20 based on ground truth testing (0 misidentifications + 50% matching)
     threshold = float(os.getenv("SPEAKER_THRESHOLD", "0.20"))
-    result = engine.transcribe_with_diarization(
+    result = await asyncio.to_thread(
+        engine.transcribe_with_diarization,
         conversation.audio_path,
         known_speakers,
         threshold=threshold,

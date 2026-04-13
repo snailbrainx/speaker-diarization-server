@@ -6,10 +6,9 @@ pydantic==2.11.0
 pydantic-settings==2.6.1
 
 # AI/ML dependencies
-# Note: Torch 2.8.x is installed separately in Dockerfile with CUDA support (cu126)
-# Required for pyannote.audio 4.0.x which depends on torchcodec (needs torch>=2.8.0)
+# Note: Torch 2.10.x is installed separately in Dockerfile with CUDA support (cu128)
+# PyTorch 2.10+ required for Blackwell (RTX 5090 sm_120) support
 # torch  - DO NOT UNCOMMENT - installed in Dockerfile
-# torchvision  - DO NOT UNCOMMENT - installed in Dockerfile
 # torchaudio  - DO NOT UNCOMMENT - installed in Dockerfile
 pyannote.audio==4.0.1
 huggingface_hub>=1.1.0

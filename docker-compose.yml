@@ -14,8 +14,10 @@ services:
       - WHISPER_LANGUAGE=${WHISPER_LANGUAGE:-en}
       - OFFLINE_MODE=${OFFLINE_MODE:-false}
     ports:
-      - "8418:8000"  # FastAPI backend API
+      - "8418:8418"  # FastAPI backend API
     volumes:
+      # SSL certificates for HTTPS/WSS
+      - ./certs:/app/certs:ro
       # Persistent storage for speaker database and embeddings
       - ./volumes:/app/volumes
       # Optional: Mount for audio files

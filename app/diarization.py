@@ -748,6 +748,11 @@ class SpeakerRecognitionEngine:
                 from pydub import AudioSegment
                 import tempfile
 
+                # Cap segment duration to avoid OOM in emotion2vec attention (O(n^2) memory)
+                max_emotion_duration = 30.0  # seconds
+                if (end_time - start_time) > max_emotion_duration:
+                    end_time = start_time + max_emotion_duration
+
                 # Extract segment to temporary file
                 audio = AudioSegment.from_file(audio_file)
                 start_ms = int(start_time * 1000)
@@ -780,6 +785,11 @@ class SpeakerRecognitionEngine:
                 import tempfile
 
                 audio = AudioSegment.from_file(audio_file)
+
+                # Cap duration to avoid OOM in emotion2vec attention (O(n^2) memory)
+                max_emotion_duration_ms = 30 * 1000
+                if len(audio) > max_emotion_duration_ms:
+                    audio = audio[:max_emotion_duration_ms]
 
                 # Resample to 16kHz if needed
                 if audio.frame_rate != 16000:

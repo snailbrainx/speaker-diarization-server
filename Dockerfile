@@ -20,10 +20,9 @@ RUN pip install --upgrade pip setuptools wheel
 
 # 1. Install PyTorch with CUDA support FIRST
 # This avoids downloading the huge default CPU wheels or reinstalling later
-# Using CUDA 12.6 wheels (backward compatible with CUDA 12.4)
-# PyTorch 2.8.x is required for pyannote.audio 4.0.x (torchcodec dependency)
-# Include torchcodec with GPU support for pyannote.audio's audio I/O
-RUN pip install torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 torchcodec==0.7.0 --index-url https://download.pytorch.org/whl/cu126
+# Using CUDA 12.8 wheels for Blackwell (RTX 5090 sm_120) support
+# PyTorch 2.10.x includes sm_120 arch support needed for RTX 5090
+RUN pip install torch==2.10.0 torchaudio==2.10.0 torchcodec==0.10.0 --index-url https://download.pytorch.org/whl/cu128
 
 # 2. Install CUDA libraries for faster-whisper / ctranslate2 and torchcodec
 # These are needed because we aren't using the nvidia/cuda base image
@@ -33,10 +32,9 @@ RUN pip install nvidia-cudnn-cu12==9.* nvidia-cublas-cu12 nvidia-npp-cu12
 # 3. Install remaining dependencies
 # Create constraints file to prevent torch packages from being reinstalled by other deps
 COPY requirements.txt .
-RUN echo "torch==2.8.0" > /tmp/constraints.txt && \
-    echo "torchvision==0.23.0" >> /tmp/constraints.txt && \
-    echo "torchaudio==2.8.0" >> /tmp/constraints.txt && \
-    echo "torchcodec==0.7.0" >> /tmp/constraints.txt && \
+RUN echo "torch==2.10.0" > /tmp/constraints.txt && \
+    echo "torchaudio==2.10.0" >> /tmp/constraints.txt && \
+    echo "torchcodec==0.10.0" >> /tmp/constraints.txt && \
     pip install --no-cache-dir -c /tmp/constraints.txt -r requirements.txt
 
 # Copy application code
