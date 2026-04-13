@@ -276,88 +276,38 @@ async def _handle_segment_processed(
 
         print(f"📝 Processing {len(result['segments'])} segment(s) from transcription")
 
+        from .services import create_segment_from_result
+
         for seg in result["segments"]:
-            # Determine speaker
-            speaker_id = None
-            speaker_name = seg["speaker"]
-            confidence = seg.get("confidence", 0.0)
-
-            if seg.get("is_known"):
-                speaker = db.query(Speaker).filter(Speaker.name == speaker_name).first()
-                if speaker:
-                    speaker_id = speaker.id
-            else:
-                # Auto-enroll unknown speakers with embeddings (enables clustering)
-                embedding = seg.get("embedding")
-                if embedding is not None and speaker_name and speaker_name.startswith("Unknown_"):
-                    from .diarization import auto_enroll_unknown_speaker
-                    speaker_id, speaker_name = auto_enroll_unknown_speaker(
-                        embedding, db, threshold=threshold
-                    )
-                    # Add newly enrolled speaker to cache (avoids cache invalidation)
-                    if speaker_id:
-                        engine.add_speaker_to_cache(
-                            speaker_id=speaker_id,
-                            speaker_name=speaker_name,
-                            embedding=embedding,
-                            profile_type='general'
-                        )
-                    # Update confidence since we're using the enrolled speaker
-                    confidence = 1.0 if speaker_id else confidence
-
-            # Adjust offsets relative to conversation start
-            seg_start_offset = start_offset + seg["start"]
-            seg_end_offset = start_offset + seg["end"]
-
-            # Serialize word-level data as JSON if available
-            words_json = None
-            if "words" in seg and seg["words"]:
-                words_json = json.dumps(seg["words"])
-
-            segment = ConversationSegment(
+            segment = create_segment_from_result(
+                seg=seg,
                 conversation_id=conversation_id,
-                speaker_id=speaker_id,
-                speaker_name=speaker_name,
-                text=seg["text"],
-                start_time=conv_start + timedelta(seconds=seg_start_offset),
-                end_time=conv_start + timedelta(seconds=seg_end_offset),
-                start_offset=seg_start_offset,
-                end_offset=seg_end_offset,
-                confidence=confidence,
-                emotion_category=seg.get("emotion_category"),
-                emotion_confidence=seg.get("emotion_confidence"),
-                detector_breakdown=json.dumps(seg["detector_breakdown"]) if seg.get("detector_breakdown") else None,
+                conv_start=conv_start,
+                db=db,
+                threshold=threshold,
                 segment_audio_path=segment_file,
-                words_data=words_json,
-                avg_logprob=seg.get("avg_logprob")
+                start_offset_base=start_offset,
+                engine=engine,
             )
-
-            # Store embeddings for fast recalculation (no audio re-extraction needed)
-            if seg.get("embedding") is not None:
-                segment.set_speaker_embedding(seg["embedding"])
-            if seg.get("emotion_embedding") is not None:
-                segment.set_emotion_embedding(seg["emotion_embedding"])
-
-            db.add(segment)
             db.flush()
 
-            # Ensure all numeric values are Python native types for JSON serialization
-            emotion_conf = seg.get("emotion_confidence")
+            # Build response data from the created segment object
+            emotion_conf = segment.emotion_confidence
             detector_breakdown = seg.get("detector_breakdown")
 
             segments_data.append({
                 "segment_id": segment.id,
-                "speaker_name": speaker_name,
-                "text": seg["text"],
-                "start_offset": float(seg_start_offset),
-                "end_offset": float(seg_end_offset),
-                "confidence": float(confidence) if confidence is not None else 0.0,
-                "emotion_category": seg.get("emotion_category"),
+                "speaker_name": segment.speaker_name,
+                "text": segment.text,
+                "start_offset": float(segment.start_offset),
+                "end_offset": float(segment.end_offset),
+                "confidence": float(segment.confidence) if segment.confidence is not None else 0.0,
+                "emotion_category": segment.emotion_category,
                 "emotion_confidence": float(emotion_conf) if emotion_conf is not None else None,
                 "detector_breakdown": convert_numpy_to_native(detector_breakdown) if detector_breakdown else None,
                 "is_known": seg.get("is_known", False),
-                "words": seg.get("words", []),  # Include word-level data
-                "avg_logprob": seg.get("avg_logprob")
+                "words": seg.get("words", []),
+                "avg_logprob": segment.avg_logprob
             })
 
         # Update conversation stats
