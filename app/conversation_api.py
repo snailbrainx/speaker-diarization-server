@@ -27,6 +27,7 @@ from .schemas import (
 )
 from .diarization import SpeakerRecognitionEngine
 from .api import get_engine
+from .config import get_config
 from .services import (
     create_segment_from_result,
     recalculate_speaker_embedding,
@@ -148,7 +149,6 @@ async def reprocess_conversation(
     known_speakers = [(s.id, s.name, s.get_embedding()) for s in speakers]
 
     # Get threshold from config (consistent with all other endpoints)
-    from .config import get_config
     config = get_config()
     settings = config.get_settings()
     threshold = settings.speaker_threshold
@@ -250,7 +250,6 @@ async def recalculate_emotions(
                 continue
 
             # Get speaker and their profiles
-            from .models import Speaker
             speaker = db.query(Speaker).filter(Speaker.id == segment.speaker_id).first()
 
             if speaker and speaker.emotion_profiles:
@@ -259,7 +258,7 @@ async def recalculate_emotions(
                 emotion_emb = emotion_data.get('embedding')
 
                 if voice_emb is not None and emotion_emb is not None:
-                    from .config import get_config
+                
                     global_threshold = get_config().get_settings().emotion_threshold
 
                     dual_result = engine.match_emotion_dual_detector(
@@ -491,7 +490,7 @@ async def identify_speaker_in_segment(
     
     # Check if speaker has emotion profiles
     if speaker.emotion_profiles:
-        from .config import get_config
+    
         
         # Build profile list for matching
         profiles = []
@@ -1063,7 +1062,7 @@ async def get_speaker_emotion_threshold(
     if not speaker:
         raise HTTPException(status_code=404, detail="Speaker not found")
 
-    from .config import get_config
+
     global_threshold = get_config().get_settings().emotion_threshold
 
     return {
@@ -1098,7 +1097,7 @@ async def set_speaker_emotion_threshold(
     speaker.emotion_threshold = threshold
     db.commit()
 
-    from .config import get_config
+
     global_threshold = get_config().get_settings().emotion_threshold
 
     return {
