@@ -320,8 +320,10 @@ async def process_audio(
         return conversation
 
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         conversation.status = "failed"
         db.commit()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Audio processing failed")
 
 

@@ -364,7 +364,7 @@ async def identify_speaker_in_segment(
         except Exception as e:
             raise HTTPException(
                 status_code=500,
-                detail=f"Failed to extract embedding: {str(e)}"
+                detail="Failed to extract speaker embedding"
             )
 
     # Get or create speaker
@@ -807,7 +807,9 @@ async def get_segment_audio(
         raise HTTPException(status_code=500, detail=f"Error extracting audio: {e.stderr}")
     except Exception as e:
         print(f"❌ Error: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail="Audio extraction failed")
 
 
 # ============================================================================
@@ -888,7 +890,7 @@ async def correct_emotion_in_segment(
             except Exception as e:
                 raise HTTPException(
                     status_code=500,
-                    detail=f"Failed to extract emotion embedding: {str(e)}"
+                    detail="Failed to extract emotion embedding"
                 )
         else:
             print(f"  ✓ Using cached emotion embedding for segment {segment_id}")
