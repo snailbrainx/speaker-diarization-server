@@ -225,7 +225,6 @@ async def delete_all_unknown_speakers(db: Session = Depends(get_db)):
 @router.post("/process", response_model=ConversationResponse)
 async def process_audio(
     audio_file: UploadFile = File(...),
-    enable_transcription: bool = Form(True),
     db: Session = Depends(get_db),
     engine: SpeakerRecognitionEngine = Depends(get_engine)
 ):
@@ -285,21 +284,13 @@ async def process_audio(
         threshold = settings.speaker_threshold
 
         # Process audio with transcription (run in thread to avoid blocking event loop)
-        if enable_transcription:
-            result = await asyncio.to_thread(
-                engine.transcribe_with_diarization,
-                file_path,
-                known_speakers,
-                threshold=threshold,
-                db_session=db
-            )
-        else:
-            result = await asyncio.to_thread(
-                engine.process_audio_with_recognition,
-                file_path,
-                known_speakers,
-                threshold=threshold
-            )
+        result = await asyncio.to_thread(
+            engine.transcribe_with_diarization,
+            file_path,
+            known_speakers,
+            threshold=threshold,
+            db_session=db
+        )
 
         # Create conversation segments
         from .services import create_segment_from_result

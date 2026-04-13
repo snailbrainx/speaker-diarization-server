@@ -12,7 +12,6 @@ import numpy as np
 from pyannote.audio import Pipeline, Model, Inference
 from sklearn.metrics.pairwise import cosine_similarity
 from typing import List, Dict, Tuple, Optional
-import os
 from faster_whisper import WhisperModel
 from concurrent.futures import ThreadPoolExecutor
 import time
@@ -21,6 +20,18 @@ import threading
 import queue
 import gc
 
+# Speaker matching constants
+FALLBACK_THRESHOLD_REDUCTION = 0.05
+MIN_FALLBACK_THRESHOLD = 0.20
+UNKNOWN_NAME_MAX_ATTEMPTS = 5
+
+# Emotion detection constants
+MIN_VOICE_SAMPLES = 3
+DUAL_DETECTOR_AGREE_D1 = 0.70
+DUAL_DETECTOR_AGREE_D2 = 0.80
+VOICE_STRONG_THRESHOLD = 0.85
+MAX_EMOTION_DURATION_SEC = 30.0
+MIN_SEGMENT_DURATION_SEC = 0.5
 
 
 def auto_enroll_unknown_speaker(embedding: np.ndarray, db_session, threshold: float = 0.30):
@@ -44,7 +55,7 @@ def auto_enroll_unknown_speaker(embedding: np.ndarray, db_session, threshold: fl
     # FIRST: Check ALL speakers (including enrolled ones like "Bob", "Alice") as safety fallback
     # Use slightly LOWER threshold (5% less) to catch borderline cases that transcribe_with_diarization missed
     # This prevents creating duplicate Unknowns for people already in the database
-    fallback_threshold = max(threshold - 0.05, 0.20)  # At least 0.20 (20%)
+    fallback_threshold = max(threshold - FALLBACK_THRESHOLD_REDUCTION, MIN_FALLBACK_THRESHOLD)
 
     all_speakers = db_session.query(Speaker).all()
     best_match = None
@@ -81,7 +92,7 @@ def auto_enroll_unknown_speaker(embedding: np.ndarray, db_session, threshold: fl
 
     # No match found - create new Unknown speaker with timestamp
     # Use microsecond precision for better uniqueness
-    max_attempts = 5
+    max_attempts = UNKNOWN_NAME_MAX_ATTEMPTS
     timestamp_name = None
 
     for attempt in range(max_attempts):
@@ -241,7 +252,7 @@ class SpeakerRecognitionEngine:
         Load all speaker profiles into memory cache (one-time DB query).
         Dramatically reduces DB overhead during streaming (153 queries → 1 query).
         """
-        import numpy as np
+
         from .models import Speaker, SpeakerEmotionProfile
 
         with self._cache_lock:
@@ -650,9 +661,7 @@ class SpeakerRecognitionEngine:
         context_padding: float = None
     ) -> list:
         """
-        Extract embeddings for multiple segments efficiently (WAV format required)
-
-        Essential for fast speaker embedding recalculation.
+        Extract embeddings for multiple segments efficiently.
 
         Args:
             segments: List of dicts with keys: 'audio_file', 'start_time', 'end_time'
@@ -662,53 +671,16 @@ class SpeakerRecognitionEngine:
             List of embeddings (numpy arrays) in same order as input segments
             Skips segments that fail extraction (returns None in that position)
         """
-        from pyannote.core import Segment
-        import soundfile as sf
-
         embeddings = []
-
-        # Use instance padding if not specified
-        if context_padding is None:
-            context_padding = self.context_padding
-
-        # Extract embeddings from WAV files
         for seg in segments:
-            audio_file = seg['audio_file']
-            start_time = seg['start_time']
-            end_time = seg['end_time']
-
             try:
-                # Get actual audio duration to prevent out-of-bounds
-                info = sf.info(audio_file)
-                duration = info.duration
-
-                # Add context padding for more reliable embeddings
-                padded_start = start_time - context_padding
-                padded_end = end_time + context_padding
-
-                # Clamp times to valid range with small safety margin
-                start_time = max(0, min(padded_start, duration - 0.5))
-                end_time = min(padded_end, duration - 0.01)
-
-                # If start is beyond end after clamping, adjust start
-                if start_time >= end_time:
-                    start_time = max(0, end_time - 0.5)
-
-                # Ensure segment is at least 0.1s
-                if end_time - start_time < 0.1:
-                    end_time = min(start_time + 0.1, duration - 0.01)
-                    if end_time - start_time < 0.1:
-                        start_time = max(0, end_time - 0.1)
-
-                segment = Segment(start_time, end_time)
-                with torch.no_grad():
-                    embedding = self.embedding_model.crop(audio_file, segment)
-                embeddings.append(np.array(embedding))
-
+                emb = self.extract_segment_embedding(
+                    seg['audio_file'], seg['start_time'], seg['end_time'], context_padding
+                )
+                embeddings.append(emb)
             except Exception as e:
-                print(f"⚠️ Could not extract embedding from {os.path.basename(seg['audio_file'])}: {e}")
+                print(f"Could not extract embedding from {os.path.basename(seg['audio_file'])}: {e}")
                 embeddings.append(None)
-
         return embeddings
 
     def extract_emotion(
@@ -749,9 +721,8 @@ class SpeakerRecognitionEngine:
                 import tempfile
 
                 # Cap segment duration to avoid OOM in emotion2vec attention (O(n^2) memory)
-                max_emotion_duration = 30.0  # seconds
-                if (end_time - start_time) > max_emotion_duration:
-                    end_time = start_time + max_emotion_duration
+                if (end_time - start_time) > MAX_EMOTION_DURATION_SEC:
+                    end_time = start_time + MAX_EMOTION_DURATION_SEC
 
                 # Extract segment to temporary file
                 audio = AudioSegment.from_file(audio_file)
@@ -787,7 +758,7 @@ class SpeakerRecognitionEngine:
                 audio = AudioSegment.from_file(audio_file)
 
                 # Cap duration to avoid OOM in emotion2vec attention (O(n^2) memory)
-                max_emotion_duration_ms = 30 * 1000
+                max_emotion_duration_ms = int(MAX_EMOTION_DURATION_SEC * 1000)
                 if len(audio) > max_emotion_duration_ms:
                     audio = audio[:max_emotion_duration_ms]
 
@@ -863,7 +834,7 @@ class SpeakerRecognitionEngine:
                 if extract_embedding and isinstance(res, dict):
                     feats = res.get('feats')
                     if feats is not None:
-                        import numpy as np
+                
                         # Convert to numpy array (1024-D from emotion2vec)
                         embedding = np.array(feats, dtype=np.float32)
                         emotion_data['embedding'] = embedding
@@ -887,72 +858,6 @@ class SpeakerRecognitionEngine:
             # Cleanup on error
             self.clear_gpu_cache_async("emotion_error")
             return None
-
-    def process_audio_with_recognition(
-        self,
-        audio_file: str,
-        known_speakers: List[Tuple[int, str, np.ndarray]],
-        threshold: float = 0.7
-    ) -> Dict:
-        """
-        Full pipeline: diarization + speaker recognition
-
-        Args:
-            audio_file: Path to audio file
-            known_speakers: List of (id, name, embedding) tuples
-            threshold: Similarity threshold for speaker matching
-
-        Returns:
-            Dictionary with segments and speaker identifications
-        """
-        # Step 1: Diarize
-        diarization_result = self.diarize(audio_file)
-
-        # Step 2: Match each segment to known speakers
-        segments_with_recognition = []
-        unknown_counter = 1
-
-        for segment in diarization_result["segments"]:
-            # Extract embedding for this segment
-            segment_embedding = self.extract_segment_embedding(
-                audio_file,
-                segment["start"],
-                segment["end"]
-            )
-
-            # Try to match to known speaker
-            match = self.match_speaker(segment_embedding, known_speakers, threshold)
-
-            if match:
-                speaker_id, speaker_name, confidence = match
-                segment_info = {
-                    **segment,
-                    "speaker_id": speaker_id,
-                    "speaker_name": speaker_name,
-                    "confidence": confidence,
-                    "is_known": True,
-                    "embedding": None  # Don't need to return embedding for known speakers
-                }
-            else:
-                # Unknown speaker - return embedding for auto-enrollment
-                segment_info = {
-                    **segment,
-                    "speaker_id": None,
-                    "speaker_name": f"Unknown_{unknown_counter:02d}",
-                    "confidence": 0.0,
-                    "is_known": False,
-                    "embedding": segment_embedding  # Return embedding for auto-enrollment
-                }
-                unknown_counter += 1
-
-            segments_with_recognition.append(segment_info)
-
-        return {
-            "segments": segments_with_recognition,
-            "num_speakers": diarization_result["num_speakers"],
-            "num_known": sum(1 for s in segments_with_recognition if s["is_known"]),
-            "num_unknown": sum(1 for s in segments_with_recognition if not s["is_known"])
-        }
 
     def transcribe_with_diarization(
         self,
@@ -1040,7 +945,7 @@ class SpeakerRecognitionEngine:
             # ALWAYS extract embeddings (needed for embedding verification and speaker matching)
             # Check if segment is long enough for embedding extraction
             segment_duration = trans_seg["end"] - trans_seg["start"]
-            if segment_duration < 0.5:
+            if segment_duration < MIN_SEGMENT_DURATION_SEC:
                 print(f"⏭️ Skipping embedding extraction (segment too short: {segment_duration:.2f}s)")
             else:
                 try:
@@ -1283,7 +1188,7 @@ class SpeakerRecognitionEngine:
         if db_session is None:
             return None
 
-        import numpy as np
+
         from sklearn.metrics.pairwise import cosine_similarity
         from .models import Speaker, SpeakerEmotionProfile
 
@@ -1369,7 +1274,7 @@ class SpeakerRecognitionEngine:
         generic_confidence=0.0
     ):
         """Dual-detector emotion matching using both emotion2vec and voice profiles"""
-        import numpy as np
+
         from sklearn.metrics.pairwise import cosine_similarity
 
         # Validate inputs
@@ -1419,7 +1324,7 @@ class SpeakerRecognitionEngine:
         voice_matches = []
         voice_best = None
         voice_best_confidence = 0.0
-        MIN_VOICE_SAMPLES = 3
+        # MIN_VOICE_SAMPLES defined at module level
 
         for profile in speaker_emotion_profiles:
             voice_emb = profile.get_voice_embedding()
@@ -1452,11 +1357,11 @@ class SpeakerRecognitionEngine:
         d2_emotion = detector2_result["emotion"]
         d2_conf = detector2_result["confidence"]
 
-        if d1_emotion == d2_emotion and d1_conf > 0.70 and d2_conf > 0.80:
+        if d1_emotion == d2_emotion and d1_conf > DUAL_DETECTOR_AGREE_D1 and d2_conf > DUAL_DETECTOR_AGREE_D2:
             final = {"emotion": d1_emotion, "confidence": float((d1_conf + d2_conf) / 2), "reason": "Both agree", "voice_profile_available": True}
         elif d1_emotion == "neutral" or d1_emotion == "<unk>":
             final = {"emotion": "neutral", "confidence": float(d1_conf), "reason": "emotion2vec neutral", "voice_profile_available": len(voice_matches) > 0}
-        elif d2_conf > 0.85:
+        elif d2_conf > VOICE_STRONG_THRESHOLD:
             final = {"emotion": d2_emotion, "confidence": float(d2_conf), "reason": f"Voice strong: {d2_emotion}", "voice_profile_available": True}
         elif d1_emotion != d2_emotion:
             final = {"emotion": "neutral", "confidence": float(max(d1_conf, d2_conf)), "reason": f"Disagree: {d1_emotion} vs {d2_emotion}", "voice_profile_available": len(voice_matches) > 0}
