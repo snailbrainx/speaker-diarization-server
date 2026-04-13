@@ -203,9 +203,9 @@ docker-compose logs -f
 ```
 
 **Access the application:**
-- API Documentation: http://localhost:8000/docs
-- API Endpoint: http://localhost:8000/api/v1
-- MCP Server: http://localhost:8000/mcp
+- API Documentation: http://localhost:8418/docs
+- API Endpoint: http://localhost:8418/api/v1
+- MCP Server: http://localhost:8418/mcp
 
 For a web interface, see the separate [Next.js frontend repository](https://github.com/snailbrainx/speaker_identity_nextjs).
 
@@ -249,7 +249,7 @@ If you're running the application on a remote server (e.g., headless Ubuntu serv
 **Using PowerShell or Command Prompt:**
 
 ```powershell
-ssh -L 8000:localhost:8000 username@remote-server-ip
+ssh -L 8000:localhost:8418 username@remote-server-ip
 ```
 
 **Using PuTTY:**
@@ -258,21 +258,21 @@ ssh -L 8000:localhost:8000 username@remote-server-ip
 2. Navigate to: **Connection → SSH → Tunnels**
 3. Add forwarding rule:
    - Source port: `8000`
-   - Destination: `localhost:8000`
+   - Destination: `localhost:8418`
    - Click "Add"
 4. Return to Session tab and connect
 
 **After connecting:**
 - Open browser on your Windows machine
-- Navigate to: `http://localhost:8000/docs` (API documentation)
+- Navigate to: `http://localhost:8418/docs` (API documentation)
 
 ### SSH Tunnel (Linux/Mac)
 
 ```bash
-ssh -L 8000:localhost:8000 username@remote-server-ip
+ssh -L 8000:localhost:8418 username@remote-server-ip
 ```
 
-Then access API docs at `http://localhost:8000/docs`.
+Then access API docs at `http://localhost:8418/docs`.
 
 ### Important Notes
 
@@ -688,8 +688,8 @@ Two independent VAD systems work together:
 
 ### API Overview
 
-**Base URL:** `http://localhost:8000/api/v1`
-**Interactive Docs:** `http://localhost:8000/docs` (Swagger UI with test interface)
+**Base URL:** `http://localhost:8418/api/v1`
+**Interactive Docs:** `http://localhost:8418/docs` (Swagger UI with test interface)
 
 **Key Endpoints:**
 
@@ -736,13 +736,13 @@ Two independent VAD systems work together:
   - `GET /profiles/download/{name}` - Download backup JSON
   - `POST /profiles/import` - Import backup JSON
 
-**📖 Full documentation with examples**: `http://localhost:8000/docs`
+**📖 Full documentation with examples**: `http://localhost:8418/docs`
 
 ### MCP Server Integration
 
 **Model Context Protocol (MCP)** enables AI assistants to directly interact with the speaker diarization system.
 
-**MCP Endpoint:** `http://localhost:8000/mcp`
+**MCP Endpoint:** `http://localhost:8418/mcp`
 **Protocol:** JSON-RPC 2.0 over HTTP with Server-Sent Events
 **Compatible With:** Claude Desktop, Flowise, custom MCP clients
 
@@ -770,7 +770,7 @@ Two independent VAD systems work together:
 {
   "mcpServers": {
     "speaker-diarization": {
-      "url": "http://localhost:8000/mcp",
+      "url": "http://localhost:8418/mcp",
       "transport": "http"
     }
   }
@@ -851,7 +851,7 @@ import requests
 # Process audio file
 with open("meeting.wav", "rb") as f:
     response = requests.post(
-        "http://localhost:8000/api/v1/process",
+        "http://localhost:8418/api/v1/process",
         files={"audio_file": f}
     )
 
@@ -871,13 +871,13 @@ for segment in conversation["segments"]:
   "mcpServers": {
     "speaker-diarization": {
       "command": "node",
-      "args": ["/path/to/mcp-proxy.js", "http://localhost:8000/mcp"]
+      "args": ["/path/to/mcp-proxy.js", "http://localhost:8418/mcp"]
     }
   }
 }
 ```
 
-**Flowise**: Add MCP node, set URL to `http://localhost:8000/mcp`
+**Flowise**: Add MCP node, set URL to `http://localhost:8418/mcp`
 
 ### Key Benefits
 
@@ -905,7 +905,7 @@ Rename any speaker → all past segments automatically update:
 
 ```bash
 # User identifies Unknown_01 as "Alice" in conversation 5
-curl -X POST "http://localhost:8000/api/v1/conversations/5/segments/123/identify?speaker_name=Alice&enroll=true"
+curl -X POST "http://localhost:8418/api/v1/conversations/5/segments/123/identify?speaker_name=Alice&enroll=true"
 
 # System automatically:
 # 1. Creates "Alice" speaker profile (if new)
