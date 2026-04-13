@@ -3,6 +3,7 @@ from sqlalchemy.orm import relationship
 from datetime import datetime
 from .database import Base
 import json
+import numpy as np
 
 class Speaker(Base):
     __tablename__ = "speakers"
@@ -17,17 +18,16 @@ class Speaker(Base):
     emotion_threshold = Column(Float, nullable=True)
 
     # Relationships
-    segments = relationship("Segment", back_populates="speaker")
     emotion_profiles = relationship("SpeakerEmotionProfile", back_populates="speaker", cascade="all, delete-orphan")
 
     def get_embedding(self):
         """Convert binary embedding back to numpy array"""
-        import numpy as np
+
         return np.frombuffer(self.embedding, dtype=np.float32)
 
     def set_embedding(self, embedding_array):
         """Convert numpy array to binary for storage"""
-        import numpy as np
+
         self.embedding = embedding_array.astype(np.float32).tobytes()
 
 
@@ -67,19 +67,19 @@ class SpeakerEmotionProfile(Base):
 
     def get_embedding(self):
         """Convert binary emotion embedding to numpy array"""
-        import numpy as np
+
         return np.frombuffer(self.embedding, dtype=np.float32)
 
     def set_embedding(self, embedding_array):
         """Convert numpy array to binary (emotion embedding)"""
-        import numpy as np
+
         self.embedding = embedding_array.astype(np.float32).tobytes()
     
     def get_voice_embedding(self):
         """Convert binary voice embedding to numpy array"""
         if self.voice_embedding is None:
             return None
-        import numpy as np
+
         return np.frombuffer(self.voice_embedding, dtype=np.float32)
     
     def set_voice_embedding(self, embedding_array):
@@ -87,37 +87,8 @@ class SpeakerEmotionProfile(Base):
         if embedding_array is None:
             self.voice_embedding = None
             return
-        import numpy as np
+
         self.voice_embedding = embedding_array.astype(np.float32).tobytes()
-
-
-class Recording(Base):
-    __tablename__ = "recordings"
-
-    id = Column(Integer, primary_key=True, index=True)
-    filename = Column(String, nullable=False)
-    duration = Column(Float)  # Duration in seconds
-    processed_at = Column(DateTime, default=datetime.utcnow)
-    status = Column(String, default="processing")  # processing, completed, failed
-
-    # Relationship to segments
-    segments = relationship("Segment", back_populates="recording", cascade="all, delete-orphan")
-
-
-class Segment(Base):
-    __tablename__ = "segments"
-
-    id = Column(Integer, primary_key=True, index=True)
-    recording_id = Column(Integer, ForeignKey("recordings.id"), nullable=False)
-    speaker_id = Column(Integer, ForeignKey("speakers.id"), nullable=True)  # Null if unknown
-    start_time = Column(Float, nullable=False)  # Start time in seconds
-    end_time = Column(Float, nullable=False)  # End time in seconds
-    confidence = Column(Float)  # Confidence score for speaker match
-    speaker_label = Column(String)  # e.g., "SPEAKER_00", "Unknown_01", or actual name
-
-    # Relationships
-    recording = relationship("Recording", back_populates="segments")
-    speaker = relationship("Speaker", back_populates="segments")
 
 
 class Conversation(Base):
@@ -212,7 +183,7 @@ class ConversationSegment(Base):
         """Convert binary speaker embedding back to numpy array"""
         if self.speaker_embedding is None:
             return None
-        import numpy as np
+
         return np.frombuffer(self.speaker_embedding, dtype=np.float32)
 
     def set_speaker_embedding(self, embedding_array):
@@ -220,14 +191,14 @@ class ConversationSegment(Base):
         if embedding_array is None:
             self.speaker_embedding = None
             return
-        import numpy as np
+
         self.speaker_embedding = embedding_array.astype(np.float32).tobytes()
 
     def get_emotion_embedding(self):
         """Convert binary emotion embedding back to numpy array"""
         if self.emotion_embedding is None:
             return None
-        import numpy as np
+
         return np.frombuffer(self.emotion_embedding, dtype=np.float32)
 
     def set_emotion_embedding(self, embedding_array):
@@ -235,7 +206,7 @@ class ConversationSegment(Base):
         if embedding_array is None:
             self.emotion_embedding = None
             return
-        import numpy as np
+
         self.emotion_embedding = embedding_array.astype(np.float32).tobytes()
 
 

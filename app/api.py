@@ -10,10 +10,9 @@ import torch
 from pydub import AudioSegment
 
 from .database import get_db
-from .models import Speaker, Recording, Segment, Conversation, ConversationSegment
+from .models import Speaker, Conversation, ConversationSegment
 from .schemas import (
     SpeakerCreate, SpeakerResponse, SpeakerRename,
-    RecordingResponse, SegmentResponse, DiarizationResult,
     StatusResponse, ConversationResponse
 )
 from .diarization import SpeakerRecognitionEngine
@@ -326,17 +325,3 @@ async def process_audio(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.get("/recordings", response_model=List[RecordingResponse])
-async def list_recordings(db: Session = Depends(get_db)):
-    """List all recordings"""
-    recordings = db.query(Recording).all()
-    return recordings
-
-
-@router.get("/recordings/{recording_id}", response_model=RecordingResponse)
-async def get_recording(recording_id: int, db: Session = Depends(get_db)):
-    """Get recording details with segments"""
-    recording = db.query(Recording).filter(Recording.id == recording_id).first()
-    if not recording:
-        raise HTTPException(status_code=404, detail="Recording not found")
-    return recording

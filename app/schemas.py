@@ -21,35 +21,6 @@ class SpeakerResponse(SpeakerBase):
 class SpeakerRename(BaseModel):
     new_name: str
 
-class SegmentResponse(BaseModel):
-    id: int
-    start_time: float
-    end_time: float
-    speaker_label: str
-    speaker_id: Optional[int]
-    confidence: Optional[float]
-
-    class Config:
-        from_attributes = True
-
-class RecordingResponse(BaseModel):
-    id: int
-    filename: str
-    duration: Optional[float]
-    status: str
-    processed_at: datetime
-    segments: List[SegmentResponse] = []
-
-    class Config:
-        from_attributes = True
-
-class DiarizationResult(BaseModel):
-    recording_id: int
-    num_speakers: int
-    num_known: int
-    num_unknown: int
-    segments: List[SegmentResponse]
-
 class StatusResponse(BaseModel):
     status: str
     message: str
