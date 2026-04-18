@@ -12,7 +12,7 @@ import json
 import os
 import tempfile
 
-from .database import get_db
+from .database import get_db, utc_now
 from .models import Conversation, ConversationSegment, Speaker, SpeakerEmotionProfile
 from .schemas import (
     ConversationResponse,
@@ -891,7 +891,7 @@ async def correct_emotion_in_segment(
     segment.emotion_category = corrected_emotion
     segment.emotion_confidence = 1.0  # Manual correction = 100% confidence
     segment.emotion_corrected = True
-    segment.emotion_corrected_at = datetime.utcnow()
+    segment.emotion_corrected_at = utc_now()
     db.flush()
 
     # CRITICAL: If changing from one emotion to another, recalculate OLD emotion profile
@@ -926,7 +926,7 @@ async def correct_emotion_in_segment(
 
             profile.set_embedding(merged_emb)
             profile.sample_count += 1
-            profile.updated_at = datetime.utcnow()
+            profile.updated_at = utc_now()
 
             sample_count = profile.sample_count
             print(f"✓ Merged segment {segment_id} into '{corrected_emotion}' profile (now {sample_count} emotion samples)")

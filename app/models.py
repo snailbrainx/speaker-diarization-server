@@ -1,7 +1,6 @@
 from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey, LargeBinary, Text, Boolean, UniqueConstraint
 from sqlalchemy.orm import relationship
-from datetime import datetime
-from .database import Base
+from .database import Base, utc_now
 import json
 import numpy as np
 
@@ -11,8 +10,8 @@ class Speaker(Base):
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String, unique=True, index=True, nullable=False)
     embedding = Column(LargeBinary, nullable=False)  # Stored as numpy array bytes
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=utc_now)
+    updated_at = Column(DateTime, default=utc_now, onupdate=utc_now)
 
     # Per-speaker emotion matching threshold (NULL = use global default)
     emotion_threshold = Column(Float, nullable=True)
@@ -54,8 +53,8 @@ class SpeakerEmotionProfile(Base):
     voice_sample_count = Column(Integer, default=0)  # How many voice samples in this emotion profile
     voice_threshold = Column(Float, nullable=True)  # Custom threshold for voice matching (NULL = use speaker/global)
 
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=utc_now)
+    updated_at = Column(DateTime, default=utc_now, onupdate=utc_now)
 
     # Unique constraint: one profile per speaker per emotion
     __table_args__ = (
@@ -99,7 +98,7 @@ class Conversation(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     title = Column(String, nullable=True)  # Auto-generated or user-set
-    start_time = Column(DateTime, nullable=False, default=datetime.utcnow)
+    start_time = Column(DateTime, nullable=False, default=utc_now)
     end_time = Column(DateTime, nullable=True)  # Null while recording
     duration = Column(Float, nullable=True)  # Duration in seconds
     status = Column(String, default="recording")  # recording, processing, completed, failed
@@ -107,7 +106,7 @@ class Conversation(Base):
     audio_format = Column(String, default="wav")  # wav or mp3
     num_segments = Column(Integer, default=0)
     num_speakers = Column(Integer, default=0)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=utc_now)
 
     # Relationships
     transcript_segments = relationship("ConversationSegment", back_populates="conversation", cascade="all, delete-orphan")
@@ -154,7 +153,7 @@ class ConversationSegment(Base):
     words_data = Column(Text, nullable=True)  # Stores JSON array of {word, start, end, probability}
     avg_logprob = Column(Float, nullable=True)  # Segment-level average log probability
 
-    processed_at = Column(DateTime, default=datetime.utcnow)
+    processed_at = Column(DateTime, default=utc_now)
 
     # Misidentification tracking
     is_misidentified = Column(Boolean, default=False, nullable=False)  # True if this segment was wrongly assigned to current speaker

@@ -4,12 +4,12 @@ from typing import List, Optional
 import os
 import shutil
 import asyncio
-from datetime import datetime, timedelta
+from datetime import timedelta
 import json
 import torch
 from pydub import AudioSegment
 
-from .database import get_db
+from .database import get_db, utc_now
 from .models import Speaker, Conversation, ConversationSegment
 from .schemas import (
     SpeakerResponse, SpeakerRename,
@@ -168,7 +168,7 @@ async def rename_speaker(
 
     old_name = speaker.name
     speaker.name = rename_data.new_name
-    speaker.updated_at = datetime.utcnow()
+    speaker.updated_at = utc_now()
 
     # UPDATE ALL PAST CONVERSATION SEGMENTS
     from .models import ConversationSegment
@@ -237,7 +237,7 @@ async def process_audio(
     # Save audio file
     data_path = os.getenv("DATA_PATH", "/app/data")
     os.makedirs(f"{data_path}/recordings", exist_ok=True)
-    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    timestamp = utc_now().strftime("%Y%m%d_%H%M%S")
 
     # Save uploaded file with timestamp (basename strips any directory component)
     base_filename = os.path.basename(audio_file.filename or "upload")
@@ -266,7 +266,7 @@ async def process_audio(
         file_path = temp_path
 
     # Create conversation entry
-    start_time = datetime.utcnow()
+    start_time = utc_now()
     conversation = Conversation(
         title=f"Uploaded: {audio_file.filename}",
         audio_path=file_path,

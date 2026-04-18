@@ -11,7 +11,7 @@ import asyncio
 from datetime import datetime, timedelta
 from typing import Dict, Optional
 
-from .database import SessionLocal, get_db
+from .database import SessionLocal, get_db, utc_now
 from .models import Conversation, ConversationSegment, Speaker
 from .streaming_recorder import StreamingRecorder
 from .config import get_config
@@ -55,7 +55,7 @@ async def send_message(websocket: WebSocket, message_type: str, data: dict):
             message = {
                 "type": message_type,
                 "data": data,
-                "timestamp": datetime.utcnow().isoformat()
+                "timestamp": utc_now().isoformat()
             }
             print(f"🔌 Sending WebSocket message: type={message_type}, data_keys={list(data.keys()) if isinstance(data, dict) else 'not-dict'}")
             await websocket.send_json(message)
@@ -100,7 +100,7 @@ async def websocket_endpoint(
         # Create conversation
         conversation = Conversation(
             title=f"Live Recording {datetime.now().strftime('%Y-%m-%d %H:%M')}",
-            start_time=datetime.utcnow(),
+            start_time=utc_now(),
             status="recording"
         )
         db.add(conversation)
@@ -365,7 +365,7 @@ async def _finalize_recording(
 
         # Update conversation status
         conversation.status = "completed"
-        conversation.end_time = datetime.utcnow()
+        conversation.end_time = utc_now()
 
         # Calculate duration
         if conversation.num_segments and conversation.num_segments > 0:

@@ -1,7 +1,18 @@
+from datetime import datetime, timezone
+
 from sqlalchemy import create_engine, inspect, text, event
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import declarative_base, sessionmaker
 import os
+
+
+def utc_now() -> datetime:
+    """Naive UTC datetime, matching the existing DateTime columns.
+
+    Replacement for the deprecated datetime.utcnow(). We store naive UTC
+    timestamps throughout the schema; callers that need aware datetimes
+    should attach `timezone.utc` themselves.
+    """
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./volumes/speakers.db")
 
