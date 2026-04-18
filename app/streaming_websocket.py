@@ -118,7 +118,6 @@ async def websocket_endpoint(
             sample_rate=48000,
             silence_threshold=0.005,
             silence_duration=settings.silence_duration,
-            max_workers=2
         )
 
         # Get event loop for scheduling async tasks from background threads
@@ -359,11 +358,10 @@ async def _finalize_recording(
     try:
         print(f"Finalizing recording for conversation {conversation_id}")
 
-        # Stop recorder and wait for queue to finish
-        recorder.stop_recording()
-
-        # Concatenate segments
-        full_audio_path = recorder.concatenate_segments()
+        # Both calls block for many seconds — run off the event loop so other
+        # clients aren't frozen while one user stops a recording.
+        await asyncio.to_thread(recorder.stop_recording)
+        full_audio_path = await asyncio.to_thread(recorder.concatenate_segments)
 
         if full_audio_path and os.path.exists(full_audio_path):
             # Keep WAV file (no MP3 conversion - WAV avoids pyannote 24ms boundary bug)
