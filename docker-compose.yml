@@ -5,6 +5,10 @@ services:
     environment:
       - NVIDIA_VISIBLE_DEVICES=${NVIDIA_VISIBLE_DEVICES:-all}
       - CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
+      # Without this, CUDA enumerates by FASTEST_FIRST and CUDA_VISIBLE_DEVICES
+      # indices stop matching nvidia-smi (e.g. index 0 would pick the 5090 even
+      # if you meant the 3090). PCI_BUS_ID keeps the two in sync.
+      - CUDA_DEVICE_ORDER=PCI_BUS_ID
       - DATABASE_URL=sqlite:////app/volumes/speakers.db
       - HF_TOKEN=${HF_TOKEN:-}
       - CORS_ORIGINS=${CORS_ORIGINS:-}

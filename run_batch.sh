@@ -18,6 +18,9 @@ export DATA_PATH="$SCRIPT_DIR/data"
 export VOLUMES_PATH="$SCRIPT_DIR/volumes"
 export DATABASE_URL="sqlite:///$SCRIPT_DIR/volumes/speakers.db"
 
+# Enumerate GPUs by PCI slot so CUDA_VISIBLE_DEVICES indices match nvidia-smi.
+export CUDA_DEVICE_ORDER=PCI_BUS_ID
+
 # Glob the interpreter-specific site-packages so this script isn't pinned
 # to a particular Python version.
 SITE_PACKAGES=$(echo "$SCRIPT_DIR"/venv/lib/python*/site-packages)

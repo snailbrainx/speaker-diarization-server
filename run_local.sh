@@ -17,6 +17,11 @@ export DATA_PATH="$SCRIPT_DIR/data"
 export VOLUMES_PATH="$SCRIPT_DIR/volumes"
 export DATABASE_URL="sqlite:///$SCRIPT_DIR/volumes/speakers.db"
 
+# Force CUDA to enumerate GPUs by PCI slot (matches nvidia-smi indices).
+# The default FASTEST_FIRST silently remaps CUDA_VISIBLE_DEVICES=0 onto
+# whichever card it considers fastest, which is rarely what you want.
+export CUDA_DEVICE_ORDER=PCI_BUS_ID
+
 source "$SCRIPT_DIR/venv/bin/activate"
 
 # faster-whisper/ctranslate2 need cuDNN + cuBLAS on LD_LIBRARY_PATH.
