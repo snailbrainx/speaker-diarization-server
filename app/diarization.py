@@ -1090,7 +1090,7 @@ class SpeakerRecognitionEngine:
                             emotion_data['emotion_category'] = final['emotion']
                             emotion_data['emotion_confidence'] = final['confidence']
 
-                            # Store detector breakdown for frontend display
+                            # Store detector breakdown for client display
                             emotion_data['detector_breakdown'] = dual_result
 
                             print(f"  🔬 Dual-Detector Results:")

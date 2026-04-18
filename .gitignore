@@ -52,8 +52,5 @@ Thumbs.db
 # SSL certificates
 certs/
 
-# Frontend (separate repository)
-anna-frontend/
-
 # Plan docs (local only)
 docs/superpowers/

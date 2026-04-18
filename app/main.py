@@ -138,14 +138,17 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# Add CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# CORS: internal-network-only by default. Set CORS_ORIGINS to a comma-separated
+# list of origins (e.g. "http://host:3000,http://host:8080") if a browser UI needs access.
+_cors_origins = [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
+if _cors_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_cors_origins,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
 # Include API routers
 app.include_router(router, prefix="/api/v1", tags=["Speaker Diarization"])
@@ -164,7 +167,6 @@ async def root():
         "docs": "/docs",
         "api": "/api/v1",
         "mcp": "/mcp (AI agent interface - JSON-RPC)",
-        "frontend": "http://localhost:3000/voice (Next.js UI)"
     }
 
 

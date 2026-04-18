@@ -275,7 +275,7 @@ async def recalculate_emotions(
                     final = dual_result['final_decision']
                     segment.emotion_category = final['emotion']
                     segment.emotion_confidence = final['confidence']
-                    segment.detector_breakdown = json.dumps(dual_result)  # Store breakdown for frontend
+                    segment.detector_breakdown = json.dumps(dual_result)  # Store breakdown for clients
                     updated_count += 1
                 else:
                     # Fall back to generic emotion2vec result

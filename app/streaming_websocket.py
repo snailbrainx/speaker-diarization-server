@@ -318,7 +318,7 @@ async def _handle_segment_processed(
         db.commit()
 
         # Send segments to client
-        print(f"📤 Sending {len(segments_data)} segment(s) to frontend")
+        print(f"📤 Sending {len(segments_data)} segment(s) to client")
         for seg_data in segments_data:
             print(f"   → Segment: {seg_data['speaker_name']}: {seg_data['text'][:50]}...")
             await send_message(websocket, "segment", seg_data)
