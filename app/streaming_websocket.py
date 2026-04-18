@@ -338,6 +338,9 @@ async def _handle_segment_processed(
 
     except Exception as e:
         print(f"Error processing segment: {e}")
+        import traceback
+        traceback.print_exc()
+        db.rollback()
         await send_message(websocket, "error", {"message": "Segment processing error"})
     finally:
         db.close()
@@ -367,20 +370,20 @@ async def _finalize_recording(
             conversation.audio_path = full_audio_path
             conversation.audio_format = "wav"
 
-        # Update conversation status
+        # The per-segment callback owns its own Session and commits there, so
+        # this handler's cached `conversation` instance is stale — refresh before
+        # reading num_segments (or the duration calculation short-circuits).
+        db.refresh(conversation)
+
         conversation.status = "completed"
         conversation.end_time = utc_now()
 
-        # Calculate duration
-        if conversation.num_segments and conversation.num_segments > 0:
-            last_segment = db.query(ConversationSegment).filter(
-                ConversationSegment.conversation_id == conversation_id
-            ).order_by(ConversationSegment.end_offset.desc()).first()
+        last_segment = db.query(ConversationSegment).filter(
+            ConversationSegment.conversation_id == conversation_id
+        ).order_by(ConversationSegment.end_offset.desc()).first()
+        if last_segment:
+            conversation.duration = last_segment.end_offset
 
-            if last_segment:
-                conversation.duration = last_segment.end_offset
-
-        # Count speakers
         speaker_count = db.query(ConversationSegment.speaker_name).filter(
             ConversationSegment.conversation_id == conversation_id
         ).distinct().count()
@@ -388,8 +391,7 @@ async def _finalize_recording(
 
         db.commit()
 
-        # Send completion message
-        if websocket and websocket.client_state.CONNECTED:
+        if websocket and websocket.client_state == WebSocketState.CONNECTED:
             await send_message(websocket, "completed", {
                 "conversation_id": conversation_id,
                 "num_segments": conversation.num_segments,
@@ -400,16 +402,15 @@ async def _finalize_recording(
 
         print(f"Recording finalized: {conversation.num_segments} segments, {conversation.num_speakers} speakers")
 
-        # Force GPU cleanup after recording stops (free up VRAM)
         engine = get_engine()
-        print(f"🧹 Forcing GPU cleanup after recording stop...")
-        engine.clear_gpu_cache()  # Blocking cleanup to free VRAM immediately
-        print(f"✅ GPU cleanup complete")
+        engine.clear_gpu_cache()
 
     except Exception as e:
         print(f"Error finalizing recording: {e}")
+        import traceback
+        traceback.print_exc()
         conversation.status = "failed"
         db.commit()
 
-        if websocket and websocket.client_state.CONNECTED:
-            await send_message(websocket, "error", {"message": f"Finalization error: {str(e)}"})
+        if websocket and websocket.client_state == WebSocketState.CONNECTED:
+            await send_message(websocket, "error", {"message": "Finalization error"})

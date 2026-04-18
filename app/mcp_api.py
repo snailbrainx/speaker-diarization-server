@@ -21,6 +21,7 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from sqlalchemy.orm import Session
 from typing import Optional, Any, Dict
 import inspect
+import typing
 import json
 import asyncio
 import os
@@ -32,8 +33,6 @@ from .models import Speaker, Conversation, ConversationSegment
 
 router = APIRouter(prefix="/mcp", tags=["MCP"])
 
-
-import typing
 
 _JSON_TYPE_BY_PY = {
     int: "integer",
@@ -52,18 +51,42 @@ def _unwrap_optional(annotation):
     return annotation
 
 
-def _params_schema(func, params):
-    """Build a JSON-Schema properties dict from a tool function's type hints."""
+def _json_type(annotation) -> dict:
+    """Map a Python annotation to a JSON-Schema type fragment."""
+    annotation = _unwrap_optional(annotation)
+    origin = typing.get_origin(annotation)
+    if origin in (list, tuple):
+        args = typing.get_args(annotation)
+        item_t = _unwrap_optional(args[0]) if args else str
+        return {"type": "array", "items": {"type": _JSON_TYPE_BY_PY.get(item_t, "string")}}
+    if origin is dict:
+        return {"type": "object"}
+    return {"type": _JSON_TYPE_BY_PY.get(annotation, "string")}
+
+
+def _params_schema(func, params) -> dict:
+    """Build a JSON-Schema object from a tool function's type hints.
+
+    Returns {"type": "object", "properties": {...}, "required": [...]} so MCP
+    clients can validate required vs optional inputs.
+    """
     sig = inspect.signature(func)
-    properties = {}
+    properties: Dict[str, dict] = {}
+    required = []
     for p in params:
         param = sig.parameters.get(p)
-        annotation = _unwrap_optional(param.annotation) if param else inspect.Parameter.empty
-        properties[p] = {"type": _JSON_TYPE_BY_PY.get(annotation, "string")}
-    return properties
+        annotation = param.annotation if param else inspect.Parameter.empty
+        properties[p] = _json_type(annotation)
+        if param is not None and param.default is inspect.Parameter.empty:
+            required.append(p)
+    schema: Dict[str, Any] = {"type": "object", "properties": properties}
+    if required:
+        schema["required"] = required
+    return schema
 
-# Store active SSE connections for ping
-active_connections: Dict[str, bool] = {}
+
+# SSE connection keep-alive registry (connection_id -> still_alive flag).
+_sse_connections: Dict[str, bool] = {}
 
 
 # ============================================================================
@@ -488,7 +511,7 @@ async def mcp_sse(request: Request):
     Maintains persistent connection for server notifications and ping/keepalive.
     """
     connection_id = f"conn_{datetime.now().timestamp()}"
-    active_connections[connection_id] = True
+    _sse_connections[connection_id] = True
 
     async def event_stream():
         try:
@@ -496,7 +519,7 @@ async def mcp_sse(request: Request):
             yield f"data: {json.dumps({'type': 'connection', 'status': 'connected'})}\n\n"
 
             # Keep connection alive with ping every 30 seconds
-            while active_connections.get(connection_id, False):
+            while _sse_connections.get(connection_id, False):
                 await asyncio.sleep(30)
 
                 # Check if client disconnected
@@ -510,7 +533,7 @@ async def mcp_sse(request: Request):
             pass
         finally:
             # Clean up connection
-            active_connections.pop(connection_id, None)
+            _sse_connections.pop(connection_id, None)
 
     return StreamingResponse(
         event_stream(),
@@ -555,10 +578,7 @@ async def mcp_rpc(body: Dict[str, Any] = Body(...), db: Session = Depends(get_db
                     {
                         "name": name,
                         "description": tool["description"],
-                        "inputSchema": {
-                            "type": "object",
-                            "properties": _params_schema(tool["function"], tool["params"]),
-                        },
+                        "inputSchema": _params_schema(tool["function"], tool["params"]),
                     }
                     for name, tool in TOOLS.items()
                 ]
@@ -592,7 +612,7 @@ async def mcp_rpc(body: Dict[str, Any] = Body(...), db: Session = Depends(get_db
 
             return JSONResponse({
                 "jsonrpc": "2.0",
-                "result": {"content": [{"type": "text", "text": str(result)}]},
+                "result": {"content": [{"type": "text", "text": json.dumps(result, default=str)}]},
                 "id": req_id
             })
 
