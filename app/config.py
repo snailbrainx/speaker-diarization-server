@@ -81,10 +81,13 @@ class ConfigManager:
         return self._settings
 
     def _save_settings(self):
-        """Save settings to config file"""
-        os.makedirs(os.path.dirname(self.config_file), exist_ok=True)
-        with open(self.config_file, 'w') as f:
+        """Save settings to config file atomically (tempfile + os.replace)."""
+        target_dir = os.path.dirname(self.config_file) or "."
+        os.makedirs(target_dir, exist_ok=True)
+        tmp_path = f"{self.config_file}.tmp"
+        with open(tmp_path, 'w') as f:
             json.dump(self._settings.model_dump(), f, indent=2)
+        os.replace(tmp_path, self.config_file)
 
 
 # Global config manager instance

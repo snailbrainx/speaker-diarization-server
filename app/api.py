@@ -88,10 +88,11 @@ async def enroll_speaker(
     if existing:
         raise HTTPException(status_code=400, detail=f"Speaker '{name}' already exists")
 
-    # Save audio file temporarily
+    # Save audio file temporarily (sanitize filename to prevent path traversal)
     data_path = os.getenv("DATA_PATH", "/app/data")
     os.makedirs(f"{data_path}/temp", exist_ok=True)
-    temp_path = f"{data_path}/temp/{audio_file.filename}"
+    safe_filename = os.path.basename(audio_file.filename or "upload")
+    temp_path = f"{data_path}/temp/{safe_filename}"
 
     with open(temp_path, "wb") as buffer:
         shutil.copyfileobj(audio_file.file, buffer)
@@ -236,8 +237,8 @@ async def process_audio(
     os.makedirs(f"{data_path}/recordings", exist_ok=True)
     timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
 
-    # Save uploaded file with timestamp
-    base_filename = audio_file.filename or "upload"
+    # Save uploaded file with timestamp (basename strips any directory component)
+    base_filename = os.path.basename(audio_file.filename or "upload")
     temp_filename = f"uploaded_{timestamp}_{base_filename}"
     temp_path = f"{data_path}/recordings/{temp_filename}"
 

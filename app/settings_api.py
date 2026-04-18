@@ -64,10 +64,14 @@ async def update_voice_settings(updates: SettingsUpdateRequest):
         raise HTTPException(status_code=400, detail="No settings provided to update")
 
     try:
-        updated_settings = config.update_settings(update_dict)
-        return updated_settings
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid settings: {str(e)}")
+        return config.update_settings(update_dict)
+    except ValueError as e:
+        # Pydantic validation errors — the message is user-facing data, safe to surface
+        raise HTTPException(status_code=400, detail=f"Invalid settings: {e}")
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail="Failed to update settings")
 
 
 @router.post("/voice/reset", response_model=VoiceSettings)
@@ -79,9 +83,9 @@ async def reset_voice_settings():
     """
     config = get_config()
     try:
-        # Reset to defaults
         default_settings = VoiceSettings()
-        updated_settings = config.update_settings(default_settings.model_dump())
-        return updated_settings
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error resetting settings: {str(e)}")
+        return config.update_settings(default_settings.model_dump())
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail="Error resetting settings")

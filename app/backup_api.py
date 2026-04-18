@@ -4,10 +4,12 @@ API endpoints for Voice Profiles and Checkpoints
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy.orm import Session
-from typing import List, Optional
+from typing import Optional
 from pydantic import BaseModel
 import json
 import os
+import re
+import traceback
 import numpy as np
 import zipfile
 import io
@@ -15,8 +17,12 @@ from datetime import datetime
 
 from .database import get_db
 from .models import Speaker, ConversationSegment, SpeakerEmotionProfile
+from .config import get_config
 
 router = APIRouter(prefix="/profiles", tags=["Voice Profiles"])
+
+_BACKUPS_DIR = "backups"
+_TIMESTAMP_RE = re.compile(r"^\d{8}_\d{6}$")
 
 
 class CreateProfileRequest(BaseModel):
@@ -33,10 +39,20 @@ def sanitize_filename(name: str) -> str:
     return "".join(c for c in name if c.isalnum() or c in (' ', '-', '_')).strip().replace(' ', '_')
 
 
+def _safe_backup_path(filename: str) -> str:
+    """
+    Resolve `filename` inside the backups directory and guarantee the result
+    stays inside it. Rejects any path that escapes via traversal or absolute paths.
+    """
+    backups_abs = os.path.realpath(_BACKUPS_DIR)
+    candidate = os.path.realpath(os.path.join(_BACKUPS_DIR, filename))
+    if candidate != backups_abs and not candidate.startswith(backups_abs + os.sep):
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    return candidate
+
+
 def save_current_state(profile_name: str, description: str, db: Session):
     """Save current speaker/segment state to profile file"""
-    from .config import get_config
-
     safe_name = sanitize_filename(profile_name)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -117,20 +133,19 @@ def save_current_state(profile_name: str, description: str, db: Session):
 
 
 @router.post("")
-@router.post("/")
 async def create_profile(
     request: CreateProfileRequest,
     db: Session = Depends(get_db)
 ):
     """Create a new EMPTY voice profile with default settings"""
-    from .config import get_config, VoiceSettings
+    from .config import VoiceSettings
 
     try:
         safe_name = sanitize_filename(request.name)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-        os.makedirs("backups", exist_ok=True)
-        profile_file = f"backups/profile_{safe_name}.json"
+        os.makedirs(_BACKUPS_DIR, exist_ok=True)
+        profile_file = f"{_BACKUPS_DIR}/profile_{safe_name}.json"
 
         # Get default settings (not current settings!)
         default_settings = VoiceSettings()
@@ -164,8 +179,9 @@ async def create_profile(
             "segments_count": 0,
             "timestamp": timestamp
         }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to create profile: {str(e)}")
+    except Exception:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail="Failed to create profile")
 
 
 @router.post("/duplicate")
@@ -182,8 +198,9 @@ async def duplicate_profile(
             "description": request.description or "",
             **result
         }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to duplicate profile: {str(e)}")
+    except Exception:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail="Failed to duplicate profile")
 
 
 @router.patch("/{profile_name}")
@@ -211,12 +228,12 @@ async def update_profile(
             "description": description,
             **result
         }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to update profile: {str(e)}")
+    except Exception:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail="Failed to update profile")
 
 
 @router.get("")
-@router.get("/")
 async def list_profiles():
     """List all voice profiles"""
     if not os.path.exists("backups"):
@@ -276,8 +293,6 @@ async def delete_profile(profile_name: str):
 @router.post("/{profile_name}/checkpoints")
 async def create_checkpoint(profile_name: str, db: Session = Depends(get_db)):
     """Create a checkpoint (snapshot) of current profile state"""
-    from .config import get_config
-
     try:
         safe_name = sanitize_filename(profile_name)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -348,8 +363,9 @@ async def create_checkpoint(profile_name: str, db: Session = Depends(get_db)):
             "segments_count": len(segments)
         }
 
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to create checkpoint: {str(e)}")
+    except Exception:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail="Failed to create checkpoint")
 
 
 @router.get("/{profile_name}/checkpoints")
@@ -387,22 +403,28 @@ async def list_checkpoints(profile_name: str):
 @router.delete("/{profile_name}/checkpoints/{timestamp}")
 async def delete_checkpoint(profile_name: str, timestamp: str):
     """Delete a specific checkpoint"""
+    if not _TIMESTAMP_RE.match(timestamp):
+        raise HTTPException(status_code=400, detail="Invalid timestamp format")
+
     safe_name = sanitize_filename(profile_name)
-    checkpoint_file = f"backups/checkpoint_{safe_name}_{timestamp}.json"
+    checkpoint_file = _safe_backup_path(f"checkpoint_{safe_name}_{timestamp}.json")
 
     if not os.path.exists(checkpoint_file):
         raise HTTPException(status_code=404, detail="Checkpoint not found")
 
     os.remove(checkpoint_file)
-    return {"message": f"Checkpoint deleted"}
+    return {"message": "Checkpoint deleted"}
 
 
 @router.post("/restore")
 async def restore_from_file(filename: str, db: Session = Depends(get_db)):
     """Restore speakers/segments from a profile or checkpoint file"""
-    from .config import get_config
+    # Only allow profile/checkpoint JSON files inside the backups directory.
+    base = os.path.basename(filename)
+    if not (base.startswith("profile_") or base.startswith("checkpoint_")) or not base.endswith(".json"):
+        raise HTTPException(status_code=400, detail="Invalid filename")
 
-    filepath = os.path.join("backups", filename)
+    filepath = _safe_backup_path(base)
 
     if not os.path.exists(filepath):
         raise HTTPException(status_code=404, detail="File not found")
@@ -502,9 +524,10 @@ async def restore_from_file(filename: str, db: Session = Depends(get_db)):
             "segments_updated": segments_updated
         }
 
-    except Exception as e:
+    except Exception:
         db.rollback()
-        raise HTTPException(status_code=500, detail=f"Restore failed: {str(e)}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail="Restore failed")
 
 
 @router.get("/download/{profile_name}")
@@ -579,5 +602,6 @@ async def import_profile(file: UploadFile = File(...)):
 
     except json.JSONDecodeError:
         raise HTTPException(status_code=400, detail="Invalid JSON file")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Import failed: {str(e)}")
+    except Exception:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail="Import failed")

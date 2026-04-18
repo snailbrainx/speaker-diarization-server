@@ -804,7 +804,7 @@ async def get_segment_audio(
 
     except subprocess.CalledProcessError as e:
         print(f"❌ FFmpeg error: {e.stderr}")
-        raise HTTPException(status_code=500, detail=f"Error extracting audio: {e.stderr}")
+        raise HTTPException(status_code=500, detail="Audio extraction failed")
     except Exception as e:
         print(f"❌ Error: {str(e)}")
         import traceback
