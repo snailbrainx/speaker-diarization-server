@@ -737,15 +737,15 @@ class SpeakerRecognitionEngine:
                     segment.export(temp_file.name, format='wav')
                     temp_path = temp_file.name
 
-                # Process with emotion2vec
-                result = self.emotion_model.generate(
-                    temp_path,
-                    granularity="utterance",
-                    extract_embedding=extract_embedding
-                )
-
-                # Clean up temp file
-                os.unlink(temp_path)
+                try:
+                    result = self.emotion_model.generate(
+                        temp_path,
+                        granularity="utterance",
+                        extract_embedding=extract_embedding,
+                    )
+                finally:
+                    if os.path.exists(temp_path):
+                        os.unlink(temp_path)
             else:
                 # Process entire file - need to check/resample first
                 audio = AudioSegment.from_file(audio_file)
@@ -763,15 +763,15 @@ class SpeakerRecognitionEngine:
                         audio.export(temp_file.name, format='wav')
                         temp_path = temp_file.name
 
-                    result = self.emotion_model.generate(
-                        temp_path,
-                        granularity="utterance",
-                        extract_embedding=extract_embedding
-                    )
-
-                    # Clean up
-                    import os
-                    os.unlink(temp_path)
+                    try:
+                        result = self.emotion_model.generate(
+                            temp_path,
+                            granularity="utterance",
+                            extract_embedding=extract_embedding,
+                        )
+                    finally:
+                        if os.path.exists(temp_path):
+                            os.unlink(temp_path)
                 else:
                     # Already 16kHz, use directly
                     result = self.emotion_model.generate(
