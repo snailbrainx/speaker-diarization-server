@@ -140,7 +140,9 @@ app = FastAPI(
 
 # CORS: internal-network-only by default. Set CORS_ORIGINS to a comma-separated
 # list of origins (e.g. "http://host:3000,http://host:8080") if a browser UI needs access.
-_cors_origins = [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
+# Browsers never send a trailing slash on Origin, so strip one if the user
+# included it in CORS_ORIGINS — otherwise Starlette's exact-string match misses.
+_cors_origins = [o.strip().rstrip("/") for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
 if _cors_origins:
     app.add_middleware(
         CORSMiddleware,

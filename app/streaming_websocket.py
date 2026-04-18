@@ -8,8 +8,8 @@ from sqlalchemy.orm import Session
 import numpy as np
 import json
 import asyncio
-from datetime import datetime, timedelta
-from typing import Dict, Optional
+from datetime import datetime
+from typing import Optional
 
 from .database import SessionLocal, get_db, utc_now
 from .models import Conversation, ConversationSegment
@@ -33,12 +33,6 @@ def convert_numpy_to_native(obj):
         return obj
 
 router = APIRouter(prefix="/streaming", tags=["Streaming"])
-
-# Active WebSocket connections (conversation_id -> WebSocket)
-active_connections: Dict[int, WebSocket] = {}
-
-# Active recorders (conversation_id -> StreamingRecorder)
-active_recorders: Dict[int, StreamingRecorder] = {}
 
 
 def get_engine():
@@ -108,7 +102,6 @@ async def websocket_endpoint(
         db.refresh(conversation)
 
         conversation_id = conversation.id
-        active_connections[conversation_id] = websocket
 
         # Initialize recorder
         config = get_config()
@@ -136,7 +129,6 @@ async def websocket_endpoint(
         recorder.on_segment_processed = segment_callback
 
         recorder.start_recording(conversation_id)
-        active_recorders[conversation_id] = recorder
 
         # Load speaker cache for fast matching (avoids DB queries per segment)
         engine = get_engine()
@@ -217,11 +209,6 @@ async def websocket_endpoint(
         if websocket.client_state == WebSocketState.CONNECTED:
             await send_message(websocket, "error", {"message": str(e)})
     finally:
-        # Cleanup
-        if conversation_id:
-            active_connections.pop(conversation_id, None)
-            active_recorders.pop(conversation_id, None)
-
         # Close WebSocket if still open (ignore if already closed)
         try:
             if websocket.client_state == WebSocketState.CONNECTED:

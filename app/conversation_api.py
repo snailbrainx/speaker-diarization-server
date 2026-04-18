@@ -4,13 +4,11 @@ API endpoints for conversation management
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
-from sqlalchemy import func
 from typing import Optional
-from datetime import datetime, timedelta
+from datetime import datetime
 import asyncio
 import json
 import os
-import tempfile
 
 from .database import get_db, utc_now
 from .models import Conversation, ConversationSegment, Speaker, SpeakerEmotionProfile
@@ -581,8 +579,6 @@ async def toggle_segment_misidentified(
     if not segment:
         raise HTTPException(status_code=404, detail="Segment not found")
 
-    # Update misidentification status
-    old_status = segment.is_misidentified
     segment.is_misidentified = request.is_misidentified
 
     # Flush to ensure the change is visible to subsequent queries
@@ -642,8 +638,6 @@ async def toggle_emotion_misidentified(
             detail="Segment has no emotion correction to mark as misidentified"
         )
 
-    # Update misidentification status
-    old_status = segment.emotion_misidentified
     segment.emotion_misidentified = request.is_misidentified
 
     # Flush so subsequent same-session queries see the new value

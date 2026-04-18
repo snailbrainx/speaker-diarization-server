@@ -27,11 +27,12 @@ class StatusResponse(BaseModel):
 
 # Conversation Schemas
 class Word(BaseModel):
-    """Word-level transcription data with confidence"""
+    """Word-level transcription data. Fields are Optional so that legacy rows
+    (pre-word-probability schema) still deserialize without raising."""
     word: str
-    start: float
-    end: float
-    probability: float
+    start: Optional[float] = None
+    end: Optional[float] = None
+    probability: Optional[float] = None
 
 class ConversationSegmentResponse(BaseModel):
     id: int

@@ -169,14 +169,13 @@ class ConversationSegment(Base):
 
     @property
     def words(self):
-        """Parse words_data JSON and return as list"""
-        if self.words_data:
-            try:
-                import json
-                return json.loads(self.words_data)
-            except (json.JSONDecodeError, TypeError):
-                return None
-        return None
+        """Parse words_data JSON and return as list."""
+        if not self.words_data:
+            return None
+        try:
+            return json.loads(self.words_data)
+        except (json.JSONDecodeError, TypeError):
+            return None
 
     def get_speaker_embedding(self):
         """Convert binary speaker embedding back to numpy array"""
