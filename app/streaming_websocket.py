@@ -3,6 +3,7 @@ WebSocket endpoint for real-time audio streaming and transcription.
 Integrates with StreamingRecorder for live speaker diarization.
 """
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Depends
+from starlette.websockets import WebSocketState
 from sqlalchemy.orm import Session
 import numpy as np
 import json
@@ -10,10 +11,11 @@ import asyncio
 from datetime import datetime, timedelta
 from typing import Dict, Optional
 
-from .database import get_db
+from .database import SessionLocal, get_db
 from .models import Conversation, ConversationSegment, Speaker
 from .streaming_recorder import StreamingRecorder
 from .config import get_config
+from .services import create_segment_from_result
 import os
 
 
@@ -49,7 +51,7 @@ async def send_message(websocket: WebSocket, message_type: str, data: dict):
     """Send JSON message to WebSocket client"""
     try:
         # Check if WebSocket is still connected
-        if websocket.client_state.CONNECTED:
+        if websocket.client_state == WebSocketState.CONNECTED:
             message = {
                 "type": message_type,
                 "data": data,
@@ -120,13 +122,15 @@ async def websocket_endpoint(
         )
 
         # Get event loop for scheduling async tasks from background threads
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
 
         # Set callback after initialization
-        # Use asyncio.run_coroutine_threadsafe to schedule from background thread
+        # Use asyncio.run_coroutine_threadsafe to schedule from background thread.
+        # The coroutine creates its own DB session — the request-scoped `db` is not
+        # thread-safe and may conflict with the main handler's usage.
         def segment_callback(seg_info):
             asyncio.run_coroutine_threadsafe(
-                _handle_segment_processed(websocket, conversation_id, seg_info, db, get_engine()),
+                _handle_segment_processed(websocket, conversation_id, seg_info, get_engine()),
                 loop
             )
 
@@ -207,7 +211,7 @@ async def websocket_endpoint(
             await _finalize_recording(conversation_id, recorder, conversation, db, None)
     except Exception as e:
         print(f"WebSocket error: {e}")
-        if websocket.client_state.CONNECTED:
+        if websocket.client_state == WebSocketState.CONNECTED:
             await send_message(websocket, "error", {"message": str(e)})
     finally:
         # Cleanup
@@ -217,7 +221,7 @@ async def websocket_endpoint(
 
         # Close WebSocket if still open (ignore if already closed)
         try:
-            if websocket.client_state.CONNECTED:
+            if websocket.client_state == WebSocketState.CONNECTED:
                 await websocket.close()
         except RuntimeError:
             # WebSocket already closed, ignore
@@ -228,13 +232,18 @@ async def _handle_segment_processed(
     websocket: WebSocket,
     conversation_id: int,
     segment_info: dict,
-    db: Session,
     engine
 ):
     """
     Callback when StreamingRecorder finishes processing a segment.
-    Runs diarization + transcription, saves to DB, sends to client.
+    Runs diarization + transcription (off the event loop), saves to DB, sends to client.
+
+    Owns its own DB session: the request-scoped session held by the WebSocket
+    handler is not safe to share with this thread-scheduled coroutine, and the
+    blocking GPU call below runs in a worker thread that also needs to touch the
+    session for speaker/emotion profile lookups.
     """
+    db = SessionLocal()
     try:
         # Get conversation
         conversation = db.query(Conversation).filter(
@@ -262,12 +271,13 @@ async def _handle_segment_processed(
         settings = config.get_settings()
         threshold = settings.speaker_threshold
 
-        # Process with diarization + transcription
-        result = engine.transcribe_with_diarization(
+        # Process with diarization + transcription — heavy GPU work, run off the event loop
+        result = await asyncio.to_thread(
+            engine.transcribe_with_diarization,
             segment_file,
             known_speakers,
             threshold=threshold,
-            db_session=db
+            db_session=db,
         )
 
         # Save segments to database
@@ -275,8 +285,6 @@ async def _handle_segment_processed(
         segments_data = []
 
         print(f"📝 Processing {len(result['segments'])} segment(s) from transcription")
-
-        from .services import create_segment_from_result
 
         for seg in result["segments"]:
             segment = create_segment_from_result(
@@ -310,10 +318,8 @@ async def _handle_segment_processed(
                 "avg_logprob": segment.avg_logprob
             })
 
-        # Update conversation stats
-        conversation.num_segments = db.query(ConversationSegment).filter(
-            ConversationSegment.conversation_id == conversation_id
-        ).count()
+        # Update conversation stats (increment rather than re-count)
+        conversation.num_segments = (conversation.num_segments or 0) + len(result["segments"])
 
         db.commit()
 
@@ -328,7 +334,9 @@ async def _handle_segment_processed(
 
     except Exception as e:
         print(f"Error processing segment: {e}")
-        await send_message(websocket, "error", {"message": f"Segment processing error: {str(e)}"})
+        await send_message(websocket, "error", {"message": "Segment processing error"})
+    finally:
+        db.close()
 
 
 async def _finalize_recording(

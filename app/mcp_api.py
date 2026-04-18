@@ -20,7 +20,7 @@ from fastapi import APIRouter, HTTPException, Depends, Request, Body
 from fastapi.responses import StreamingResponse, JSONResponse
 from sqlalchemy.orm import Session
 from typing import Optional, Any, Dict
-import httpx
+import inspect
 import json
 import asyncio
 import os
@@ -30,13 +30,7 @@ from .database import get_db
 from .models import Speaker, Conversation, ConversationSegment
 
 
-def _get_base_url():
-    """Get the base URL for internal API calls."""
-    port = os.getenv("PORT", "8418")
-    return f"http://localhost:{port}/api/v1"
-
-
-router = APIRouter(tags=["MCP"])
+router = APIRouter(prefix="/mcp", tags=["MCP"])
 
 # Store active SSE connections for ping
 active_connections: Dict[str, bool] = {}
@@ -102,7 +96,8 @@ async def identify_speaker_in_segment(
     conversation_id: int,
     segment_id: int,
     speaker_name: str,
-    auto_enroll: bool = True
+    auto_enroll: bool = True,
+    db: Session = None,
 ) -> dict:
     """
     Identify or correct speaker in a segment.
@@ -112,34 +107,31 @@ async def identify_speaker_in_segment(
 
     System will automatically update all matching past segments.
     """
-    async with httpx.AsyncClient(base_url=_get_base_url()) as client:
-        try:
-            response = await client.post(
-                f"/conversations/{conversation_id}/segments/{segment_id}/identify",
-                json={"speaker_name": speaker_name, "enroll": auto_enroll}
-            )
-            response.raise_for_status()
-            result = response.json()
-            # Add success context
-            return {
-                "success": True,
-                "speaker_name": speaker_name,
-                "enrolled": auto_enroll,
-                "segments_updated": result.get("segments_updated", 0),
-                "message": f"Successfully identified speaker as '{speaker_name}'. " +
-                          (f"Updated {result.get('segments_updated', 0)} past segments automatically." if result.get('segments_updated') else ""),
-                "details": result
-            }
-        except httpx.HTTPStatusError as e:
-            error_detail = "Unknown error"
-            try:
-                error_data = e.response.json()
-                error_detail = error_data.get("detail", str(e))
-            except Exception:
-                error_detail = e.response.text or str(e)
-            return {"error": f"Failed to identify speaker: {error_detail}", "status_code": e.response.status_code}
-        except httpx.HTTPError as e:
-            return {"error": f"Network error: {str(e)}"}
+    from .conversation_api import identify_speaker_in_segment as _identify
+    from .schemas import IdentifySpeakerRequest
+    from .api import get_engine
+
+    try:
+        result = await _identify(
+            conversation_id=conversation_id,
+            segment_id=segment_id,
+            request=IdentifySpeakerRequest(speaker_name=speaker_name, enroll=auto_enroll),
+            db=db,
+            engine=get_engine(),
+        )
+    except HTTPException as e:
+        return {"error": f"Failed to identify speaker: {e.detail}", "status_code": e.status_code}
+
+    updated = result.get("segments_updated", 0) if isinstance(result, dict) else 0
+    return {
+        "success": True,
+        "speaker_name": speaker_name,
+        "enrolled": auto_enroll,
+        "segments_updated": updated,
+        "message": f"Successfully identified speaker as '{speaker_name}'." +
+                  (f" Updated {updated} past segments automatically." if updated else ""),
+        "details": result,
+    }
 
 
 async def list_speakers(db: Session) -> dict:
@@ -212,54 +204,55 @@ async def list_conversations(skip: int = 0, limit: int = 10, db: Session = None)
     }
 
 
-async def rename_speaker(speaker_id: int, new_name: str) -> dict:
+async def rename_speaker(speaker_id: int, new_name: str, db: Session = None) -> dict:
     """Rename speaker (updates all past segments)"""
-    async with httpx.AsyncClient(base_url=_get_base_url()) as client:
-        try:
-            response = await client.patch(
-                f"/speakers/{speaker_id}/rename",
-                json={"new_name": new_name}
-            )
-            response.raise_for_status()
-            return response.json()
-        except httpx.HTTPError as e:
-            return {"error": f"API error: {str(e)}"}
+    from .api import rename_speaker as _rename
+    from .schemas import SpeakerRename
+
+    try:
+        speaker = await _rename(speaker_id=speaker_id, rename_data=SpeakerRename(new_name=new_name), db=db)
+    except HTTPException as e:
+        return {"error": f"API error: {e.detail}", "status_code": e.status_code}
+
+    return {"id": speaker.id, "name": speaker.name}
 
 
-async def delete_speaker(speaker_id: int) -> dict:
+async def delete_speaker(speaker_id: int, db: Session = None) -> dict:
     """Delete speaker profile"""
-    async with httpx.AsyncClient(base_url=_get_base_url()) as client:
-        try:
-            response = await client.delete(f"/speakers/{speaker_id}")
-            response.raise_for_status()
-            return response.json()
-        except httpx.HTTPError as e:
-            return {"error": f"API error: {str(e)}"}
+    from .api import delete_speaker as _delete
+
+    try:
+        return await _delete(speaker_id=speaker_id, db=db)
+    except HTTPException as e:
+        return {"error": f"API error: {e.detail}", "status_code": e.status_code}
 
 
-async def reprocess_conversation(conversation_id: int) -> dict:
+async def reprocess_conversation(conversation_id: int, db: Session = None) -> dict:
     """Re-analyze conversation with current speaker profiles"""
-    async with httpx.AsyncClient(base_url=_get_base_url()) as client:
-        try:
-            response = await client.post(f"/conversations/{conversation_id}/reprocess")
-            response.raise_for_status()
-            return response.json()
-        except httpx.HTTPError as e:
-            return {"error": f"API error: {str(e)}"}
+    from .conversation_api import reprocess_conversation as _reprocess
+    from .api import get_engine
+
+    try:
+        return await _reprocess(conversation_id=conversation_id, db=db, engine=get_engine())
+    except HTTPException as e:
+        return {"error": f"API error: {e.detail}", "status_code": e.status_code}
 
 
-async def update_conversation_title(conversation_id: int, title: str) -> dict:
+async def update_conversation_title(conversation_id: int, title: str, db: Session = None) -> dict:
     """Update conversation title"""
-    async with httpx.AsyncClient(base_url=_get_base_url()) as client:
-        try:
-            response = await client.patch(
-                f"/conversations/{conversation_id}",
-                json={"title": title}
-            )
-            response.raise_for_status()
-            return response.json()
-        except httpx.HTTPError as e:
-            return {"error": f"API error: {str(e)}"}
+    from .conversation_api import update_conversation as _update
+    from .schemas import ConversationUpdate
+
+    try:
+        conv = await _update(
+            conversation_id=conversation_id,
+            update_data=ConversationUpdate(title=title),
+            db=db,
+        )
+    except HTTPException as e:
+        return {"error": f"API error: {e.detail}", "status_code": e.status_code}
+
+    return {"id": conv.id, "title": conv.title}
 
 
 async def delete_all_unknown_speakers(db: Session) -> dict:
@@ -436,7 +429,7 @@ TOOLS = {
 # HTTP Endpoints
 # ============================================================================
 
-@router.get("/", include_in_schema=False)
+@router.get("", include_in_schema=False)
 async def mcp_info():
     """
     MCP server information endpoint.
@@ -451,7 +444,7 @@ async def mcp_info():
         "description": "AI agent interface for speaker diarization system",
         "endpoints": {
             "sse": "/mcp/sse",
-            "messages": "/mcp/messages"
+            "rpc": "/mcp"
         },
         "capabilities": {
             "tools": True,
@@ -511,7 +504,7 @@ async def mcp_sse(request: Request):
     )
 
 
-@router.post("/mcp", include_in_schema=False)
+@router.post("", include_in_schema=False)
 async def mcp_rpc(body: Dict[str, Any] = Body(...), db: Session = Depends(get_db)):
     """MCP JSON-RPC endpoint"""
     req_id = body.get("id")
@@ -563,7 +556,7 @@ async def mcp_rpc(body: Dict[str, Any] = Body(...), db: Session = Depends(get_db
             })
 
         tool = TOOLS[tool_name]
-        if "db" in tool["function"].__code__.co_varnames:
+        if "db" in inspect.signature(tool["function"]).parameters:
             arguments["db"] = db
 
         try:
@@ -582,9 +575,11 @@ async def mcp_rpc(body: Dict[str, Any] = Body(...), db: Session = Depends(get_db
             })
 
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             return JSONResponse({
                 "jsonrpc": "2.0",
-                "error": {"code": -32603, "message": "Internal error", "data": str(e)},
+                "error": {"code": -32603, "message": "Internal error"},
                 "id": req_id
             })
 
