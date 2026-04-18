@@ -158,11 +158,15 @@ async def websocket_endpoint(
                 message = await websocket.receive()
 
                 if "bytes" in message:
-                    # Binary audio chunk
+                    # Binary audio chunk (float32 PCM, 4 bytes/sample)
                     audio_bytes = message["bytes"]
                     print(f"📦 Received audio chunk: {len(audio_bytes)} bytes")
 
-                    # Convert bytes to numpy array (assuming float32)
+                    # Clients occasionally send truncated frames — skip instead of crashing.
+                    if len(audio_bytes) % 4 != 0:
+                        print(f"⚠️ Dropping misaligned audio chunk ({len(audio_bytes)} bytes)")
+                        continue
+
                     audio_array = np.frombuffer(audio_bytes, dtype=np.float32)
                     print(f"🔊 Converted to audio array: {len(audio_array)} samples")
 

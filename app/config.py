@@ -4,8 +4,23 @@ Supports runtime updates and persistence.
 """
 import os
 import json
-from typing import Dict, Any
+from typing import Dict, Any, Callable, Tuple
 from pydantic import BaseModel, Field
+
+
+def _as_bool(value: str) -> bool:
+    return value.lower() == "true"
+
+
+# (setting_name, env_var, parser). Declarative so adding a new tunable
+# requires one line instead of a copy-paste if-block.
+_ENV_OVERRIDES: Tuple[Tuple[str, str, Callable[[str], Any]], ...] = (
+    ("speaker_threshold", "SPEAKER_THRESHOLD", float),
+    ("context_padding", "CONTEXT_PADDING", float),
+    ("silence_duration", "SILENCE_DURATION", float),
+    ("filter_hallucinations", "FILTER_HALLUCINATIONS", _as_bool),
+    ("emotion_threshold", "EMOTION_THRESHOLD", float),
+)
 
 
 class VoiceSettings(BaseModel):
@@ -21,9 +36,9 @@ class ConfigManager:
     """
     Manages application configuration with runtime updates.
     Settings are loaded from:
-    1. Environment variables (highest priority)
-    2. Config file (if exists)
-    3. Defaults
+    1. Config file (if exists)
+    2. Environment variables (override file values)
+    3. VoiceSettings defaults (fallback)
     """
 
     def __init__(self, config_file: str = "data/config.json"):
@@ -31,10 +46,9 @@ class ConfigManager:
         self._settings: VoiceSettings = self._load_settings()
 
     def _load_settings(self) -> VoiceSettings:
-        """Load settings from env vars, file, or defaults"""
-        settings_dict = {}
+        """Load settings from file, apply env overrides, fall back to defaults."""
+        settings_dict: Dict[str, Any] = {}
 
-        # Try to load from config file first
         if os.path.exists(self.config_file):
             try:
                 with open(self.config_file, 'r') as f:
@@ -42,17 +56,10 @@ class ConfigManager:
             except Exception as e:
                 print(f"Warning: Could not load config file: {e}")
 
-        # Override with environment variables if set
-        if os.getenv("SPEAKER_THRESHOLD"):
-            settings_dict["speaker_threshold"] = float(os.getenv("SPEAKER_THRESHOLD"))
-        if os.getenv("CONTEXT_PADDING"):
-            settings_dict["context_padding"] = float(os.getenv("CONTEXT_PADDING"))
-        if os.getenv("SILENCE_DURATION"):
-            settings_dict["silence_duration"] = float(os.getenv("SILENCE_DURATION"))
-        if os.getenv("FILTER_HALLUCINATIONS"):
-            settings_dict["filter_hallucinations"] = os.getenv("FILTER_HALLUCINATIONS").lower() == "true"
-        if os.getenv("EMOTION_THRESHOLD"):
-            settings_dict["emotion_threshold"] = float(os.getenv("EMOTION_THRESHOLD"))
+        for name, env_var, parser in _ENV_OVERRIDES:
+            raw = os.getenv(env_var)
+            if raw:
+                settings_dict[name] = parser(raw)
 
         return VoiceSettings(**settings_dict)
 

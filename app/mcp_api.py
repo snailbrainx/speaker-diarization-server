@@ -32,6 +32,36 @@ from .models import Speaker, Conversation, ConversationSegment
 
 router = APIRouter(prefix="/mcp", tags=["MCP"])
 
+
+import typing
+
+_JSON_TYPE_BY_PY = {
+    int: "integer",
+    float: "number",
+    bool: "boolean",
+    str: "string",
+}
+
+
+def _unwrap_optional(annotation):
+    """Return the inner type of Optional[T] / Union[T, None], else annotation."""
+    if typing.get_origin(annotation) is typing.Union:
+        args = [a for a in typing.get_args(annotation) if a is not type(None)]
+        if len(args) == 1:
+            return args[0]
+    return annotation
+
+
+def _params_schema(func, params):
+    """Build a JSON-Schema properties dict from a tool function's type hints."""
+    sig = inspect.signature(func)
+    properties = {}
+    for p in params:
+        param = sig.parameters.get(p)
+        annotation = _unwrap_optional(param.annotation) if param else inspect.Parameter.empty
+        properties[p] = {"type": _JSON_TYPE_BY_PY.get(annotation, "string")}
+    return properties
+
 # Store active SSE connections for ping
 active_connections: Dict[str, bool] = {}
 
@@ -525,7 +555,10 @@ async def mcp_rpc(body: Dict[str, Any] = Body(...), db: Session = Depends(get_db
                     {
                         "name": name,
                         "description": tool["description"],
-                        "inputSchema": {"type": "object", "properties": {p: {"type": "string"} for p in tool["params"]}}
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": _params_schema(tool["function"], tool["params"]),
+                        },
                     }
                     for name, tool in TOOLS.items()
                 ]
