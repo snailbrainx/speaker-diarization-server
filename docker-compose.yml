@@ -16,21 +16,19 @@ services:
       - WHISPER_LANGUAGE=${WHISPER_LANGUAGE:-en}
       - OFFLINE_MODE=${OFFLINE_MODE:-false}
     ports:
-      - "8418:8418"  # FastAPI backend API
+      - "8418:8418"
     volumes:
       # SSL certificates for HTTPS/WSS
       - ./certs:/app/certs:ro
       # Persistent storage for speaker database and embeddings
       - ./volumes:/app/volumes
-      # Optional: Mount for audio files
+      # Audio recordings and temp files
       - ./data:/app/data
       # Backup snapshots
       - ./backups:/app/backups
-      # Model caches (persist downloaded models)
+      # Shared HuggingFace model cache — pyannote + faster-whisper both read
+      # from HF_HOME (set in the Dockerfile to /root/.cache/huggingface).
       - ./volumes/huggingface_cache:/root/.cache/huggingface
-      # Note: faster-whisper uses huggingface cache, not separate whisper cache
-      # Development: Mount source code (comment out for production)
-      - ./app:/app/app
     deploy:
       resources:
         reservations:
@@ -39,3 +37,8 @@ services:
               count: all
               capabilities: [gpu]
     restart: unless-stopped
+
+# Development convenience: docker-compose.override.yml bind-mounts ./app
+# over the image's /app/app for live reloads. Delete or rename that file
+# (or `docker compose -f docker-compose.yml up` without the override) for a
+# production run that uses only the baked-in code.
