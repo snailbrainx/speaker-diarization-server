@@ -10,7 +10,6 @@ from datetime import datetime, timedelta
 import asyncio
 import json
 import os
-import subprocess
 import tempfile
 
 from .database import get_db
@@ -226,12 +225,13 @@ async def recalculate_emotions(
             continue
 
         try:
-            # Re-extract emotion with personalized matching
-            emotion_data = engine.extract_emotion(
+            # Re-extract emotion with personalized matching (off the event loop)
+            emotion_data = await asyncio.to_thread(
+                engine.extract_emotion,
                 audio_file,
                 segment.start_offset,
                 segment.end_offset,
-                extract_embedding=True
+                extract_embedding=True,
             )
 
             if not emotion_data:
@@ -339,17 +339,17 @@ async def identify_speaker_in_segment(
     old_speaker_name = segment.speaker_name
     old_speaker_id = segment.speaker_id
 
-    # Extract embedding FIRST if enrolling (needed for new speakers)
+    # Extract embedding FIRST if enrolling (needed for new speakers, off the event loop)
     embedding = None
     if enroll:
         try:
-            # Extract from specific time range
-            embedding = engine.extract_segment_embedding(
+            embedding = await asyncio.to_thread(
+                engine.extract_segment_embedding,
                 audio_file,
                 start_time,
-                end_time
+                end_time,
             )
-        except Exception as e:
+        except Exception:
             raise HTTPException(
                 status_code=500,
                 detail="Failed to extract speaker embedding"
@@ -748,15 +748,21 @@ async def get_segment_audio(
         print(f"  Extracting {duration_with_padding:.2f}s from offset {start_time:.2f}s")
         print(f"  Output: {temp_path}")
 
-        result = subprocess.run([
+        proc = await asyncio.create_subprocess_exec(
             "ffmpeg", "-y",
             "-ss", str(start_time),
             "-t", str(duration_with_padding),
             "-i", source_audio,
             "-acodec", "pcm_s16le",
             "-ar", "16000",
-            temp_path
-        ], check=True, capture_output=True, text=True)
+            temp_path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr_bytes = await proc.communicate()
+        if proc.returncode != 0:
+            print(f"❌ FFmpeg error: {stderr_bytes.decode(errors='replace')}")
+            raise HTTPException(status_code=500, detail="Audio extraction failed")
 
         if not os.path.exists(temp_path):
             print(f"❌ Extraction failed - temp file not created")
@@ -789,9 +795,8 @@ async def get_segment_audio(
             }
         )
 
-    except subprocess.CalledProcessError as e:
-        print(f"❌ FFmpeg error: {e.stderr}")
-        raise HTTPException(status_code=500, detail="Audio extraction failed")
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"❌ Error: {str(e)}")
         import traceback

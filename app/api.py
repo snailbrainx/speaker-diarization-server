@@ -94,8 +94,10 @@ async def enroll_speaker(
     safe_filename = os.path.basename(audio_file.filename or "upload")
     temp_path = f"{data_path}/temp/{safe_filename}"
 
-    with open(temp_path, "wb") as buffer:
-        shutil.copyfileobj(audio_file.file, buffer)
+    def _stream_upload():
+        with open(temp_path, "wb") as buffer:
+            shutil.copyfileobj(audio_file.file, buffer)
+    await asyncio.to_thread(_stream_upload)
 
     try:
         # Convert MP3 to WAV if needed (speaker enrollment may receive MP3 uploads)
@@ -242,11 +244,13 @@ async def process_audio(
     temp_filename = f"uploaded_{timestamp}_{base_filename}"
     temp_path = f"{data_path}/recordings/{temp_filename}"
 
-    with open(temp_path, "wb") as buffer:
-        shutil.copyfileobj(audio_file.file, buffer)
+    def _stream_upload():
+        with open(temp_path, "wb") as buffer:
+            shutil.copyfileobj(audio_file.file, buffer)
+    await asyncio.to_thread(_stream_upload)
 
     # Convert to WAV for reliable processing
-    if not temp_path.endswith('.wav'):
+    if not temp_path.lower().endswith('.wav'):
         try:
             audio = AudioSegment.from_file(temp_path)
             wav_filename = temp_filename.rsplit('.', 1)[0] + '.wav'
