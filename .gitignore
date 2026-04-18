@@ -2,6 +2,12 @@
 .env
 *.env
 
+# AI tooling artifacts (per-user, should never be committed)
+.claude/
+CLAUDE.md
+AGENTS.md
+GEMINI.md
+
 # Python
 __pycache__/
 *.py[cod]

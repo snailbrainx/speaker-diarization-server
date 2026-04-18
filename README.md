@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
-[![CUDA 12.4](https://img.shields.io/badge/CUDA-12.4-green.svg)](https://developer.nvidia.com/cuda-toolkit)
+[![CUDA 12.8](https://img.shields.io/badge/CUDA-12.8-green.svg)](https://developer.nvidia.com/cuda-toolkit)
 
 An all-in-one complete package combining GPU-accelerated speaker diarization and recognition with web interface and REST API. Integrates pyannote.audio speaker diarization with faster-whisper transcription, designed for AI agent integration and hobby projects.
 
@@ -59,7 +59,7 @@ Example Next.js frontend interface (available at [github.com/snailbrainx/speaker
 - **Dual-Detector Emotion System**: Combines general AI (emotion2vec+) with personalized voice profiles for dramatically improved emotion detection accuracy across 9 emotions (angry, happy, sad, neutral, fearful, surprised, disgusted, other, unknown)
 - **Personalized Learning**: System learns each speaker's unique emotional voice patterns from corrections with weighted embedding merging (no re-enrollment needed)
 - **Retroactive Intelligence**: Identify one segment → all past segments with that voice automatically update
-- **Transcription**: faster-whisper (large-v3) with word-level confidence scores and 99 language support
+- **Transcription**: faster-whisper (large-v3-turbo by default; any Whisper variant via `WHISPER_MODEL`) with word-level confidence scores and 99 language support
 - **Live Streaming**: Real-time recording with WebSocket streaming, VAD, and instant processing
 - **AI-Ready Architecture**: Built-in MCP server enables seamless integration with AI assistants (Claude Desktop, Flowise, custom agents) providing the contextual memory needed for natural multi-party conversations
 - **REST API**: Full programmatic access at `/api/v1/*` (see `/docs` for interactive documentation)
@@ -78,12 +78,12 @@ Example Next.js frontend interface (available at [github.com/snailbrainx/speaker
 - **Diarization**: pyannote.audio 4.0.1 (`pyannote/speaker-diarization-community-1`)
 - **Embeddings**: pyannote.audio (`pyannote/embedding`)
 - **Emotion Recognition**: emotion2vec_plus_large via FunASR (ACL 2024, 9 emotion categories)
-- **Transcription**: faster-whisper 1.2.1 (configurable models: tiny/base/small/medium/large-v3, supports 99 languages, CTranslate2 backend)
+- **Transcription**: faster-whisper 1.2.1 (CTranslate2 backend, 99 languages). Any Whisper variant works via `WHISPER_MODEL` — default `large-v3-turbo`.
 - **Backend API**: FastAPI 0.115.5 with WebSocket streaming support
-- **ML Framework**: PyTorch 2.5.1 with CUDA 12.4 support
-- **Database**: SQLAlchemy 2.0.36 with SQLite + Pydantic 2.11.0
+- **ML Framework**: PyTorch 2.10.0 with CUDA 12.8 (Blackwell/RTX 5090 `sm_120` ready)
+- **Database**: SQLAlchemy 2.0.36 with SQLite (WAL mode) + Pydantic 2.11.0
 - **Audio Processing**: pydub, soundfile, ffmpeg
-- **MCP Integration**: MCP 1.21.0 for AI agent connectivity
+- **MCP Integration**: JSON-RPC 2.0 / HTTP+SSE server at `/mcp`, no external MCP library needed
 
 ## Emotion Detection
 
@@ -141,7 +141,8 @@ Manual correction = 100% confidence. No need to re-identify speaker.
       - `tiny`/`base`: ~400-500MB (total: ~5GB minimum with emotion)
       - `small`: ~1GB (total: ~6GB recommended with emotion)
       - `medium`: ~2GB (total: ~7GB recommended with emotion)
-      - `large-v3`: ~3-4GB (total: ~8-9GB recommended with emotion, default)
+      - `large-v3-turbo`: ~1.5GB (total: ~6-7GB with emotion, default — ~6x faster than large-v3)
+      - `large-v3`: ~3-4GB (total: ~8-9GB with emotion, best accuracy)
   - **Works on**: Consumer GPUs (GTX 1060 6GB+, 1080, 2060, 3060, 3090, 4080, 4090, etc.)
 - **CPU Fallback**: Runs on CPU but significantly slower (GPU strongly recommended)
 - **RAM**: 8GB minimum, 16GB+ recommended
@@ -150,14 +151,13 @@ Manual correction = 100% confidence. No need to re-identify speaker.
 ### Software
 - **Operating System**: Linux (tested on Ubuntu), macOS (via Docker), Windows (via WSL2 + Docker)
 - **Python**: 3.11 or 3.12
-- **CUDA**: 12.4 (included in Docker image)
+- **CUDA**: 12.8 (included in Docker image; supports Blackwell/RTX 5090 `sm_120`)
 - **cuDNN**: 9.x (auto-installed)
 - **Docker** (optional but recommended): 20.10+ with NVIDIA Container Toolkit
 
 ### System Dependencies
 - **ffmpeg**: Audio processing and format conversion
 - **git**: HuggingFace model downloads
-- **portaudio19-dev**: Live microphone recording (optional)
 
 ## Quick Start
 
@@ -214,7 +214,7 @@ For a web interface, see the separate [Next.js frontend repository](https://gith
 ```bash
 # Install system dependencies
 sudo apt-get update
-sudo apt-get install -y ffmpeg git portaudio19-dev
+sudo apt-get install -y ffmpeg git
 
 # Setup Python environment
 python -m venv venv
@@ -249,7 +249,7 @@ If you're running the application on a remote server (e.g., headless Ubuntu serv
 **Using PowerShell or Command Prompt:**
 
 ```powershell
-ssh -L 8000:localhost:8418 username@remote-server-ip
+ssh -L 8418:localhost:8418 username@remote-server-ip
 ```
 
 **Using PuTTY:**
@@ -257,7 +257,7 @@ ssh -L 8000:localhost:8418 username@remote-server-ip
 1. Open PuTTY and enter your server hostname/IP
 2. Navigate to: **Connection → SSH → Tunnels**
 3. Add forwarding rule:
-   - Source port: `8000`
+   - Source port: `8418`
    - Destination: `localhost:8418`
    - Click "Add"
 4. Return to Session tab and connect
@@ -269,7 +269,7 @@ ssh -L 8000:localhost:8418 username@remote-server-ip
 ### SSH Tunnel (Linux/Mac)
 
 ```bash
-ssh -L 8000:localhost:8418 username@remote-server-ip
+ssh -L 8418:localhost:8418 username@remote-server-ip
 ```
 
 Then access API docs at `http://localhost:8418/docs`.
@@ -330,8 +330,9 @@ EMOTION_THRESHOLD=0.6
 # - base.en / base: ~500MB VRAM, very fast, basic accuracy
 # - small.en / small: ~1GB VRAM, fast, good accuracy
 # - medium.en / medium: ~2GB VRAM, slower, better accuracy
+# - large-v3-turbo: ~1.5GB VRAM, ~6x faster decoder than large-v3, ~1-2% accuracy loss (default)
 # - large-v3 / large-v2: ~3-4GB VRAM, slowest, best accuracy
-WHISPER_MODEL=large-v3
+WHISPER_MODEL=large-v3-turbo
 
 # Whisper language setting
 # - "en" = English only (default, fastest)
@@ -347,7 +348,7 @@ Default settings are optimized for normal home usage:
 - **SPEAKER_THRESHOLD=0.30**: Good balance of accuracy and matching for home conversations
 - **CONTEXT_PADDING=0.15**: Optimal for audio with background noise/music
 - **SILENCE_DURATION=0.5**: Balances responsiveness with complete sentence capture
-- **WHISPER_MODEL=large-v3**: Best accuracy, requires ~3-4GB VRAM. Use `small` (~1GB) or `base` (~500MB) for weaker GPUs.
+- **WHISPER_MODEL=large-v3-turbo**: Best speed/accuracy balance, ~1.5GB VRAM. Use `large-v3` for top accuracy (~3-4GB) or `small`/`base` for weaker GPUs.
 - **WHISPER_LANGUAGE=en**: English only (fastest). Use `auto` for multilingual auto-detection or specify language code.
 
 For stricter matching with movie audio or challenging conditions, reduce SPEAKER_THRESHOLD to 0.20.
@@ -805,7 +806,7 @@ Build conversational AI assistants with persistent speaker memory using either R
 
 **Option 2: MCP Server** (AI-Native)
 - Connect Claude Desktop, Flowise, or custom MCP clients
-- AI assistant directly calls 10 MCP tools for speaker management
+- AI assistant directly calls 11 MCP tools for speaker management
 - Automatic retroactive updates when identifying/renaming speakers
 - Zero code - just configure MCP endpoint
 
@@ -865,19 +866,20 @@ for segment in conversation["segments"]:
 
 ### MCP Configuration
 
-**Claude Desktop** (`~/.claude/claude_desktop_config.json`):
+Both Flowise and Claude Desktop (and any MCP client speaking JSON-RPC 2.0 over HTTP) can connect directly:
+
 ```json
 {
   "mcpServers": {
     "speaker-diarization": {
-      "command": "node",
-      "args": ["/path/to/mcp-proxy.js", "http://localhost:8418/mcp"]
+      "url": "http://localhost:8418/mcp",
+      "transport": "http"
     }
   }
 }
 ```
 
-**Flowise**: Add MCP node, set URL to `http://localhost:8418/mcp`
+**Flowise**: Add MCP node, set URL to `http://localhost:8418/mcp`.
 
 ### Key Benefits
 
@@ -950,33 +952,21 @@ Test and optimize recognition accuracy:
 speaker-diarization-app/
 ├── data/
 │   ├── recordings/              # Permanent audio storage
-│   │   ├── conv_7_full.mp3     # Live recordings (MP3)
-│   │   ├── uploaded_1_tommy_converted.wav  # Uploads
-│   │   └── 20251109_160230_meeting.wav    # Timestamped uploads
+│   │   └── conv_7_full.wav     # Live recordings (WAV)
 │   │
-│   ├── stream_segments/         # Live recording segments (temporary)
+│   ├── stream_segments/         # Live recording segments (per conversation)
 │   │   └── conv_7/
 │   │       ├── seg_0001.wav
-│   │       ├── seg_0002.wav
 │   │       └── ...
 │   │
 │   └── temp/                    # Temporary segment extractions
-│       └── segment_123_456.wav
 │
 ├── volumes/
 │   ├── speakers.db              # SQLite database
-│   └── huggingface_cache/       # Downloaded models
+│   └── huggingface_cache/       # Downloaded pyannote + Whisper models
 │
-├── backups/                     # Backup snapshots (JSON)
-│   └── backup_20251109_120000.json
-│
-├── scripts/                     # Utility scripts
-│   ├── migrate_temp_audio.py   # Fix audio paths
-│   ├── diagnose_speakers.py    # Debug issues
-│   └── ...
-│
-└── tests/                       # Test files
-    └── test_*.py
+└── backups/                     # Backup snapshots (JSON)
+    └── backup_20251109_120000.json
 ```
 
 ### Docker Volumes
@@ -1043,9 +1033,9 @@ docker run --rm --gpus all nvidia/cuda:12.4.0-base-ubuntu22.04 nvidia-smi
 - Re-enroll with better quality audio
 
 **"Audio file not found" errors**
-- Old uploads: Run `python scripts/migrate_temp_audio.py`
-- New uploads: Should auto-save to `data/recordings/`
-- Verify `data/` directory is accessible
+- New uploads auto-save to `data/recordings/`
+- Verify `data/` directory is accessible and writable
+- Check that the `./data` volume is mounted correctly in `docker-compose.yml`
 
 **Whisper hallucinations ("thank you.", "thanks for watching")**
 - Already filtered via energy thresholding and text filtering
@@ -1076,9 +1066,9 @@ docker run --rm --gpus all nvidia/cuda:12.4.0-base-ubuntu22.04 nvidia-smi
 
 **Live recording not working**
 - Browser permission: Allow microphone access
-- Standalone: Install PortAudio: `sudo apt-get install portaudio19-dev`
+- WebSocket requires HTTPS for browser mic capture — make sure `certs/cert.pem` and `certs/key.pem` exist so the server starts in HTTPS/WSS mode
 - Check browser microphone settings
-- Try different browser
+- Try a different browser (tested: Chrome, Firefox, Safari)
 
 ## License
 
@@ -1093,11 +1083,9 @@ All major dependencies use permissive open-source licenses compatible with MIT:
   - Models themselves remain open-source and MIT licensed
 - **faster-whisper** (1.2.1): MIT License (SYSTRAN)
 - **FastAPI** (0.115.5): MIT License
-- **Next.js** (15.x): MIT License
-- **PyTorch** (2.5.1): BSD 3-Clause License
+- **PyTorch** (2.10.0): BSD 3-Clause License
 - **SQLAlchemy** (2.0.36): MIT License
 - **Pydantic** (2.11.0): MIT License
-- **MCP** (1.21.0): MIT License
 
 **Note:** While the software licenses are permissive, pyannote's pretrained models require:
 1. HuggingFace account
