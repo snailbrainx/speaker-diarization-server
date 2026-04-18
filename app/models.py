@@ -210,19 +210,3 @@ class ConversationSegment(Base):
         self.emotion_embedding = embedding_array.astype(np.float32).tobytes()
 
 
-class GroundTruthLabel(Base):
-    """
-    Ground truth speaker labels for testing and optimization
-    Stores manual identifications WITHOUT affecting the actual segments
-    """
-    __tablename__ = "ground_truth_labels"
-
-    id = Column(Integer, primary_key=True, index=True)
-    segment_id = Column(Integer, ForeignKey("conversation_segments.id"), nullable=False)
-    true_speaker_name = Column(String, nullable=False)  # Manual identification
-    labeled_by = Column(String, default="user")  # Who labeled it
-    labeled_at = Column(DateTime, default=datetime.utcnow)
-    notes = Column(Text, nullable=True)  # Optional notes about the segment
-
-    # Relationship
-    segment = relationship("ConversationSegment")

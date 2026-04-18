@@ -15,6 +15,7 @@ from typing import List, Dict, Tuple, Optional
 from faster_whisper import WhisperModel
 from concurrent.futures import ThreadPoolExecutor
 import time
+import tempfile
 from pydub import AudioSegment
 import threading
 import queue
@@ -715,11 +716,7 @@ class SpeakerRecognitionEngine:
             # Format: model.generate(input, granularity="utterance")
 
             if start_time is not None and end_time is not None:
-                # For segments, we need to extract the audio first
-                import torchaudio
-                from pydub import AudioSegment
-                import tempfile
-
+                # For segments, we need to extract the audio first.
                 # Cap segment duration to avoid OOM in emotion2vec attention (O(n^2) memory)
                 if (end_time - start_time) > MAX_EMOTION_DURATION_SEC:
                     end_time = start_time + MAX_EMOTION_DURATION_SEC
@@ -748,13 +745,9 @@ class SpeakerRecognitionEngine:
                 )
 
                 # Clean up temp file
-                import os
                 os.unlink(temp_path)
             else:
                 # Process entire file - need to check/resample first
-                from pydub import AudioSegment
-                import tempfile
-
                 audio = AudioSegment.from_file(audio_file)
 
                 # Cap duration to avoid OOM in emotion2vec attention (O(n^2) memory)
@@ -1189,7 +1182,6 @@ class SpeakerRecognitionEngine:
             return None
 
 
-        from sklearn.metrics.pairwise import cosine_similarity
         from .models import Speaker, SpeakerEmotionProfile
 
         best_match = None
@@ -1275,7 +1267,6 @@ class SpeakerRecognitionEngine:
     ):
         """Dual-detector emotion matching using both emotion2vec and voice profiles"""
 
-        from sklearn.metrics.pairwise import cosine_similarity
 
         # Validate inputs
         if np.isnan(emotion_embedding).any() or np.isnan(voice_embedding).any():

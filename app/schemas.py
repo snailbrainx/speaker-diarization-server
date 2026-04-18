@@ -6,9 +6,6 @@ import json
 class SpeakerBase(BaseModel):
     name: str
 
-class SpeakerCreate(SpeakerBase):
-    pass
-
 class SpeakerResponse(SpeakerBase):
     id: int
     created_at: datetime
@@ -35,25 +32,6 @@ class Word(BaseModel):
     start: float
     end: float
     probability: float
-
-# Dual-detector emotion breakdown schemas
-class EmotionDetectorResult(BaseModel):
-    """Result from a single emotion detector"""
-    emotion: str
-    confidence: float
-    all_scores: Optional[dict] = None
-
-class EmotionFinalDecision(BaseModel):
-    """Final emotion decision with reasoning"""
-    emotion: str
-    reasoning: str
-    voice_profile_available: bool
-
-class EmotionDetectorBreakdown(BaseModel):
-    """Breakdown of dual-detector emotion system"""
-    emotion2vec_detector: EmotionDetectorResult
-    voice_profile_detector: Optional[EmotionDetectorResult]
-    final_decision: EmotionFinalDecision
 
 class ConversationSegmentResponse(BaseModel):
     id: int
@@ -145,10 +123,6 @@ class ConversationResponse(BaseModel):
 
     class Config:
         from_attributes = True
-
-
-class ConversationCreate(BaseModel):
-    title: Optional[str] = None
 
 
 class ConversationUpdate(BaseModel):

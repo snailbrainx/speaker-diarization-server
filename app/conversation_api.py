@@ -2,10 +2,10 @@
 API endpoints for conversation management
 """
 from fastapi import APIRouter, Depends, HTTPException, Query
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import func
-from typing import List, Optional
+from typing import Optional
 from datetime import datetime, timedelta
 import asyncio
 import json
@@ -17,13 +17,10 @@ from .database import get_db
 from .models import Conversation, ConversationSegment, Speaker, SpeakerEmotionProfile
 from .schemas import (
     ConversationResponse,
-    ConversationListItem,
     ConversationsListResponse,
-    ConversationCreate,
     ConversationUpdate,
-    ConversationSegmentResponse,
     IdentifySpeakerRequest,
-    ToggleMisidentifiedRequest
+    ToggleMisidentifiedRequest,
 )
 from .diarization import SpeakerRecognitionEngine
 from .api import get_engine
@@ -159,16 +156,6 @@ async def reprocess_conversation(
         threshold=threshold,
         db_session=db  # Enable personalized emotion matching
     )
-
-    # Delete ground truth labels first (they reference segments)
-    from sqlalchemy import text
-    db.execute(text("""
-        DELETE FROM ground_truth_labels
-        WHERE segment_id IN (
-            SELECT id FROM conversation_segments
-            WHERE conversation_id = :conv_id
-        )
-    """), {"conv_id": conversation_id})
 
     # Delete old segments (synchronize_session=False avoids FK constraint issues)
     db.query(ConversationSegment).filter(

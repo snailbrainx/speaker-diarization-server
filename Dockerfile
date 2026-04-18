@@ -5,14 +5,12 @@ WORKDIR /app
 
 # Install system dependencies
 # ffmpeg: for audio processing
-# git: for installing python packages from git
-# build-essential: for compiling some python extensions
-# portaudio19-dev: for sounddevice
-RUN apt-get update && apt-get install -y \
+# git: required by some Python deps during install
+# build-essential: for compiling native extensions
+RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     git \
     build-essential \
-    portaudio19-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Upgrade pip

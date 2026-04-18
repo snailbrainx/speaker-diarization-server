@@ -12,8 +12,8 @@ from pydub import AudioSegment
 from .database import get_db
 from .models import Speaker, Conversation, ConversationSegment
 from .schemas import (
-    SpeakerCreate, SpeakerResponse, SpeakerRename,
-    StatusResponse, ConversationResponse
+    SpeakerResponse, SpeakerRename,
+    StatusResponse, ConversationResponse,
 )
 from .diarization import SpeakerRecognitionEngine
 from .config import get_config
