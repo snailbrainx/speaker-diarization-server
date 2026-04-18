@@ -203,11 +203,14 @@ async def delete_speaker(speaker_id: int, db: Session = Depends(get_db)):
         SpeakerEmotionProfile.speaker_id == speaker_id
     ).delete(synchronize_session=False)
 
-    # 3. Delete speaker
+    # Capture name before delete — post-commit attribute access can
+    # trigger an expired-instance reload that raises.
+    name = speaker.name
+
     db.delete(speaker)
     db.commit()
 
-    return {"message": f"Speaker '{speaker.name}' deleted successfully"}
+    return {"message": f"Speaker '{name}' deleted successfully"}
 
 
 @router.delete("/speakers/unknown/all")
