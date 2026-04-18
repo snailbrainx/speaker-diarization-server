@@ -1,24 +1,35 @@
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
+from sqlalchemy import func
 from sqlalchemy.orm import Session
-from typing import List, Optional
+from typing import List
 import os
 import shutil
 import asyncio
 from datetime import timedelta
-import json
 import torch
 from pydub import AudioSegment
 
 from .database import get_db, utc_now
-from .models import Speaker, Conversation, ConversationSegment
+from .models import Speaker, SpeakerEmotionProfile, Conversation, ConversationSegment
 from .schemas import (
     SpeakerResponse, SpeakerRename,
     StatusResponse, ConversationResponse,
 )
 from .diarization import SpeakerRecognitionEngine
 from .config import get_config
+from .services import (
+    create_segment_from_result,
+    delete_unknown_speakers,
+    load_known_speakers,
+)
 
 router = APIRouter()
+
+
+def _convert_audio(src: str, dst: str) -> None:
+    """Blocking pydub conversion — always called via asyncio.to_thread."""
+    AudioSegment.from_file(src).export(dst, format="wav")
+
 
 # Initialize speaker recognition engine (singleton)
 engine = None
@@ -44,9 +55,6 @@ async def get_status():
 @router.get("/speakers", response_model=List[SpeakerResponse])
 async def list_speakers(db: Session = Depends(get_db)):
     """List all enrolled speakers with segment counts"""
-    from sqlalchemy import func
-
-    # Query speakers with segment counts
     speakers_with_counts = db.query(
         Speaker,
         func.count(ConversationSegment.id).label('segment_count')
@@ -100,19 +108,17 @@ async def enroll_speaker(
     await asyncio.to_thread(_stream_upload)
 
     try:
-        # Convert MP3 to WAV if needed (speaker enrollment may receive MP3 uploads)
+        # Convert MP3 to WAV if needed (speaker enrollment may receive MP3 uploads).
+        # pydub.from_file shells out to ffmpeg and is blocking — run off the event loop.
         wav_temp_path = None
         if temp_path.lower().endswith('.mp3'):
+            wav_temp_path = temp_path.rsplit('.', 1)[0] + '_enrolled.wav'
             try:
-                print(f"Converting uploaded MP3 to WAV for speaker enrollment...")
-                audio = AudioSegment.from_file(temp_path)
-                wav_temp_path = temp_path.rsplit('.', 1)[0] + '_enrolled.wav'
-                audio.export(wav_temp_path, format='wav')
-                # Use WAV for embedding extraction
+                await asyncio.to_thread(_convert_audio, temp_path, wav_temp_path)
                 extraction_path = wav_temp_path
-                print(f"Conversion successful: {wav_temp_path}")
             except Exception as e:
                 print(f"Warning: Failed to convert MP3 to WAV: {e}")
+                wav_temp_path = None
                 extraction_path = temp_path  # Fall back to MP3
         else:
             extraction_path = temp_path
@@ -170,8 +176,6 @@ async def rename_speaker(
     speaker.name = rename_data.new_name
     speaker.updated_at = utc_now()
 
-    # UPDATE ALL PAST CONVERSATION SEGMENTS
-    from .models import ConversationSegment
     updated_segments = db.query(ConversationSegment).filter(
         ConversationSegment.speaker_id == speaker_id
     ).update({"speaker_name": rename_data.new_name})
@@ -187,8 +191,6 @@ async def rename_speaker(
 @router.delete("/speakers/{speaker_id}")
 async def delete_speaker(speaker_id: int, db: Session = Depends(get_db)):
     """Delete a speaker"""
-    from .models import SpeakerEmotionProfile, ConversationSegment
-
     speaker = db.query(Speaker).filter(Speaker.id == speaker_id).first()
     if not speaker:
         raise HTTPException(status_code=404, detail="Speaker not found")
@@ -216,8 +218,6 @@ async def delete_speaker(speaker_id: int, db: Session = Depends(get_db)):
 @router.delete("/speakers/unknown/all")
 async def delete_all_unknown_speakers(db: Session = Depends(get_db)):
     """Delete all speakers with names starting with 'Unknown_'"""
-    from .services import delete_unknown_speakers
-
     deleted_count, _ = delete_unknown_speakers(db)
     db.commit()
 
@@ -252,17 +252,14 @@ async def process_audio(
             shutil.copyfileobj(audio_file.file, buffer)
     await asyncio.to_thread(_stream_upload)
 
-    # Convert to WAV for reliable processing
+    # Convert to WAV for reliable processing (blocking ffmpeg shell-out)
     if not temp_path.lower().endswith('.wav'):
+        wav_filename = temp_filename.rsplit('.', 1)[0] + '.wav'
+        file_path = f"{data_path}/recordings/{wav_filename}"
         try:
-            audio = AudioSegment.from_file(temp_path)
-            wav_filename = temp_filename.rsplit('.', 1)[0] + '.wav'
-            file_path = f"{data_path}/recordings/{wav_filename}"
-            audio.export(file_path, format='wav')
-            # Remove original after conversion
+            await asyncio.to_thread(_convert_audio, temp_path, file_path)
             os.remove(temp_path)
         except Exception as e:
-            # If conversion fails, use original file
             print(f"Warning: Failed to convert to WAV: {e}")
             file_path = temp_path
     else:
@@ -281,9 +278,7 @@ async def process_audio(
     db.refresh(conversation)
 
     try:
-        # Get known speakers
-        speakers = db.query(Speaker).all()
-        known_speakers = [(s.id, s.name, s.get_embedding()) for s in speakers]
+        known_speakers = load_known_speakers(db)
 
         # Get threshold from config
         config = get_config()
@@ -299,8 +294,6 @@ async def process_audio(
             db_session=db
         )
 
-        # Create conversation segments
-        from .services import create_segment_from_result
         for seg in result["segments"]:
             create_segment_from_result(
                 seg=seg,

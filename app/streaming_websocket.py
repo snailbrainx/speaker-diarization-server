@@ -12,10 +12,10 @@ from datetime import datetime, timedelta
 from typing import Dict, Optional
 
 from .database import SessionLocal, get_db, utc_now
-from .models import Conversation, ConversationSegment, Speaker
+from .models import Conversation, ConversationSegment
 from .streaming_recorder import StreamingRecorder
 from .config import get_config
-from .services import create_segment_from_result
+from .services import create_segment_from_result, load_known_speakers
 import os
 
 
@@ -265,9 +265,7 @@ async def _handle_segment_processed(
             print(f"Segment file not found: {segment_file}")
             return
 
-        # Get known speakers
-        speakers = db.query(Speaker).all()
-        known_speakers = [(s.id, s.name, s.get_embedding()) for s in speakers]
+        known_speakers = load_known_speakers(db)
 
         # Get threshold from config
         config = get_config()

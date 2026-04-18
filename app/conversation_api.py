@@ -25,11 +25,12 @@ from .diarization import SpeakerRecognitionEngine
 from .api import get_engine
 from .config import get_config
 from .services import (
-    create_segment_from_result,
-    recalculate_speaker_embedding,
-    recalculate_emotion_profile,
-    resolve_audio_path,
     cleanup_orphaned_unknowns,
+    create_segment_from_result,
+    load_known_speakers,
+    recalculate_emotion_profile,
+    recalculate_speaker_embedding,
+    resolve_audio_path,
 )
 import numpy as np
 
@@ -140,9 +141,7 @@ async def reprocess_conversation(
     if not conversation.audio_path or not os.path.exists(conversation.audio_path):
         raise HTTPException(status_code=404, detail="Audio file not found")
 
-    # Get known speakers
-    speakers = db.query(Speaker).all()
-    known_speakers = [(s.id, s.name, s.get_embedding()) for s in speakers]
+    known_speakers = load_known_speakers(db)
 
     # Get threshold from config (consistent with all other endpoints)
     config = get_config()

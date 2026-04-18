@@ -6,12 +6,18 @@ import os
 import json
 import numpy as np
 from datetime import timedelta
-from typing import Optional, Tuple, List
-from sqlalchemy import select, exists
-from sqlalchemy.orm import Session
+from typing import Any, Optional, Tuple, List
+from sqlalchemy import exists
+from sqlalchemy.orm import Session, joinedload
 
-from .models import Speaker, ConversationSegment, SpeakerEmotionProfile
+from .models import Speaker, Conversation, ConversationSegment, SpeakerEmotionProfile
 from .diarization import auto_enroll_unknown_speaker
+
+
+def load_known_speakers(db: Session) -> List[Tuple[int, str, Any]]:
+    """Return the (id, name, embedding) tuple list consumed by the engine."""
+    speakers = db.query(Speaker).all()
+    return [(s.id, s.name, s.get_embedding()) for s in speakers]
 
 
 def resolve_audio_path(conversation, segment=None) -> Optional[str]:
@@ -127,10 +133,16 @@ def recalculate_speaker_embedding(
     Returns:
         Number of embeddings used, or 0 if no valid segments found
     """
-    segments = db.query(ConversationSegment).filter(
-        ConversationSegment.speaker_id == speaker.id,
-        ConversationSegment.is_misidentified == False
-    ).all()
+    # joinedload prevents an N+1 on seg.conversation when embeddings are missing.
+    segments = (
+        db.query(ConversationSegment)
+        .options(joinedload(ConversationSegment.conversation))
+        .filter(
+            ConversationSegment.speaker_id == speaker.id,
+            ConversationSegment.is_misidentified == False,
+        )
+        .all()
+    )
 
     if not segments:
         return 0
@@ -174,12 +186,17 @@ def recalculate_emotion_profile(
     Returns:
         "updated", "created", "deleted", or None if nothing changed
     """
-    segments = db.query(ConversationSegment).filter(
-        ConversationSegment.speaker_id == speaker_id,
-        ConversationSegment.emotion_corrected == True,
-        ConversationSegment.emotion_misidentified == False,
-        ConversationSegment.emotion_category == emotion_category
-    ).all()
+    segments = (
+        db.query(ConversationSegment)
+        .options(joinedload(ConversationSegment.conversation))
+        .filter(
+            ConversationSegment.speaker_id == speaker_id,
+            ConversationSegment.emotion_corrected == True,
+            ConversationSegment.emotion_misidentified == False,
+            ConversationSegment.emotion_category == emotion_category,
+        )
+        .all()
+    )
 
     emotion_embeddings = []
     voice_embeddings = []
