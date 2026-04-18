@@ -208,18 +208,20 @@ async def recalculate_emotions(
         ConversationSegment.conversation_id == conversation_id
     ).all()
 
+    # Preload speakers referenced by these segments (avoids a per-segment query)
+    speaker_ids = {s.speaker_id for s in segments if s.speaker_id}
+    speakers_by_id = (
+        {sp.id: sp for sp in db.query(Speaker).filter(Speaker.id.in_(speaker_ids)).all()}
+        if speaker_ids else {}
+    )
+
     updated_count = 0
     skipped_count = 0
+    audio_file = conversation.audio_path
 
     for segment in segments:
         # Skip if no speaker or manually corrected (respect user corrections)
         if not segment.speaker_id or segment.emotion_corrected:
-            skipped_count += 1
-            continue
-
-        # Skip if no audio available
-        audio_file = conversation.audio_path
-        if not audio_file or not os.path.exists(audio_file):
             skipped_count += 1
             continue
 
@@ -236,8 +238,7 @@ async def recalculate_emotions(
                 skipped_count += 1
                 continue
 
-            # Get speaker and their profiles
-            speaker = db.query(Speaker).filter(Speaker.id == segment.speaker_id).first()
+            speaker = speakers_by_id.get(segment.speaker_id)
 
             if speaker and speaker.emotion_profiles:
                 # Use dual-detector matching if profiles exist
@@ -646,9 +647,8 @@ async def toggle_emotion_misidentified(
     old_status = segment.emotion_misidentified
     segment.emotion_misidentified = request.is_misidentified
 
-    # Flush and expire to ensure the change is visible to subsequent queries
+    # Flush so subsequent same-session queries see the new value
     db.flush()
-    db.expire_all()
 
     # If segment has a speaker and emotion, recalculate emotion profile
     if segment.speaker_id and segment.emotion_category:

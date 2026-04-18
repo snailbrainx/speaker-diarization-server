@@ -3,9 +3,11 @@ services:
     build: .
     container_name: speaker-diarization-app
     environment:
-      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_VISIBLE_DEVICES=${NVIDIA_VISIBLE_DEVICES:-all}
+      - CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
       - DATABASE_URL=sqlite:////app/volumes/speakers.db
       - HF_TOKEN=${HF_TOKEN:-}
+      - CORS_ORIGINS=${CORS_ORIGINS:-}
       - SPEAKER_THRESHOLD=${SPEAKER_THRESHOLD:-0.30}
       - CONTEXT_PADDING=${CONTEXT_PADDING:-0.15}
       - SILENCE_DURATION=${SILENCE_DURATION:-0.5}

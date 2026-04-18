@@ -7,9 +7,11 @@ import json
 import numpy as np
 from datetime import timedelta
 from typing import Optional, Tuple, List
+from sqlalchemy import select, exists
 from sqlalchemy.orm import Session
 
 from .models import Speaker, ConversationSegment, SpeakerEmotionProfile
+from .diarization import auto_enroll_unknown_speaker
 
 
 def resolve_audio_path(conversation, segment=None) -> Optional[str]:
@@ -57,8 +59,6 @@ def create_segment_from_result(
     Returns:
         ConversationSegment (added to session but not committed)
     """
-    from .diarization import auto_enroll_unknown_speaker
-
     speaker_id = None
     speaker_name = seg["speaker"]
     confidence = seg.get("confidence", 0.0)
@@ -278,15 +278,13 @@ def cleanup_orphaned_unknowns(db: Session) -> List[str]:
     Returns:
         List of deleted speaker names
     """
-    unknowns = db.query(Speaker).filter(Speaker.name.like("Unknown_%")).all()
-    deleted = []
+    has_segments = exists().where(ConversationSegment.speaker_id == Speaker.id)
+    orphans = db.query(Speaker).filter(
+        Speaker.name.like("Unknown_%"),
+        ~has_segments,
+    ).all()
 
-    for speaker in unknowns:
-        count = db.query(ConversationSegment).filter(
-            ConversationSegment.speaker_id == speaker.id
-        ).count()
-        if count == 0:
-            db.delete(speaker)
-            deleted.append(speaker.name)
-
+    deleted = [s.name for s in orphans]
+    for speaker in orphans:
+        db.delete(speaker)
     return deleted

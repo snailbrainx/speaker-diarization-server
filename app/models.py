@@ -39,7 +39,7 @@ class SpeakerEmotionProfile(Base):
     __tablename__ = "speaker_emotion_profiles"
 
     id = Column(Integer, primary_key=True, index=True)
-    speaker_id = Column(Integer, ForeignKey("speakers.id", ondelete="CASCADE"), nullable=False)
+    speaker_id = Column(Integer, ForeignKey("speakers.id", ondelete="CASCADE"), nullable=False, index=True)
     emotion_category = Column(String, nullable=False)  # 'angry', 'happy', 'sad', etc.
 
     # Emotion embedding (1024-D from emotion2vec)
@@ -120,8 +120,8 @@ class ConversationSegment(Base):
     __tablename__ = "conversation_segments"
 
     id = Column(Integer, primary_key=True, index=True)
-    conversation_id = Column(Integer, ForeignKey("conversations.id"), nullable=False)
-    speaker_id = Column(Integer, ForeignKey("speakers.id", ondelete="SET NULL"), nullable=True)  # Null for unknown - auto-set to NULL when speaker deleted
+    conversation_id = Column(Integer, ForeignKey("conversations.id"), nullable=False, index=True)
+    speaker_id = Column(Integer, ForeignKey("speakers.id", ondelete="SET NULL"), nullable=True, index=True)  # Null for unknown - auto-set to NULL when speaker deleted
     speaker_name = Column(String, nullable=True)  # Denormalized for quick access
     text = Column(Text, nullable=True)  # Transcription text
 

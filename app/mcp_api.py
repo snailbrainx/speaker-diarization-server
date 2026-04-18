@@ -308,7 +308,6 @@ async def search_conversations_by_speaker(speaker_name: str, db: Session, limit:
     Raises:
         Error if speaker doesn't exist in database
     """
-    from .models import Speaker, Conversation, ConversationSegment
     from sqlalchemy import func
 
     # Validate speaker exists
@@ -316,49 +315,39 @@ async def search_conversations_by_speaker(speaker_name: str, db: Session, limit:
     if not speaker:
         return {"error": f"Speaker '{speaker_name}' not found. Use list_speakers tool to see available speakers."}
 
-    # Get all distinct conversations where this speaker appears
-    # Join ConversationSegment with Conversation to get conversation details
-    conversations_query = (
-        db.query(Conversation)
+    # Single grouped query: one row per conversation with that speaker's segment count.
+    segment_count = func.count(ConversationSegment.id).label("speaker_segments")
+    rows_query = (
+        db.query(Conversation, segment_count)
         .join(ConversationSegment, Conversation.id == ConversationSegment.conversation_id)
         .filter(ConversationSegment.speaker_id == speaker.id)
-        .distinct()
-        .order_by(Conversation.start_time.desc())  # Most recent first
+        .group_by(Conversation.id)
+        .order_by(Conversation.start_time.desc())
     )
 
-    total_count = conversations_query.count()
-    conversations = conversations_query.offset(skip).limit(limit).all()
+    total_count = rows_query.count()
+    rows = rows_query.offset(skip).limit(limit).all()
 
-    # Format results
-    conversation_list = []
-    for conv in conversations:
-        # Count segments by this speaker in this conversation
-        speaker_segment_count = (
-            db.query(func.count(ConversationSegment.id))
-            .filter(
-                ConversationSegment.conversation_id == conv.id,
-                ConversationSegment.speaker_id == speaker.id
-            )
-            .scalar()
-        )
-
-        conversation_list.append({
+    conversation_list = [
+        {
             "conversation_id": conv.id,
             "title": conv.title or f"Conversation {conv.id}",
             "datetime": conv.start_time.isoformat() if conv.start_time else None,
             "duration_seconds": conv.duration,
             "duration_minutes": round(conv.duration / 60, 1) if conv.duration else None,
             "total_segments": conv.num_segments,
-            "speaker_segments": speaker_segment_count,
-            "audio_path": conv.audio_path
-        })
+            "speaker_segments": speaker_segments,
+            "audio_path": conv.audio_path,
+        }
+        for conv, speaker_segments in rows
+    ]
 
     return {
         "speaker_name": speaker.name,
         "speaker_id": speaker.id,
         "total_conversations": total_count,
         "returned_count": len(conversation_list),
-        "conversations": conversation_list
+        "conversations": conversation_list,
     }
 
 
