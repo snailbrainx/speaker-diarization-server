@@ -1,7 +1,7 @@
 services:
   speaker-diarization:
     build: .
-    container_name: speaker-diarization-app
+    container_name: speaker-diarization-server
     environment:
       - NVIDIA_VISIBLE_DEVICES=${NVIDIA_VISIBLE_DEVICES:-all}
       - CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
