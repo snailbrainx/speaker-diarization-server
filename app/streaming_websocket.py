@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 import numpy as np
 import json
 import asyncio
+import logging
 from datetime import datetime
 from typing import Optional
 
@@ -17,6 +18,8 @@ from .streaming_recorder import StreamingRecorder
 from .config import get_config
 from .services import create_segment_from_result, load_known_speakers
 import os
+
+logger = logging.getLogger(__name__)
 
 
 def convert_numpy_to_native(obj):
@@ -31,6 +34,14 @@ def convert_numpy_to_native(obj):
         return obj.tolist()
     else:
         return obj
+
+# WebSocket streams use 48 kHz float32 PCM — same rate as the browser's
+# MediaRecorder default. The StreamingRecorder resamples internally.
+WS_SAMPLE_RATE = 48000
+# Noise floor below which a frame is treated as silence. Tuned against typical
+# near-field microphones on a quiet channel; adjust in StreamingRecorder config
+# if you need different behaviour per-deployment.
+WS_SILENCE_THRESHOLD = 0.005
 
 router = APIRouter(prefix="/streaming", tags=["Streaming"])
 
@@ -51,17 +62,17 @@ async def send_message(websocket: WebSocket, message_type: str, data: dict):
                 "data": data,
                 "timestamp": utc_now().isoformat()
             }
-            print(f"🔌 Sending WebSocket message: type={message_type}, data_keys={list(data.keys()) if isinstance(data, dict) else 'not-dict'}")
+            logger.info(f"🔌 Sending WebSocket message: type={message_type}, data_keys={list(data.keys()) if isinstance(data, dict) else 'not-dict'}")
             await websocket.send_json(message)
-            print(f"✅ Successfully sent {message_type} message")
+            logger.info(f"✅ Successfully sent {message_type} message")
         else:
-            print(f"⚪ WebSocket not connected, skipping {message_type} message")
+            logger.info(f"⚪ WebSocket not connected, skipping {message_type} message")
     except WebSocketDisconnect:
         # Expected during stop/cleanup - client disconnected before we could send
-        print(f"⚪ Client disconnected, skipping {message_type} message (expected during shutdown)")
+        logger.info(f"⚪ Client disconnected, skipping {message_type} message (expected during shutdown)")
     except Exception as e:
         # Unexpected errors
-        print(f"❌ ERROR sending {message_type} message: {e}")
+        logger.error(f"ERROR sending{message_type} message: {e}")
         import traceback
         traceback.print_exc()
 
@@ -108,8 +119,8 @@ async def websocket_endpoint(
         settings = config.get_settings()
 
         recorder = StreamingRecorder(
-            sample_rate=48000,
-            silence_threshold=0.005,
+            sample_rate=WS_SAMPLE_RATE,
+            silence_threshold=WS_SILENCE_THRESHOLD,
             silence_duration=settings.silence_duration,
         )
 
@@ -133,12 +144,12 @@ async def websocket_endpoint(
         # Load speaker cache for fast matching (avoids DB queries per segment)
         engine = get_engine()
         cache_size = engine.load_speaker_cache(db)
-        print(f"🚀 Speaker cache loaded: {cache_size} profiles ready for streaming")
+        logger.info(f"🚀 Speaker cache loaded: {cache_size} profiles ready for streaming")
 
         # Send confirmation
         await send_message(websocket, "started", {
             "conversation_id": conversation_id,
-            "sample_rate": 48000,
+            "sample_rate": WS_SAMPLE_RATE,
             "message": "Recording started"
         })
 
@@ -151,19 +162,19 @@ async def websocket_endpoint(
                 if "bytes" in message:
                     # Binary audio chunk (float32 PCM, 4 bytes/sample)
                     audio_bytes = message["bytes"]
-                    print(f"📦 Received audio chunk: {len(audio_bytes)} bytes")
+                    logger.info(f"📦 Received audio chunk: {len(audio_bytes)} bytes")
 
                     # Clients occasionally send truncated frames — skip instead of crashing.
                     if len(audio_bytes) % 4 != 0:
-                        print(f"⚠️ Dropping misaligned audio chunk ({len(audio_bytes)} bytes)")
+                        logger.info(f"⚠️ Dropping misaligned audio chunk ({len(audio_bytes)} bytes)")
                         continue
 
                     audio_array = np.frombuffer(audio_bytes, dtype=np.float32)
-                    print(f"🔊 Converted to audio array: {len(audio_array)} samples")
+                    logger.info(f"🔊 Converted to audio array: {len(audio_array)} samples")
 
                     # Process chunk (StreamingRecorder expects tuple of (sample_rate, audio_data))
-                    result = recorder.process_audio_chunk((48000, audio_array))
-                    print(f"📊 VAD: {result['speech_detected']}, Level: {result['audio_level']:.3f}")
+                    result = recorder.process_audio_chunk((WS_SAMPLE_RATE, audio_array))
+                    logger.info(f"📊 VAD: {result['speech_detected']}, Level: {result['audio_level']:.3f}")
 
                     # Send status update
                     await send_message(websocket, "status", {
@@ -172,7 +183,7 @@ async def websocket_endpoint(
                         "stats": {
                             "buffer_size": result.get("buffer_size", 0),
                             "segments_processed": result.get("segments_processed", 0),
-                            "total_audio_seconds": result.get("segments_processed", 0) * 2.0  # Estimate
+                            "total_audio_seconds": float(result.get("cumulative_offset", 0.0)),
                         }
                     })
 
@@ -185,10 +196,10 @@ async def websocket_endpoint(
                         break
 
             except WebSocketDisconnect:
-                print(f"WebSocket disconnected for conversation {conversation_id}")
+                logger.info(f"WebSocket disconnected for conversation {conversation_id}")
                 break
             except Exception as e:
-                print(f"Error processing audio chunk: {e}")
+                logger.error(f"Error processingaudio chunk: {e}")
                 import traceback
                 traceback.print_exc()
                 try:
@@ -201,11 +212,11 @@ async def websocket_endpoint(
         await _finalize_recording(conversation_id, recorder, conversation, db, websocket)
 
     except WebSocketDisconnect:
-        print(f"WebSocket disconnected during initialization")
+        logger.info(f"WebSocket disconnected during initialization")
         if conversation_id and recorder:
             await _finalize_recording(conversation_id, recorder, conversation, db, None)
     except Exception as e:
-        print(f"WebSocket error: {e}")
+        logger.info(f"WebSocket error: {e}")
         if websocket.client_state == WebSocketState.CONNECTED:
             await send_message(websocket, "error", {"message": str(e)})
     finally:
@@ -249,7 +260,7 @@ async def _handle_segment_processed(
         end_offset = segment_info["end_offset"]
 
         if not os.path.exists(segment_file):
-            print(f"Segment file not found: {segment_file}")
+            logger.info(f"Segment file not found: {segment_file}")
             return
 
         known_speakers = load_known_speakers(db)
@@ -272,7 +283,7 @@ async def _handle_segment_processed(
         conv_start = conversation.start_time
         segments_data = []
 
-        print(f"📝 Processing {len(result['segments'])} segment(s) from transcription")
+        logger.info(f"📝 Processing {len(result['segments'])} segment(s) from transcription")
 
         for seg in result["segments"]:
             segment = create_segment_from_result(
@@ -312,16 +323,16 @@ async def _handle_segment_processed(
         db.commit()
 
         # Send segments to client
-        print(f"📤 Sending {len(segments_data)} segment(s) to client")
+        logger.info(f"📤 Sending {len(segments_data)} segment(s) to client")
         for seg_data in segments_data:
-            print(f"   → Segment: {seg_data['speaker_name']}: {seg_data['text'][:50]}...")
+            logger.info(f"   → Segment: {seg_data['speaker_name']}: {seg_data['text'][:50]}...")
             await send_message(websocket, "segment", seg_data)
 
         # Queue async GPU cleanup (non-blocking)
         engine.clear_gpu_cache_async("segment_complete")
 
     except Exception as e:
-        print(f"Error processing segment: {e}")
+        logger.error(f"Error processingsegment: {e}")
         import traceback
         traceback.print_exc()
         db.rollback()
@@ -341,22 +352,23 @@ async def _finalize_recording(
     Finalize recording: stop recorder, concatenate segments, convert to MP3.
     """
     try:
-        print(f"Finalizing recording for conversation {conversation_id}")
+        logger.info(f"Finalizing recording for conversation {conversation_id}")
 
         # Both calls block for many seconds — run off the event loop so other
         # clients aren't frozen while one user stops a recording.
         await asyncio.to_thread(recorder.stop_recording)
         full_audio_path = await asyncio.to_thread(recorder.concatenate_segments)
 
+        # Refresh BEFORE mutating: the per-segment callback owns its own Session
+        # and commits num_segments from a worker thread, so this handler's cached
+        # instance is stale. Refresh() overwrites every attribute, so any dirty
+        # change made before this line would be silently discarded.
+        db.refresh(conversation)
+
         if full_audio_path and os.path.exists(full_audio_path):
             # Keep WAV file (no MP3 conversion - WAV avoids pyannote 24ms boundary bug)
             conversation.audio_path = full_audio_path
             conversation.audio_format = "wav"
-
-        # The per-segment callback owns its own Session and commits there, so
-        # this handler's cached `conversation` instance is stale — refresh before
-        # reading num_segments (or the duration calculation short-circuits).
-        db.refresh(conversation)
 
         conversation.status = "completed"
         conversation.end_time = utc_now()
@@ -383,13 +395,13 @@ async def _finalize_recording(
                 "message": "Recording completed and saved"
             })
 
-        print(f"Recording finalized: {conversation.num_segments} segments, {conversation.num_speakers} speakers")
+        logger.info(f"Recording finalized: {conversation.num_segments} segments, {conversation.num_speakers} speakers")
 
         engine = get_engine()
         engine.clear_gpu_cache()
 
     except Exception as e:
-        print(f"Error finalizing recording: {e}")
+        logger.info(f"Error finalizing recording: {e}")
         import traceback
         traceback.print_exc()
         conversation.status = "failed"

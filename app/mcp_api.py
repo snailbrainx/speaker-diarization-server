@@ -29,6 +29,18 @@ from datetime import datetime
 
 from .database import get_db
 from .models import Speaker, Conversation, ConversationSegment
+from .schemas import SpeakerRename, ConversationUpdate, IdentifySpeakerRequest
+from .services import delete_unknown_speakers
+from .api import (
+    rename_speaker as _rename_speaker_api,
+    delete_speaker as _delete_speaker_api,
+    get_engine,
+)
+from .conversation_api import (
+    identify_speaker_in_segment as _identify_speaker_api,
+    reprocess_conversation as _reprocess_api,
+    update_conversation as _update_conversation_api,
+)
 
 
 router = APIRouter(prefix="/mcp", tags=["MCP"])
@@ -84,9 +96,6 @@ def _params_schema(func, params) -> dict:
         schema["required"] = required
     return schema
 
-
-# SSE connection keep-alive registry (connection_id -> still_alive flag).
-_sse_connections: Dict[str, bool] = {}
 
 
 # ============================================================================
@@ -160,12 +169,8 @@ async def identify_speaker_in_segment(
 
     System will automatically update all matching past segments.
     """
-    from .conversation_api import identify_speaker_in_segment as _identify
-    from .schemas import IdentifySpeakerRequest
-    from .api import get_engine
-
     try:
-        result = await _identify(
+        result = await _identify_speaker_api(
             conversation_id=conversation_id,
             segment_id=segment_id,
             request=IdentifySpeakerRequest(speaker_name=speaker_name, enroll=auto_enroll),
@@ -259,11 +264,12 @@ async def list_conversations(skip: int = 0, limit: int = 10, db: Session = None)
 
 async def rename_speaker(speaker_id: int, new_name: str, db: Session = None) -> dict:
     """Rename speaker (updates all past segments)"""
-    from .api import rename_speaker as _rename
-    from .schemas import SpeakerRename
-
     try:
-        speaker = await _rename(speaker_id=speaker_id, rename_data=SpeakerRename(new_name=new_name), db=db)
+        speaker = await _rename_speaker_api(
+            speaker_id=speaker_id,
+            rename_data=SpeakerRename(new_name=new_name),
+            db=db,
+        )
     except HTTPException as e:
         return {"error": f"API error: {e.detail}", "status_code": e.status_code}
 
@@ -272,32 +278,24 @@ async def rename_speaker(speaker_id: int, new_name: str, db: Session = None) -> 
 
 async def delete_speaker(speaker_id: int, db: Session = None) -> dict:
     """Delete speaker profile"""
-    from .api import delete_speaker as _delete
-
     try:
-        return await _delete(speaker_id=speaker_id, db=db)
+        return await _delete_speaker_api(speaker_id=speaker_id, db=db)
     except HTTPException as e:
         return {"error": f"API error: {e.detail}", "status_code": e.status_code}
 
 
 async def reprocess_conversation(conversation_id: int, db: Session = None) -> dict:
     """Re-analyze conversation with current speaker profiles"""
-    from .conversation_api import reprocess_conversation as _reprocess
-    from .api import get_engine
-
     try:
-        return await _reprocess(conversation_id=conversation_id, db=db, engine=get_engine())
+        return await _reprocess_api(conversation_id=conversation_id, db=db, engine=get_engine())
     except HTTPException as e:
         return {"error": f"API error: {e.detail}", "status_code": e.status_code}
 
 
 async def update_conversation_title(conversation_id: int, title: str, db: Session = None) -> dict:
     """Update conversation title"""
-    from .conversation_api import update_conversation as _update
-    from .schemas import ConversationUpdate
-
     try:
-        conv = await _update(
+        conv = await _update_conversation_api(
             conversation_id=conversation_id,
             update_data=ConversationUpdate(title=title),
             db=db,
@@ -315,9 +313,7 @@ async def delete_all_unknown_speakers(db: Session) -> dict:
     Useful for cleanup after identifying all speakers in conversations.
     Returns count of deleted speakers.
     """
-    from .services import delete_unknown_speakers
-
-    count, names = delete_unknown_speakers(db)
+    count, names = delete_unknown_speakers(db, engine=get_engine())
     db.commit()
 
     if not count:
@@ -505,35 +501,17 @@ async def mcp_info():
 
 @router.get("/sse", include_in_schema=False)
 async def mcp_sse(request: Request):
-    """
-    MCP SSE endpoint for server-to-client messages.
-
-    Maintains persistent connection for server notifications and ping/keepalive.
-    """
-    connection_id = f"conn_{datetime.now().timestamp()}"
-    _sse_connections[connection_id] = True
-
+    """MCP SSE endpoint — maintains a keepalive ping until the client disconnects."""
     async def event_stream():
         try:
-            # Send initial connection message
             yield f"data: {json.dumps({'type': 'connection', 'status': 'connected'})}\n\n"
-
-            # Keep connection alive with ping every 30 seconds
-            while _sse_connections.get(connection_id, False):
+            while not await request.is_disconnected():
                 await asyncio.sleep(30)
-
-                # Check if client disconnected
                 if await request.is_disconnected():
                     break
-
-                # Send ping
                 yield f"event: ping\ndata: {json.dumps({'timestamp': datetime.now().isoformat()})}\n\n"
-
         except asyncio.CancelledError:
             pass
-        finally:
-            # Clean up connection
-            _sse_connections.pop(connection_id, None)
 
     return StreamingResponse(
         event_stream(),
@@ -541,8 +519,8 @@ async def mcp_sse(request: Request):
         headers={
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
-            "X-Accel-Buffering": "no"
-        }
+            "X-Accel-Buffering": "no",
+        },
     )
 
 

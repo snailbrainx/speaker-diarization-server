@@ -4,6 +4,7 @@ Extracted from api.py, conversation_api.py, and streaming_websocket.py to elimin
 """
 import os
 import json
+import logging
 import numpy as np
 from datetime import timedelta
 from typing import Any, Optional, Tuple, List
@@ -12,6 +13,13 @@ from sqlalchemy.orm import Session, joinedload
 
 from .models import Speaker, Conversation, ConversationSegment, SpeakerEmotionProfile
 from .diarization import auto_enroll_unknown_speaker
+
+logger = logging.getLogger(__name__)
+
+
+def data_path() -> str:
+    """Single source of truth for the data directory (audio, temp, recordings)."""
+    return os.getenv("DATA_PATH", "./data")
 
 
 def load_known_speakers(db: Session) -> List[Tuple[int, str, Any]]:
@@ -121,6 +129,19 @@ def create_segment_from_result(
     return segment
 
 
+def _invalidate_speaker_cache(engine) -> None:
+    """Tell a streaming engine to forget its speaker-profile cache after a mutation.
+
+    Safe to call with any engine-like object or None; just a noop if the engine
+    doesn't expose clear_speaker_cache (e.g. in batch mode).
+    """
+    if engine is None:
+        return
+    clear = getattr(engine, "clear_speaker_cache", None)
+    if clear is not None:
+        clear()
+
+
 def recalculate_speaker_embedding(
     speaker: Speaker,
     db: Session,
@@ -133,6 +154,7 @@ def recalculate_speaker_embedding(
     Returns:
         Number of embeddings used, or 0 if no valid segments found
     """
+    _invalidate_speaker_cache(engine)
     # joinedload prevents an N+1 on seg.conversation when embeddings are missing.
     segments = (
         db.query(ConversationSegment)
@@ -186,6 +208,7 @@ def recalculate_emotion_profile(
     Returns:
         "updated", "created", "deleted", or None if nothing changed
     """
+    _invalidate_speaker_cache(engine)
     segments = (
         db.query(ConversationSegment)
         .options(joinedload(ConversationSegment.conversation))
@@ -214,7 +237,7 @@ def recalculate_emotion_profile(
                     if data and 'embedding' in data and not np.isnan(data['embedding']).any():
                         emotion_embeddings.append(data['embedding'])
                 except Exception as e:
-                    print(f"Warning: Could not extract emotion embedding for segment {seg.id}: {e}")
+                    logger.warning(f"Could not extract emotion embedding for segment {seg.id}: {e}")
 
         # Voice embedding
         voice_emb = seg.get_speaker_embedding()
@@ -259,7 +282,7 @@ def recalculate_emotion_profile(
     return None
 
 
-def delete_unknown_speakers(db: Session) -> Tuple[int, List[str]]:
+def delete_unknown_speakers(db: Session, engine=None) -> Tuple[int, List[str]]:
     """
     Delete all speakers with names starting with 'Unknown_'.
     Handles FK cleanup (nullify segments, delete emotion profiles).
@@ -267,6 +290,7 @@ def delete_unknown_speakers(db: Session) -> Tuple[int, List[str]]:
     Returns:
         Tuple of (deleted_count, list of deleted names)
     """
+    _invalidate_speaker_cache(engine)
     unknowns = db.query(Speaker).filter(Speaker.name.like("Unknown_%")).all()
     if not unknowns:
         return 0, []
@@ -288,13 +312,14 @@ def delete_unknown_speakers(db: Session) -> Tuple[int, List[str]]:
     return len(unknowns), names
 
 
-def cleanup_orphaned_unknowns(db: Session) -> List[str]:
+def cleanup_orphaned_unknowns(db: Session, engine=None) -> List[str]:
     """
     Delete Unknown_* speakers that have zero segments assigned.
 
     Returns:
         List of deleted speaker names
     """
+    _invalidate_speaker_cache(engine)
     has_segments = exists().where(ConversationSegment.speaker_id == Speaker.id)
     orphans = db.query(Speaker).filter(
         Speaker.name.like("Unknown_%"),

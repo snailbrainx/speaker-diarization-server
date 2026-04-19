@@ -4,8 +4,11 @@ Supports runtime updates and persistence.
 """
 import os
 import json
+import logging
 from typing import Dict, Any, Callable, Tuple
 from pydantic import BaseModel, Field
+
+logger = logging.getLogger(__name__)
 
 
 def _as_bool(value: str) -> bool:
@@ -54,7 +57,7 @@ class ConfigManager:
                 with open(self.config_file, 'r') as f:
                     settings_dict = json.load(f)
             except Exception as e:
-                print(f"Warning: Could not load config file: {e}")
+                logger.warning(f"Could not load config file: {e}")
 
         for name, env_var, parser in _ENV_OVERRIDES:
             raw = os.getenv(env_var)

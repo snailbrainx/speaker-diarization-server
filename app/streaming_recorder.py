@@ -1,6 +1,7 @@
 """
 Streaming audio recorder with queue-based background processing.
 """
+import logging
 import numpy as np
 import os
 import queue
@@ -11,10 +12,9 @@ from concurrent.futures import ThreadPoolExecutor, wait as futures_wait
 from datetime import datetime
 from typing import Callable, Dict, List, Optional
 
+from .services import data_path
 
-def _data_path() -> str:
-    """Resolve DATA_PATH with the same default used everywhere else."""
-    return os.getenv("DATA_PATH", "./data")
+logger = logging.getLogger(__name__)
 
 
 class StreamingRecorder:
@@ -80,7 +80,7 @@ class StreamingRecorder:
         self.segment_paths: List[str] = []
 
     def _segments_dir(self) -> str:
-        return os.path.join(_data_path(), "stream_segments", f"conv_{self.conversation_id}")
+        return os.path.join(data_path(), "stream_segments", f"conv_{self.conversation_id}")
 
     def start_recording(self, conversation_id: int):
         """Start recording for a conversation."""
@@ -101,14 +101,14 @@ class StreamingRecorder:
         self.processing_futures = []
 
         os.makedirs(self._segments_dir(), exist_ok=True)
-        print(f"🎤 Streaming recorder started for conversation {conversation_id} (silence: {self.silence_duration}s)")
+        logger.info(f"🎤 Streaming recorder started for conversation {conversation_id} (silence: {self.silence_duration}s)")
 
     def stop_recording(self):
         """Stop recording and wait for all queued segments to finish processing.
 
         Safe to call from a worker thread (via asyncio.to_thread).
         """
-        print("⏹️ Stopping streaming recorder...")
+        logger.info("⏹️ Stopping streaming recorder...")
 
         # Flush any remaining buffer under the lock (races with process_audio_chunk)
         with self._lock:
@@ -120,14 +120,14 @@ class StreamingRecorder:
         # Wait on the actual futures — the counter approach deadlocked if a
         # worker raised before incrementing, and .exception() surfaces errors.
         futures = list(self.processing_futures)
-        print(f"⏳ Waiting for {len(futures)} segment(s) to finish processing...")
+        logger.info(f"⏳ Waiting for {len(futures)} segment(s) to finish processing...")
         done, _ = futures_wait(futures)
         for fut in done:
             err = fut.exception()
             if err:
-                print(f"⚠️ Segment worker raised: {err!r}")
+                logger.info(f"⚠️ Segment worker raised: {err!r}")
 
-        print("✅ Streaming recorder stopped")
+        logger.info("✅ Streaming recorder stopped")
 
     def process_audio_chunk(self, audio_chunk: tuple) -> Dict:
         """Process an incoming audio chunk.
@@ -171,6 +171,7 @@ class StreamingRecorder:
                     self._flush_locked()
 
             buffer_size = len(self.current_buffer)
+            cumulative_offset = self.cumulative_offset
 
         return {
             "status": "recording",
@@ -179,6 +180,7 @@ class StreamingRecorder:
             "segments_queued": self.segments_queued,
             "segments_processed": self.segments_processed,
             "buffer_size": buffer_size,
+            "cumulative_offset": cumulative_offset,
         }
 
     def _flush_locked(self):
@@ -194,14 +196,14 @@ class StreamingRecorder:
 
         duration = len(segment_audio) / self.sample_rate
         if duration < self.MIN_SEGMENT_SECONDS:
-            print(f"⏭️ Skipping segment (too short: {duration:.2f}s)")
+            logger.info(f"⏭️ Skipping segment (too short: {duration:.2f}s)")
             return
         if duration > self.LONG_SEGMENT_WARN_SECONDS:
-            print(f"⚠️ Long segment detected: {duration:.1f}s - processing may take longer")
+            logger.info(f"⚠️ Long segment detected: {duration:.1f}s - processing may take longer")
 
         avg_energy = float(np.sqrt(np.mean(segment_audio ** 2)))
         if avg_energy < self.silence_threshold * 2:
-            print(f"⏭️ Skipping segment (mostly silence, energy: {avg_energy:.4f})")
+            logger.info(f"⏭️ Skipping segment (mostly silence, energy: {avg_energy:.4f})")
             return
 
         # Normalize
@@ -240,7 +242,7 @@ class StreamingRecorder:
         future = self.executor.submit(self._process_segment_worker, segment_info)
         self.processing_futures.append(future)
 
-        print(f"📦 Queued segment {segment_id} ({duration:.1f}s, offset {start_offset:.1f}-{end_offset:.1f}s)")
+        logger.info(f"📦 Queued segment {segment_id} ({duration:.1f}s, offset {start_offset:.1f}-{end_offset:.1f}s)")
 
     def _process_segment_worker(self, segment_info: Dict):
         """Background worker for a single segment. Increments segments_processed
@@ -249,7 +251,7 @@ class StreamingRecorder:
             if self.on_segment_processed:
                 self.on_segment_processed(segment_info)
         except Exception as e:
-            print(f"❌ Error processing segment {segment_info['id']}: {e}")
+            logger.error(f"Error processingsegment {segment_info['id']}: {e}")
             import traceback
             traceback.print_exc()
         finally:
@@ -257,7 +259,7 @@ class StreamingRecorder:
                 self.segments_processed += 1
                 done = self.segments_processed
                 total = self.segments_queued
-            print(f"✅ Processed segment {segment_info['id']} ({done}/{total})")
+            logger.info(f"✅ Processed segment {segment_info['id']} ({done}/{total})")
 
     def get_stats(self) -> Dict:
         with self._lock:
@@ -279,9 +281,9 @@ class StreamingRecorder:
             return None
 
         try:
-            print(f"🔗 Concatenating {len(self.segment_paths)} segments...")
+            logger.info(f"🔗 Concatenating {len(self.segment_paths)} segments...")
 
-            recordings_dir = os.path.join(_data_path(), "recordings")
+            recordings_dir = os.path.join(data_path(), "recordings")
             os.makedirs(recordings_dir, exist_ok=True)
             output_path = os.path.join(recordings_dir, f"conv_{self.conversation_id}_full.wav")
 
@@ -290,7 +292,7 @@ class StreamingRecorder:
             try:
                 for seg_path in self.segment_paths:
                     if not os.path.exists(seg_path):
-                        print(f"⚠️ Segment not found: {seg_path}")
+                        logger.info(f"⚠️ Segment not found: {seg_path}")
                         continue
 
                     with wave.open(seg_path, "rb") as in_wf:
@@ -309,18 +311,18 @@ class StreamingRecorder:
                     out_wf.close()
 
             if total_frames == 0:
-                print("⚠️ No valid segments to concatenate")
+                logger.info("⚠️ No valid segments to concatenate")
                 # Remove empty file if one was created
                 if os.path.exists(output_path) and os.path.getsize(output_path) == 0:
                     os.remove(output_path)
                 return None
 
             duration = total_frames / sample_rate
-            print(f"✅ Concatenated conversation saved: {output_path} ({duration:.1f}s)")
+            logger.info(f"✅ Concatenated conversation saved: {output_path} ({duration:.1f}s)")
             return output_path
 
         except Exception as e:
-            print(f"❌ Error concatenating segments: {e}")
+            logger.info(f"❌ Error concatenating segments: {e}")
             import traceback
             traceback.print_exc()
             return None

@@ -1,8 +1,11 @@
 from datetime import datetime, timezone
 
+import logging
 from sqlalchemy import create_engine, inspect, text, event
 from sqlalchemy.orm import declarative_base, sessionmaker
 import os
+
+logger = logging.getLogger(__name__)
 
 
 def utc_now() -> datetime:
@@ -77,4 +80,4 @@ def init_db():
             if column in columns:
                 continue
             conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {sql_type}"))
-            print(f"✓ Added {column} column to {table}")
+            logger.info(f"Added {column} column to {table}")

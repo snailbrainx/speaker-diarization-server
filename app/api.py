@@ -5,9 +5,12 @@ from typing import List
 import os
 import shutil
 import asyncio
+import logging
 from datetime import timedelta
 import torch
 from pydub import AudioSegment
+
+logger = logging.getLogger(__name__)
 
 from .database import get_db, utc_now
 from .models import Speaker, SpeakerEmotionProfile, Conversation, ConversationSegment
@@ -19,6 +22,7 @@ from .diarization import SpeakerRecognitionEngine
 from .config import get_config
 from .services import (
     create_segment_from_result,
+    data_path,
     delete_unknown_speakers,
     load_known_speakers,
 )
@@ -97,10 +101,10 @@ async def enroll_speaker(
         raise HTTPException(status_code=400, detail=f"Speaker '{name}' already exists")
 
     # Save audio file temporarily (sanitize filename to prevent path traversal)
-    data_path = os.getenv("DATA_PATH", "/app/data")
-    os.makedirs(f"{data_path}/temp", exist_ok=True)
+    temp_dir = os.path.join(data_path(), "temp")
+    os.makedirs(temp_dir, exist_ok=True)
     safe_filename = os.path.basename(audio_file.filename or "upload")
-    temp_path = f"{data_path}/temp/{safe_filename}"
+    temp_path = os.path.join(temp_dir, safe_filename)
 
     def _stream_upload():
         with open(temp_path, "wb") as buffer:
@@ -117,7 +121,7 @@ async def enroll_speaker(
                 await asyncio.to_thread(_convert_audio, temp_path, wav_temp_path)
                 extraction_path = wav_temp_path
             except Exception as e:
-                print(f"Warning: Failed to convert MP3 to WAV: {e}")
+                logger.warning(f"Failed to convert MP3 to WAV: {e}")
                 wav_temp_path = None
                 extraction_path = temp_path  # Fall back to MP3
         else:
@@ -183,7 +187,10 @@ async def rename_speaker(
     db.commit()
     db.refresh(speaker)
 
-    print(f"✓ Renamed speaker '{old_name}' → '{rename_data.new_name}' (updated {updated_segments} past segments)")
+    # A live WS stream caches profiles by name; drop the cache so matches use the new name.
+    get_engine().clear_speaker_cache()
+
+    logger.info(f"✓ Renamed speaker '{old_name}' → '{rename_data.new_name}' (updated {updated_segments} past segments)")
 
     return speaker
 
@@ -212,13 +219,15 @@ async def delete_speaker(speaker_id: int, db: Session = Depends(get_db)):
     db.delete(speaker)
     db.commit()
 
+    get_engine().clear_speaker_cache()
+
     return {"message": f"Speaker '{name}' deleted successfully"}
 
 
 @router.delete("/speakers/unknown/all")
 async def delete_all_unknown_speakers(db: Session = Depends(get_db)):
     """Delete all speakers with names starting with 'Unknown_'"""
-    deleted_count, _ = delete_unknown_speakers(db)
+    deleted_count, _ = delete_unknown_speakers(db, engine=get_engine())
     db.commit()
 
     return {
@@ -238,14 +247,14 @@ async def process_audio(
     Creates a new Conversation with segments.
     """
     # Save audio file
-    data_path = os.getenv("DATA_PATH", "/app/data")
-    os.makedirs(f"{data_path}/recordings", exist_ok=True)
+    recordings_dir = os.path.join(data_path(), "recordings")
+    os.makedirs(recordings_dir, exist_ok=True)
     timestamp = utc_now().strftime("%Y%m%d_%H%M%S")
 
     # Save uploaded file with timestamp (basename strips any directory component)
     base_filename = os.path.basename(audio_file.filename or "upload")
     temp_filename = f"uploaded_{timestamp}_{base_filename}"
-    temp_path = f"{data_path}/recordings/{temp_filename}"
+    temp_path = os.path.join(recordings_dir, temp_filename)
 
     def _stream_upload():
         with open(temp_path, "wb") as buffer:
@@ -255,12 +264,12 @@ async def process_audio(
     # Convert to WAV for reliable processing (blocking ffmpeg shell-out)
     if not temp_path.lower().endswith('.wav'):
         wav_filename = temp_filename.rsplit('.', 1)[0] + '.wav'
-        file_path = f"{data_path}/recordings/{wav_filename}"
+        file_path = os.path.join(recordings_dir, wav_filename)
         try:
             await asyncio.to_thread(_convert_audio, temp_path, file_path)
             os.remove(temp_path)
         except Exception as e:
-            print(f"Warning: Failed to convert to WAV: {e}")
+            logger.warning(f"Failed to convert to WAV: {e}")
             file_path = temp_path
     else:
         file_path = temp_path
@@ -320,11 +329,16 @@ async def process_audio(
         # Return conversation
         return conversation
 
-    except Exception as e:
+    except Exception:
         import traceback
         traceback.print_exc()
-        conversation.status = "failed"
-        db.commit()
+        # Roll back any half-built segments from create_segment_from_result
+        # so the failed-status commit doesn't persist partial state.
+        db.rollback()
+        failed = db.query(Conversation).filter(Conversation.id == conversation.id).first()
+        if failed is not None:
+            failed.status = "failed"
+            db.commit()
         raise HTTPException(status_code=500, detail="Audio processing failed")
 
 

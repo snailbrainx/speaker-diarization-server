@@ -19,20 +19,26 @@ services:
       - WHISPER_MODEL=${WHISPER_MODEL:-large-v3}
       - WHISPER_LANGUAGE=${WHISPER_LANGUAGE:-en}
       - OFFLINE_MODE=${OFFLINE_MODE:-false}
+    # Match the `app` user baked into the image (uid 1000) so bind-mounted
+    # volumes stay writable without chown gymnastics on the host.
+    user: "1000:1000"
     ports:
       - "8418:8418"
     volumes:
       # SSL certificates for HTTPS/WSS
       - ./certs:/app/certs:ro
-      # Persistent storage for speaker database and embeddings
+      # Persistent storage: speaker DB, embeddings, and HuggingFace model cache.
+      # HF_HOME is /app/volumes/huggingface_cache (set in the Dockerfile) so
+      # everything pyannote + faster-whisper download lives under this mount.
       - ./volumes:/app/volumes
       # Audio recordings and temp files
       - ./data:/app/data
       # Backup snapshots
       - ./backups:/app/backups
-      # Shared HuggingFace model cache — pyannote + faster-whisper both read
-      # from HF_HOME (set in the Dockerfile to /root/.cache/huggingface).
-      - ./volumes/huggingface_cache:/root/.cache/huggingface
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     deploy:
       resources:
         reservations:

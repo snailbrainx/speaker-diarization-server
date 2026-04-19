@@ -907,14 +907,16 @@ Rename any speaker → all past segments automatically update:
 
 ```bash
 # User identifies Unknown_01 as "Alice" in conversation 5
-curl -X POST "http://localhost:8418/api/v1/conversations/5/segments/123/identify?speaker_name=Alice&enroll=true"
+curl -X POST http://localhost:8418/api/v1/conversations/5/segments/123/identify \
+  -H 'Content-Type: application/json' \
+  -d '{"speaker_name": "Alice", "enroll": true}'
 
 # System automatically:
 # 1. Creates "Alice" speaker profile (if new)
 # 2. Updates segment 123
 # 3. Finds ALL segments with speaker_name="Unknown_01"
 # 4. Updates ALL to speaker_name="Alice"
-# 5. Merges embeddings from all segments
+# 5. Recalculates speaker embedding from every non-misidentified segment
 # 6. Returns count of updated segments
 ```
 
@@ -925,7 +927,7 @@ Export and restore speaker profiles:
 **Backup:**
 - Exports all speakers and their embeddings to JSON
 - Includes segment assignments for full state recovery
-- Saves to `backups/backup_YYYYMMDD_HHMMSS.json`
+- Profiles saved as `backups/profile_<name>.json`; checkpoints as `backups/checkpoint_<name>_<YYYYMMDD_HHMMSS>.json`
 - **Does NOT include audio files** (only speaker data)
 
 **Restore:**
@@ -966,7 +968,8 @@ speaker-diarization-app/
 │   └── huggingface_cache/       # Downloaded pyannote + Whisper models
 │
 └── backups/                     # Backup snapshots (JSON)
-    └── backup_20251109_120000.json
+    ├── profile_<name>.json       # Full profile export (speakers + segments + settings)
+    └── checkpoint_<name>_<ts>.json  # Lightweight state snapshots
 ```
 
 ### Docker Volumes
@@ -1006,8 +1009,14 @@ volumes:
 - Manual: `pip install nvidia-cudnn-cu12==9.* nvidia-cublas-cu12`
 
 **Permission errors**
+
+The container runs as UID 1000 (user `app`). Host-mounted `data/`, `volumes/`,
+and `backups/` directories must be writable by that UID. On first run (or after
+switching from an earlier root-owned deployment):
+
 ```bash
-sudo chown -R $USER:docker data/ volumes/ backups/
+# If your host UID isn't 1000, chown the bind-mount sources to uid 1000:
+sudo chown -R 1000:1000 data/ volumes/ backups/
 ```
 
 **Docker GPU not detected**
