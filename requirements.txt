@@ -4,7 +4,7 @@ uvicorn[standard]==0.32.1
 python-multipart>=0.0.18
 pydantic==2.11.0
 
-# AI/ML dependencies
+# ML dependencies
 # Note: Torch 2.10.x is installed separately in Dockerfile with CUDA support (cu128)
 # PyTorch 2.10+ required for Blackwell (RTX 5090 sm_120) support
 # torch  - DO NOT UNCOMMENT - installed in Dockerfile

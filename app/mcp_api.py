@@ -3,7 +3,7 @@ MCP (Model Context Protocol) API Endpoint
 
 Standard MCP server over HTTP (SSE transport) at /mcp endpoint.
 
-Allows AI agents to connect from anywhere on the network:
+Allows MCP clients to connect from anywhere on the network:
 - Flowise: {"url": "http://10.x.x.x:8418/mcp", "transport": "http"}
 - Other MCP clients via HTTP
 
@@ -479,7 +479,7 @@ async def mcp_info():
         "version": "1.0.0",
         "protocol": "MCP 2024-11-05",
         "transport": "HTTP (SSE)",
-        "description": "AI agent interface for speaker diarization system",
+        "description": "Speaker diarization MCP interface",
         "endpoints": {
             "sse": "/mcp/sse",
             "rpc": "/mcp"

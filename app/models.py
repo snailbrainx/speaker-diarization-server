@@ -124,7 +124,7 @@ class ConversationSegment(Base):
     speaker_name = Column(String, nullable=True)  # Denormalized for quick access
     text = Column(Text, nullable=True)  # Transcription text
 
-    # Absolute timestamps (for AI context)
+    # Absolute timestamps (for MCP clients)
     start_time = Column(DateTime, nullable=False)
     end_time = Column(DateTime, nullable=False)
 

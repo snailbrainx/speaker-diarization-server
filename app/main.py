@@ -50,8 +50,8 @@ async def lifespan(app: FastAPI):
     os.makedirs(os.path.join(root, "temp"), exist_ok=True)
     os.makedirs(volumes_path, exist_ok=True)
 
-    # Preload AI models for faster first request
-    logger.info("\n=== Preloading AI models ===")
+    # Preload ML models for faster first request
+    logger.info("\n=== Preloading models ===")
     engine = get_engine()
 
     # Load models (this loads into CPU/RAM but may not allocate VRAM yet)
@@ -179,7 +179,7 @@ async def root():
         "message": "Speaker Diarization API",
         "docs": "/docs",
         "api": "/api/v1",
-        "mcp": "/mcp (AI agent interface - JSON-RPC)",
+        "mcp": "/mcp (MCP JSON-RPC interface)",
     }
 
 

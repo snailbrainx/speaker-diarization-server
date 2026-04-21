@@ -158,7 +158,7 @@ async def rename_speaker(
     db: Session = Depends(get_db)
 ):
     """
-    Rename a speaker (useful for AI agents to label unknown speakers)
+    Rename a speaker (useful for MCP clients to label unknown speakers)
 
     Args:
         speaker_id: Speaker ID
