@@ -6,9 +6,6 @@ import json
 class SpeakerBase(BaseModel):
     name: str
 
-class SpeakerCreate(SpeakerBase):
-    pass
-
 class SpeakerResponse(SpeakerBase):
     id: int
     created_at: datetime
@@ -21,35 +18,6 @@ class SpeakerResponse(SpeakerBase):
 class SpeakerRename(BaseModel):
     new_name: str
 
-class SegmentResponse(BaseModel):
-    id: int
-    start_time: float
-    end_time: float
-    speaker_label: str
-    speaker_id: Optional[int]
-    confidence: Optional[float]
-
-    class Config:
-        from_attributes = True
-
-class RecordingResponse(BaseModel):
-    id: int
-    filename: str
-    duration: Optional[float]
-    status: str
-    processed_at: datetime
-    segments: List[SegmentResponse] = []
-
-    class Config:
-        from_attributes = True
-
-class DiarizationResult(BaseModel):
-    recording_id: int
-    num_speakers: int
-    num_known: int
-    num_unknown: int
-    segments: List[SegmentResponse]
-
 class StatusResponse(BaseModel):
     status: str
     message: str
@@ -59,30 +27,12 @@ class StatusResponse(BaseModel):
 
 # Conversation Schemas
 class Word(BaseModel):
-    """Word-level transcription data with confidence"""
+    """Word-level transcription data. Fields are Optional so that legacy rows
+    (pre-word-probability schema) still deserialize without raising."""
     word: str
-    start: float
-    end: float
-    probability: float
-
-# Dual-detector emotion breakdown schemas
-class EmotionDetectorResult(BaseModel):
-    """Result from a single emotion detector"""
-    emotion: str
-    confidence: float
-    all_scores: Optional[dict] = None
-
-class EmotionFinalDecision(BaseModel):
-    """Final emotion decision with reasoning"""
-    emotion: str
-    reasoning: str
-    voice_profile_available: bool
-
-class EmotionDetectorBreakdown(BaseModel):
-    """Breakdown of dual-detector emotion system"""
-    emotion2vec_detector: EmotionDetectorResult
-    voice_profile_detector: Optional[EmotionDetectorResult]
-    final_decision: EmotionFinalDecision
+    start: Optional[float] = None
+    end: Optional[float] = None
+    probability: Optional[float] = None
 
 class ConversationSegmentResponse(BaseModel):
     id: int
@@ -174,10 +124,6 @@ class ConversationResponse(BaseModel):
 
     class Config:
         from_attributes = True
-
-
-class ConversationCreate(BaseModel):
-    title: Optional[str] = None
 
 
 class ConversationUpdate(BaseModel):

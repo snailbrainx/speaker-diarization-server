@@ -3,32 +3,23 @@ fastapi==0.115.5
 uvicorn[standard]==0.32.1
 python-multipart>=0.0.18
 pydantic==2.11.0
-pydantic-settings==2.6.1
 
-# AI/ML dependencies
-# Note: Torch 2.8.x is installed separately in Dockerfile with CUDA support (cu126)
-# Required for pyannote.audio 4.0.x which depends on torchcodec (needs torch>=2.8.0)
+# ML dependencies
+# Note: Torch 2.10.x is installed separately in Dockerfile with CUDA support (cu128)
+# PyTorch 2.10+ required for Blackwell (RTX 5090 sm_120) support
 # torch  - DO NOT UNCOMMENT - installed in Dockerfile
-# torchvision  - DO NOT UNCOMMENT - installed in Dockerfile
 # torchaudio  - DO NOT UNCOMMENT - installed in Dockerfile
 pyannote.audio==4.0.1
-huggingface_hub>=1.1.0
-omegaconf
+huggingface_hub~=1.3.4
+omegaconf~=2.3.0
 faster-whisper==1.2.1
-funasr
-soundfile
+funasr==1.3.1
+soundfile~=0.13.1
 
 # Database
 sqlalchemy==2.0.36
-alembic==1.14.0
 
 # Utilities
-numpy>=2.0.0
-scikit-learn>=1.6.1
-python-dotenv==1.0.1
-aiofiles==23.2.1
+numpy~=2.3.0
+scikit-learn~=1.8.0
 pydub==0.25.1
-sounddevice==0.5.1
-
-# MCP Server
-mcp>=1.0.0

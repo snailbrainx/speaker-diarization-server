@@ -1,11 +1,17 @@
 services:
   speaker-diarization:
     build: .
-    container_name: speaker-diarization-app
+    container_name: speaker-diarization-server
     environment:
-      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_VISIBLE_DEVICES=${NVIDIA_VISIBLE_DEVICES:-all}
+      - CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
+      # Without this, CUDA enumerates by FASTEST_FIRST and CUDA_VISIBLE_DEVICES
+      # indices stop matching nvidia-smi (e.g. index 0 would pick the 5090 even
+      # if you meant the 3090). PCI_BUS_ID keeps the two in sync.
+      - CUDA_DEVICE_ORDER=PCI_BUS_ID
       - DATABASE_URL=sqlite:////app/volumes/speakers.db
       - HF_TOKEN=${HF_TOKEN:-}
+      - CORS_ORIGINS=${CORS_ORIGINS:-}
       - SPEAKER_THRESHOLD=${SPEAKER_THRESHOLD:-0.30}
       - CONTEXT_PADDING=${CONTEXT_PADDING:-0.15}
       - SILENCE_DURATION=${SILENCE_DURATION:-0.5}
@@ -13,20 +19,26 @@ services:
       - WHISPER_MODEL=${WHISPER_MODEL:-large-v3}
       - WHISPER_LANGUAGE=${WHISPER_LANGUAGE:-en}
       - OFFLINE_MODE=${OFFLINE_MODE:-false}
+    # Match the `app` user baked into the image (uid 1000) so bind-mounted
+    # volumes stay writable without chown gymnastics on the host.
+    user: "1000:1000"
     ports:
-      - "8418:8000"  # FastAPI backend API
+      - "8418:8418"
     volumes:
-      # Persistent storage for speaker database and embeddings
+      # SSL certificates for HTTPS/WSS
+      - ./certs:/app/certs:ro
+      # Persistent storage: speaker DB, embeddings, and HuggingFace model cache.
+      # HF_HOME is /app/volumes/huggingface_cache (set in the Dockerfile) so
+      # everything pyannote + faster-whisper download lives under this mount.
       - ./volumes:/app/volumes
-      # Optional: Mount for audio files
+      # Audio recordings and temp files
       - ./data:/app/data
       # Backup snapshots
       - ./backups:/app/backups
-      # Model caches (persist downloaded models)
-      - ./volumes/huggingface_cache:/root/.cache/huggingface
-      # Note: faster-whisper uses huggingface cache, not separate whisper cache
-      # Development: Mount source code (comment out for production)
-      - ./app:/app/app
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     deploy:
       resources:
         reservations:
@@ -35,3 +47,8 @@ services:
               count: all
               capabilities: [gpu]
     restart: unless-stopped
+
+# Development convenience: docker-compose.override.yml bind-mounts ./app
+# over the image's /app/app for live reloads. Delete or rename that file
+# (or `docker compose -f docker-compose.yml up` without the override) for a
+# production run that uses only the baked-in code.

@@ -1,8 +1,8 @@
 from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey, LargeBinary, Text, Boolean, UniqueConstraint
 from sqlalchemy.orm import relationship
-from datetime import datetime
-from .database import Base
+from .database import Base, utc_now
 import json
+import numpy as np
 
 class Speaker(Base):
     __tablename__ = "speakers"
@@ -10,24 +10,23 @@ class Speaker(Base):
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String, unique=True, index=True, nullable=False)
     embedding = Column(LargeBinary, nullable=False)  # Stored as numpy array bytes
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=utc_now)
+    updated_at = Column(DateTime, default=utc_now, onupdate=utc_now)
 
     # Per-speaker emotion matching threshold (NULL = use global default)
     emotion_threshold = Column(Float, nullable=True)
 
     # Relationships
-    segments = relationship("Segment", back_populates="speaker")
     emotion_profiles = relationship("SpeakerEmotionProfile", back_populates="speaker", cascade="all, delete-orphan")
 
     def get_embedding(self):
         """Convert binary embedding back to numpy array"""
-        import numpy as np
+
         return np.frombuffer(self.embedding, dtype=np.float32)
 
     def set_embedding(self, embedding_array):
         """Convert numpy array to binary for storage"""
-        import numpy as np
+
         self.embedding = embedding_array.astype(np.float32).tobytes()
 
 
@@ -39,7 +38,7 @@ class SpeakerEmotionProfile(Base):
     __tablename__ = "speaker_emotion_profiles"
 
     id = Column(Integer, primary_key=True, index=True)
-    speaker_id = Column(Integer, ForeignKey("speakers.id", ondelete="CASCADE"), nullable=False)
+    speaker_id = Column(Integer, ForeignKey("speakers.id", ondelete="CASCADE"), nullable=False, index=True)
     emotion_category = Column(String, nullable=False)  # 'angry', 'happy', 'sad', etc.
 
     # Emotion embedding (1024-D from emotion2vec)
@@ -54,8 +53,8 @@ class SpeakerEmotionProfile(Base):
     voice_sample_count = Column(Integer, default=0)  # How many voice samples in this emotion profile
     voice_threshold = Column(Float, nullable=True)  # Custom threshold for voice matching (NULL = use speaker/global)
 
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=utc_now)
+    updated_at = Column(DateTime, default=utc_now, onupdate=utc_now)
 
     # Unique constraint: one profile per speaker per emotion
     __table_args__ = (
@@ -67,19 +66,19 @@ class SpeakerEmotionProfile(Base):
 
     def get_embedding(self):
         """Convert binary emotion embedding to numpy array"""
-        import numpy as np
+
         return np.frombuffer(self.embedding, dtype=np.float32)
 
     def set_embedding(self, embedding_array):
         """Convert numpy array to binary (emotion embedding)"""
-        import numpy as np
+
         self.embedding = embedding_array.astype(np.float32).tobytes()
     
     def get_voice_embedding(self):
         """Convert binary voice embedding to numpy array"""
         if self.voice_embedding is None:
             return None
-        import numpy as np
+
         return np.frombuffer(self.voice_embedding, dtype=np.float32)
     
     def set_voice_embedding(self, embedding_array):
@@ -87,37 +86,8 @@ class SpeakerEmotionProfile(Base):
         if embedding_array is None:
             self.voice_embedding = None
             return
-        import numpy as np
+
         self.voice_embedding = embedding_array.astype(np.float32).tobytes()
-
-
-class Recording(Base):
-    __tablename__ = "recordings"
-
-    id = Column(Integer, primary_key=True, index=True)
-    filename = Column(String, nullable=False)
-    duration = Column(Float)  # Duration in seconds
-    processed_at = Column(DateTime, default=datetime.utcnow)
-    status = Column(String, default="processing")  # processing, completed, failed
-
-    # Relationship to segments
-    segments = relationship("Segment", back_populates="recording", cascade="all, delete-orphan")
-
-
-class Segment(Base):
-    __tablename__ = "segments"
-
-    id = Column(Integer, primary_key=True, index=True)
-    recording_id = Column(Integer, ForeignKey("recordings.id"), nullable=False)
-    speaker_id = Column(Integer, ForeignKey("speakers.id"), nullable=True)  # Null if unknown
-    start_time = Column(Float, nullable=False)  # Start time in seconds
-    end_time = Column(Float, nullable=False)  # End time in seconds
-    confidence = Column(Float)  # Confidence score for speaker match
-    speaker_label = Column(String)  # e.g., "SPEAKER_00", "Unknown_01", or actual name
-
-    # Relationships
-    recording = relationship("Recording", back_populates="segments")
-    speaker = relationship("Speaker", back_populates="segments")
 
 
 class Conversation(Base):
@@ -128,7 +98,7 @@ class Conversation(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     title = Column(String, nullable=True)  # Auto-generated or user-set
-    start_time = Column(DateTime, nullable=False, default=datetime.utcnow)
+    start_time = Column(DateTime, nullable=False, default=utc_now)
     end_time = Column(DateTime, nullable=True)  # Null while recording
     duration = Column(Float, nullable=True)  # Duration in seconds
     status = Column(String, default="recording")  # recording, processing, completed, failed
@@ -136,7 +106,7 @@ class Conversation(Base):
     audio_format = Column(String, default="wav")  # wav or mp3
     num_segments = Column(Integer, default=0)
     num_speakers = Column(Integer, default=0)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=utc_now)
 
     # Relationships
     transcript_segments = relationship("ConversationSegment", back_populates="conversation", cascade="all, delete-orphan")
@@ -149,12 +119,12 @@ class ConversationSegment(Base):
     __tablename__ = "conversation_segments"
 
     id = Column(Integer, primary_key=True, index=True)
-    conversation_id = Column(Integer, ForeignKey("conversations.id"), nullable=False)
-    speaker_id = Column(Integer, ForeignKey("speakers.id", ondelete="SET NULL"), nullable=True)  # Null for unknown - auto-set to NULL when speaker deleted
+    conversation_id = Column(Integer, ForeignKey("conversations.id"), nullable=False, index=True)
+    speaker_id = Column(Integer, ForeignKey("speakers.id", ondelete="SET NULL"), nullable=True, index=True)  # Null for unknown - auto-set to NULL when speaker deleted
     speaker_name = Column(String, nullable=True)  # Denormalized for quick access
     text = Column(Text, nullable=True)  # Transcription text
 
-    # Absolute timestamps (for AI context)
+    # Absolute timestamps (for MCP clients)
     start_time = Column(DateTime, nullable=False)
     end_time = Column(DateTime, nullable=False)
 
@@ -183,7 +153,7 @@ class ConversationSegment(Base):
     words_data = Column(Text, nullable=True)  # Stores JSON array of {word, start, end, probability}
     avg_logprob = Column(Float, nullable=True)  # Segment-level average log probability
 
-    processed_at = Column(DateTime, default=datetime.utcnow)
+    processed_at = Column(DateTime, default=utc_now)
 
     # Misidentification tracking
     is_misidentified = Column(Boolean, default=False, nullable=False)  # True if this segment was wrongly assigned to current speaker
@@ -199,20 +169,19 @@ class ConversationSegment(Base):
 
     @property
     def words(self):
-        """Parse words_data JSON and return as list"""
-        if self.words_data:
-            try:
-                import json
-                return json.loads(self.words_data)
-            except:
-                return None
-        return None
+        """Parse words_data JSON and return as list."""
+        if not self.words_data:
+            return None
+        try:
+            return json.loads(self.words_data)
+        except (json.JSONDecodeError, TypeError):
+            return None
 
     def get_speaker_embedding(self):
         """Convert binary speaker embedding back to numpy array"""
         if self.speaker_embedding is None:
             return None
-        import numpy as np
+
         return np.frombuffer(self.speaker_embedding, dtype=np.float32)
 
     def set_speaker_embedding(self, embedding_array):
@@ -220,14 +189,14 @@ class ConversationSegment(Base):
         if embedding_array is None:
             self.speaker_embedding = None
             return
-        import numpy as np
+
         self.speaker_embedding = embedding_array.astype(np.float32).tobytes()
 
     def get_emotion_embedding(self):
         """Convert binary emotion embedding back to numpy array"""
         if self.emotion_embedding is None:
             return None
-        import numpy as np
+
         return np.frombuffer(self.emotion_embedding, dtype=np.float32)
 
     def set_emotion_embedding(self, embedding_array):
@@ -235,23 +204,7 @@ class ConversationSegment(Base):
         if embedding_array is None:
             self.emotion_embedding = None
             return
-        import numpy as np
+
         self.emotion_embedding = embedding_array.astype(np.float32).tobytes()
 
 
-class GroundTruthLabel(Base):
-    """
-    Ground truth speaker labels for testing and optimization
-    Stores manual identifications WITHOUT affecting the actual segments
-    """
-    __tablename__ = "ground_truth_labels"
-
-    id = Column(Integer, primary_key=True, index=True)
-    segment_id = Column(Integer, ForeignKey("conversation_segments.id"), nullable=False)
-    true_speaker_name = Column(String, nullable=False)  # Manual identification
-    labeled_by = Column(String, default="user")  # Who labeled it
-    labeled_at = Column(DateTime, default=datetime.utcnow)
-    notes = Column(Text, nullable=True)  # Optional notes about the segment
-
-    # Relationship
-    segment = relationship("ConversationSegment")

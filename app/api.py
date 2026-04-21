@@ -1,24 +1,39 @@
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
+from sqlalchemy import func
 from sqlalchemy.orm import Session
-from typing import List, Optional
+from typing import List
 import os
 import shutil
-from datetime import datetime, timedelta
-import json
+import asyncio
+import logging
+from datetime import timedelta
 import torch
 from pydub import AudioSegment
 
-from .database import get_db
-from .models import Speaker, Recording, Segment, Conversation, ConversationSegment
+logger = logging.getLogger(__name__)
+
+from .database import get_db, utc_now
+from .models import Speaker, SpeakerEmotionProfile, Conversation, ConversationSegment
 from .schemas import (
-    SpeakerCreate, SpeakerResponse, SpeakerRename,
-    RecordingResponse, SegmentResponse, DiarizationResult,
-    StatusResponse, ConversationResponse
+    SpeakerResponse, SpeakerRename,
+    StatusResponse, ConversationResponse,
 )
 from .diarization import SpeakerRecognitionEngine
 from .config import get_config
+from .services import (
+    create_segment_from_result,
+    data_path,
+    delete_unknown_speakers,
+    load_known_speakers,
+)
 
 router = APIRouter()
+
+
+def _convert_audio(src: str, dst: str) -> None:
+    """Blocking pydub conversion — always called via asyncio.to_thread."""
+    AudioSegment.from_file(src).export(dst, format="wav")
+
 
 # Initialize speaker recognition engine (singleton)
 engine = None
@@ -44,9 +59,6 @@ async def get_status():
 @router.get("/speakers", response_model=List[SpeakerResponse])
 async def list_speakers(db: Session = Depends(get_db)):
     """List all enrolled speakers with segment counts"""
-    from sqlalchemy import func
-
-    # Query speakers with segment counts
     speakers_with_counts = db.query(
         Speaker,
         func.count(ConversationSegment.id).label('segment_count')
@@ -88,34 +100,35 @@ async def enroll_speaker(
     if existing:
         raise HTTPException(status_code=400, detail=f"Speaker '{name}' already exists")
 
-    # Save audio file temporarily
-    data_path = os.getenv("DATA_PATH", "/app/data")
-    os.makedirs(f"{data_path}/temp", exist_ok=True)
-    temp_path = f"{data_path}/temp/{audio_file.filename}"
+    # Save audio file temporarily (sanitize filename to prevent path traversal)
+    temp_dir = os.path.join(data_path(), "temp")
+    os.makedirs(temp_dir, exist_ok=True)
+    safe_filename = os.path.basename(audio_file.filename or "upload")
+    temp_path = os.path.join(temp_dir, safe_filename)
 
-    with open(temp_path, "wb") as buffer:
-        shutil.copyfileobj(audio_file.file, buffer)
+    def _stream_upload():
+        with open(temp_path, "wb") as buffer:
+            shutil.copyfileobj(audio_file.file, buffer)
+    await asyncio.to_thread(_stream_upload)
 
     try:
-        # Convert MP3 to WAV if needed (speaker enrollment may receive MP3 uploads)
+        # Convert MP3 to WAV if needed (speaker enrollment may receive MP3 uploads).
+        # pydub.from_file shells out to ffmpeg and is blocking — run off the event loop.
         wav_temp_path = None
         if temp_path.lower().endswith('.mp3'):
+            wav_temp_path = temp_path.rsplit('.', 1)[0] + '_enrolled.wav'
             try:
-                print(f"Converting uploaded MP3 to WAV for speaker enrollment...")
-                audio = AudioSegment.from_file(temp_path)
-                wav_temp_path = temp_path.rsplit('.', 1)[0] + '_enrolled.wav'
-                audio.export(wav_temp_path, format='wav')
-                # Use WAV for embedding extraction
+                await asyncio.to_thread(_convert_audio, temp_path, wav_temp_path)
                 extraction_path = wav_temp_path
-                print(f"Conversion successful: {wav_temp_path}")
             except Exception as e:
-                print(f"Warning: Failed to convert MP3 to WAV: {e}")
+                logger.warning(f"Failed to convert MP3 to WAV: {e}")
+                wav_temp_path = None
                 extraction_path = temp_path  # Fall back to MP3
         else:
             extraction_path = temp_path
 
-        # Extract embedding
-        embedding = engine.extract_embedding(extraction_path)
+        # Extract embedding (run in thread to avoid blocking event loop)
+        embedding = await asyncio.to_thread(engine.extract_embedding, extraction_path)
 
         # Create speaker in database
         speaker = Speaker(name=name)
@@ -145,7 +158,7 @@ async def rename_speaker(
     db: Session = Depends(get_db)
 ):
     """
-    Rename a speaker (useful for AI agents to label unknown speakers)
+    Rename a speaker (useful for MCP clients to label unknown speakers)
 
     Args:
         speaker_id: Speaker ID
@@ -165,10 +178,8 @@ async def rename_speaker(
 
     old_name = speaker.name
     speaker.name = rename_data.new_name
-    speaker.updated_at = datetime.utcnow()
+    speaker.updated_at = utc_now()
 
-    # UPDATE ALL PAST CONVERSATION SEGMENTS
-    from .models import ConversationSegment
     updated_segments = db.query(ConversationSegment).filter(
         ConversationSegment.speaker_id == speaker_id
     ).update({"speaker_name": rename_data.new_name})
@@ -176,7 +187,10 @@ async def rename_speaker(
     db.commit()
     db.refresh(speaker)
 
-    print(f"✓ Renamed speaker '{old_name}' → '{rename_data.new_name}' (updated {updated_segments} past segments)")
+    # A live WS stream caches profiles by name; drop the cache so matches use the new name.
+    get_engine().clear_speaker_cache()
+
+    logger.info(f"✓ Renamed speaker '{old_name}' → '{rename_data.new_name}' (updated {updated_segments} past segments)")
 
     return speaker
 
@@ -184,8 +198,6 @@ async def rename_speaker(
 @router.delete("/speakers/{speaker_id}")
 async def delete_speaker(speaker_id: int, db: Session = Depends(get_db)):
     """Delete a speaker"""
-    from .models import SpeakerEmotionProfile, ConversationSegment
-
     speaker = db.query(Speaker).filter(Speaker.id == speaker_id).first()
     if not speaker:
         raise HTTPException(status_code=404, detail="Speaker not found")
@@ -200,41 +212,22 @@ async def delete_speaker(speaker_id: int, db: Session = Depends(get_db)):
         SpeakerEmotionProfile.speaker_id == speaker_id
     ).delete(synchronize_session=False)
 
-    # 3. Delete speaker
+    # Capture name before delete — post-commit attribute access can
+    # trigger an expired-instance reload that raises.
+    name = speaker.name
+
     db.delete(speaker)
     db.commit()
 
-    return {"message": f"Speaker '{speaker.name}' deleted successfully"}
+    get_engine().clear_speaker_cache()
+
+    return {"message": f"Speaker '{name}' deleted successfully"}
 
 
 @router.delete("/speakers/unknown/all")
 async def delete_all_unknown_speakers(db: Session = Depends(get_db)):
     """Delete all speakers with names starting with 'Unknown_'"""
-    from .models import SpeakerEmotionProfile, ConversationSegment
-
-    unknown_speakers = db.query(Speaker).filter(
-        Speaker.name.like("Unknown_%")
-    ).all()
-
-    deleted_count = len(unknown_speakers)
-    speaker_ids = [s.id for s in unknown_speakers]
-
-    # 1. Set speaker_id to NULL in segments (SQLite FK constraint is NO ACTION, not SET NULL)
-    if speaker_ids:
-        db.query(ConversationSegment).filter(
-            ConversationSegment.speaker_id.in_(speaker_ids)
-        ).update({"speaker_id": None}, synchronize_session=False)
-
-    # 2. Delete emotion profiles
-    for speaker in unknown_speakers:
-        db.query(SpeakerEmotionProfile).filter(
-            SpeakerEmotionProfile.speaker_id == speaker.id
-        ).delete(synchronize_session=False)
-
-    # 3. Delete speakers
-    for speaker in unknown_speakers:
-        db.delete(speaker)
-
+    deleted_count, _ = delete_unknown_speakers(db, engine=get_engine())
     db.commit()
 
     return {
@@ -246,7 +239,6 @@ async def delete_all_unknown_speakers(db: Session = Depends(get_db)):
 @router.post("/process", response_model=ConversationResponse)
 async def process_audio(
     audio_file: UploadFile = File(...),
-    enable_transcription: bool = Form(True),
     db: Session = Depends(get_db),
     engine: SpeakerRecognitionEngine = Depends(get_engine)
 ):
@@ -255,36 +247,35 @@ async def process_audio(
     Creates a new Conversation with segments.
     """
     # Save audio file
-    data_path = os.getenv("DATA_PATH", "/app/data")
-    os.makedirs(f"{data_path}/recordings", exist_ok=True)
-    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    recordings_dir = os.path.join(data_path(), "recordings")
+    os.makedirs(recordings_dir, exist_ok=True)
+    timestamp = utc_now().strftime("%Y%m%d_%H%M%S")
 
-    # Save uploaded file with timestamp
-    base_filename = audio_file.filename or "upload"
+    # Save uploaded file with timestamp (basename strips any directory component)
+    base_filename = os.path.basename(audio_file.filename or "upload")
     temp_filename = f"uploaded_{timestamp}_{base_filename}"
-    temp_path = f"{data_path}/recordings/{temp_filename}"
+    temp_path = os.path.join(recordings_dir, temp_filename)
 
-    with open(temp_path, "wb") as buffer:
-        shutil.copyfileobj(audio_file.file, buffer)
+    def _stream_upload():
+        with open(temp_path, "wb") as buffer:
+            shutil.copyfileobj(audio_file.file, buffer)
+    await asyncio.to_thread(_stream_upload)
 
-    # Convert to WAV for reliable processing
-    if not temp_path.endswith('.wav'):
+    # Convert to WAV for reliable processing (blocking ffmpeg shell-out)
+    if not temp_path.lower().endswith('.wav'):
+        wav_filename = temp_filename.rsplit('.', 1)[0] + '.wav'
+        file_path = os.path.join(recordings_dir, wav_filename)
         try:
-            audio = AudioSegment.from_file(temp_path)
-            wav_filename = temp_filename.rsplit('.', 1)[0] + '.wav'
-            file_path = f"{data_path}/recordings/{wav_filename}"
-            audio.export(file_path, format='wav')
-            # Remove original after conversion
+            await asyncio.to_thread(_convert_audio, temp_path, file_path)
             os.remove(temp_path)
         except Exception as e:
-            # If conversion fails, use original file
-            print(f"Warning: Failed to convert to WAV: {e}")
+            logger.warning(f"Failed to convert to WAV: {e}")
             file_path = temp_path
     else:
         file_path = temp_path
 
     # Create conversation entry
-    start_time = datetime.utcnow()
+    start_time = utc_now()
     conversation = Conversation(
         title=f"Uploaded: {audio_file.filename}",
         audio_path=file_path,
@@ -296,80 +287,30 @@ async def process_audio(
     db.refresh(conversation)
 
     try:
-        # Get known speakers
-        speakers = db.query(Speaker).all()
-        known_speakers = [(s.id, s.name, s.get_embedding()) for s in speakers]
+        known_speakers = load_known_speakers(db)
 
         # Get threshold from config
         config = get_config()
         settings = config.get_settings()
         threshold = settings.speaker_threshold
 
-        # Process audio with transcription
-        if enable_transcription:
-            result = engine.transcribe_with_diarization(
-                file_path,
-                known_speakers,
-                threshold=threshold,
-                db_session=db
-            )
-        else:
-            result = engine.process_audio_with_recognition(
-                file_path,
-                known_speakers,
-                threshold=threshold
-            )
+        # Process audio with transcription (run in thread to avoid blocking event loop)
+        result = await asyncio.to_thread(
+            engine.transcribe_with_diarization,
+            file_path,
+            known_speakers,
+            threshold=threshold,
+            db_session=db
+        )
 
-        # Create conversation segments
         for seg in result["segments"]:
-            # Determine speaker
-            speaker_id = None
-            speaker_name = seg["speaker"]
-            confidence = seg.get("confidence", 0.0)
-
-            if seg.get("is_known"):
-                # Find speaker by name
-                speaker = db.query(Speaker).filter(Speaker.name == speaker_name).first()
-                if speaker:
-                    speaker_id = speaker.id
-            else:
-                # Auto-enroll unknown speakers with embeddings (enables clustering)
-                embedding = seg.get("embedding")
-                if embedding is not None and speaker_name and speaker_name.startswith("Unknown_"):
-                    from .diarization import auto_enroll_unknown_speaker
-                    speaker_id, speaker_name = auto_enroll_unknown_speaker(
-                        embedding, db, threshold=threshold
-                    )
-                    # Update confidence since we're using the enrolled speaker
-                    confidence = 1.0 if speaker_id else confidence
-
-            # Serialize word-level data if available
-            words_json = json.dumps(seg["words"]) if seg.get("words") else None
-
-            segment = ConversationSegment(
+            create_segment_from_result(
+                seg=seg,
                 conversation_id=conversation.id,
-                speaker_id=speaker_id,
-                speaker_name=speaker_name,
-                text=seg.get("text", ""),
-                start_time=start_time + timedelta(seconds=seg["start"]),
-                end_time=start_time + timedelta(seconds=seg["end"]),
-                start_offset=seg["start"],
-                end_offset=seg["end"],
-                confidence=confidence,
-                emotion_category=seg.get("emotion_category"),
-                emotion_confidence=seg.get("emotion_confidence"),
-                detector_breakdown=json.dumps(seg["detector_breakdown"]) if seg.get("detector_breakdown") else None,
-                words_data=words_json,  # Include word-level confidence
-                avg_logprob=seg.get("avg_logprob")
+                conv_start=start_time,
+                db=db,
+                threshold=threshold,
             )
-
-            # Store embeddings for fast recalculation (no audio re-extraction needed)
-            if seg.get("embedding") is not None:
-                segment.set_speaker_embedding(seg["embedding"])
-            if seg.get("emotion_embedding") is not None:
-                segment.set_emotion_embedding(seg["emotion_embedding"])
-
-            db.add(segment)
 
         # Update conversation metadata
         conversation.status = "completed"
@@ -388,23 +329,16 @@ async def process_audio(
         # Return conversation
         return conversation
 
-    except Exception as e:
-        conversation.status = "failed"
-        db.commit()
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        # Roll back any half-built segments from create_segment_from_result
+        # so the failed-status commit doesn't persist partial state.
+        db.rollback()
+        failed = db.query(Conversation).filter(Conversation.id == conversation.id).first()
+        if failed is not None:
+            failed.status = "failed"
+            db.commit()
+        raise HTTPException(status_code=500, detail="Audio processing failed")
 
 
-@router.get("/recordings", response_model=List[RecordingResponse])
-async def list_recordings(db: Session = Depends(get_db)):
-    """List all recordings"""
-    recordings = db.query(Recording).all()
-    return recordings
-
-
-@router.get("/recordings/{recording_id}", response_model=RecordingResponse)
-async def get_recording(recording_id: int, db: Session = Depends(get_db)):
-    """Get recording details with segments"""
-    recording = db.query(Recording).filter(Recording.id == recording_id).first()
-    if not recording:
-        raise HTTPException(status_code=404, detail="Recording not found")
-    return recording

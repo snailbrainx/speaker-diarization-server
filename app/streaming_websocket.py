@@ -3,18 +3,23 @@ WebSocket endpoint for real-time audio streaming and transcription.
 Integrates with StreamingRecorder for live speaker diarization.
 """
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Depends
+from starlette.websockets import WebSocketState
 from sqlalchemy.orm import Session
 import numpy as np
 import json
 import asyncio
-from datetime import datetime, timedelta
-from typing import Dict, Optional
+import logging
+from datetime import datetime
+from typing import Optional
 
-from .database import get_db
-from .models import Conversation, ConversationSegment, Speaker
+from .database import SessionLocal, get_db, utc_now
+from .models import Conversation, ConversationSegment
 from .streaming_recorder import StreamingRecorder
 from .config import get_config
+from .services import create_segment_from_result, load_known_speakers
 import os
+
+logger = logging.getLogger(__name__)
 
 
 def convert_numpy_to_native(obj):
@@ -30,13 +35,15 @@ def convert_numpy_to_native(obj):
     else:
         return obj
 
+# WebSocket streams use 48 kHz float32 PCM — same rate as the browser's
+# MediaRecorder default. The StreamingRecorder resamples internally.
+WS_SAMPLE_RATE = 48000
+# Noise floor below which a frame is treated as silence. Tuned against typical
+# near-field microphones on a quiet channel; adjust in StreamingRecorder config
+# if you need different behaviour per-deployment.
+WS_SILENCE_THRESHOLD = 0.005
+
 router = APIRouter(prefix="/streaming", tags=["Streaming"])
-
-# Active WebSocket connections (conversation_id -> WebSocket)
-active_connections: Dict[int, WebSocket] = {}
-
-# Active recorders (conversation_id -> StreamingRecorder)
-active_recorders: Dict[int, StreamingRecorder] = {}
 
 
 def get_engine():
@@ -49,23 +56,23 @@ async def send_message(websocket: WebSocket, message_type: str, data: dict):
     """Send JSON message to WebSocket client"""
     try:
         # Check if WebSocket is still connected
-        if websocket.client_state.CONNECTED:
+        if websocket.client_state == WebSocketState.CONNECTED:
             message = {
                 "type": message_type,
                 "data": data,
-                "timestamp": datetime.utcnow().isoformat()
+                "timestamp": utc_now().isoformat()
             }
-            print(f"🔌 Sending WebSocket message: type={message_type}, data_keys={list(data.keys()) if isinstance(data, dict) else 'not-dict'}")
+            logger.info(f"🔌 Sending WebSocket message: type={message_type}, data_keys={list(data.keys()) if isinstance(data, dict) else 'not-dict'}")
             await websocket.send_json(message)
-            print(f"✅ Successfully sent {message_type} message")
+            logger.info(f"✅ Successfully sent {message_type} message")
         else:
-            print(f"⚪ WebSocket not connected, skipping {message_type} message")
+            logger.info(f"⚪ WebSocket not connected, skipping {message_type} message")
     except WebSocketDisconnect:
         # Expected during stop/cleanup - client disconnected before we could send
-        print(f"⚪ Client disconnected, skipping {message_type} message (expected during shutdown)")
+        logger.info(f"⚪ Client disconnected, skipping {message_type} message (expected during shutdown)")
     except Exception as e:
         # Unexpected errors
-        print(f"❌ ERROR sending {message_type} message: {e}")
+        logger.error(f"ERROR sending{message_type} message: {e}")
         import traceback
         traceback.print_exc()
 
@@ -98,7 +105,7 @@ async def websocket_endpoint(
         # Create conversation
         conversation = Conversation(
             title=f"Live Recording {datetime.now().strftime('%Y-%m-%d %H:%M')}",
-            start_time=datetime.utcnow(),
+            start_time=utc_now(),
             status="recording"
         )
         db.add(conversation)
@@ -106,44 +113,43 @@ async def websocket_endpoint(
         db.refresh(conversation)
 
         conversation_id = conversation.id
-        active_connections[conversation_id] = websocket
 
         # Initialize recorder
         config = get_config()
         settings = config.get_settings()
 
         recorder = StreamingRecorder(
-            sample_rate=48000,
-            silence_threshold=0.005,
+            sample_rate=WS_SAMPLE_RATE,
+            silence_threshold=WS_SILENCE_THRESHOLD,
             silence_duration=settings.silence_duration,
-            max_workers=2
         )
 
         # Get event loop for scheduling async tasks from background threads
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
 
         # Set callback after initialization
-        # Use asyncio.run_coroutine_threadsafe to schedule from background thread
+        # Use asyncio.run_coroutine_threadsafe to schedule from background thread.
+        # The coroutine creates its own DB session — the request-scoped `db` is not
+        # thread-safe and may conflict with the main handler's usage.
         def segment_callback(seg_info):
             asyncio.run_coroutine_threadsafe(
-                _handle_segment_processed(websocket, conversation_id, seg_info, db, get_engine()),
+                _handle_segment_processed(websocket, conversation_id, seg_info, get_engine()),
                 loop
             )
 
         recorder.on_segment_processed = segment_callback
 
         recorder.start_recording(conversation_id)
-        active_recorders[conversation_id] = recorder
 
         # Load speaker cache for fast matching (avoids DB queries per segment)
         engine = get_engine()
         cache_size = engine.load_speaker_cache(db)
-        print(f"🚀 Speaker cache loaded: {cache_size} profiles ready for streaming")
+        logger.info(f"🚀 Speaker cache loaded: {cache_size} profiles ready for streaming")
 
         # Send confirmation
         await send_message(websocket, "started", {
             "conversation_id": conversation_id,
-            "sample_rate": 48000,
+            "sample_rate": WS_SAMPLE_RATE,
             "message": "Recording started"
         })
 
@@ -154,17 +160,21 @@ async def websocket_endpoint(
                 message = await websocket.receive()
 
                 if "bytes" in message:
-                    # Binary audio chunk
+                    # Binary audio chunk (float32 PCM, 4 bytes/sample)
                     audio_bytes = message["bytes"]
-                    print(f"📦 Received audio chunk: {len(audio_bytes)} bytes")
+                    logger.info(f"📦 Received audio chunk: {len(audio_bytes)} bytes")
 
-                    # Convert bytes to numpy array (assuming float32)
+                    # Clients occasionally send truncated frames — skip instead of crashing.
+                    if len(audio_bytes) % 4 != 0:
+                        logger.info(f"⚠️ Dropping misaligned audio chunk ({len(audio_bytes)} bytes)")
+                        continue
+
                     audio_array = np.frombuffer(audio_bytes, dtype=np.float32)
-                    print(f"🔊 Converted to audio array: {len(audio_array)} samples")
+                    logger.info(f"🔊 Converted to audio array: {len(audio_array)} samples")
 
                     # Process chunk (StreamingRecorder expects tuple of (sample_rate, audio_data))
-                    result = recorder.process_audio_chunk((48000, audio_array))
-                    print(f"📊 VAD: {result['speech_detected']}, Level: {result['audio_level']:.3f}")
+                    result = recorder.process_audio_chunk((WS_SAMPLE_RATE, audio_array))
+                    logger.info(f"📊 VAD: {result['speech_detected']}, Level: {result['audio_level']:.3f}")
 
                     # Send status update
                     await send_message(websocket, "status", {
@@ -173,7 +183,7 @@ async def websocket_endpoint(
                         "stats": {
                             "buffer_size": result.get("buffer_size", 0),
                             "segments_processed": result.get("segments_processed", 0),
-                            "total_audio_seconds": result.get("segments_processed", 0) * 2.0  # Estimate
+                            "total_audio_seconds": float(result.get("cumulative_offset", 0.0)),
                         }
                     })
 
@@ -186,15 +196,15 @@ async def websocket_endpoint(
                         break
 
             except WebSocketDisconnect:
-                print(f"WebSocket disconnected for conversation {conversation_id}")
+                logger.info(f"WebSocket disconnected for conversation {conversation_id}")
                 break
             except Exception as e:
-                print(f"Error processing audio chunk: {e}")
+                logger.error(f"Error processingaudio chunk: {e}")
                 import traceback
                 traceback.print_exc()
                 try:
                     await send_message(websocket, "error", {"message": str(e)})
-                except:
+                except Exception:
                     pass  # Connection already closed
                 break  # Exit loop on error
 
@@ -202,22 +212,17 @@ async def websocket_endpoint(
         await _finalize_recording(conversation_id, recorder, conversation, db, websocket)
 
     except WebSocketDisconnect:
-        print(f"WebSocket disconnected during initialization")
+        logger.info(f"WebSocket disconnected during initialization")
         if conversation_id and recorder:
             await _finalize_recording(conversation_id, recorder, conversation, db, None)
     except Exception as e:
-        print(f"WebSocket error: {e}")
-        if websocket.client_state.CONNECTED:
+        logger.info(f"WebSocket error: {e}")
+        if websocket.client_state == WebSocketState.CONNECTED:
             await send_message(websocket, "error", {"message": str(e)})
     finally:
-        # Cleanup
-        if conversation_id:
-            active_connections.pop(conversation_id, None)
-            active_recorders.pop(conversation_id, None)
-
         # Close WebSocket if still open (ignore if already closed)
         try:
-            if websocket.client_state.CONNECTED:
+            if websocket.client_state == WebSocketState.CONNECTED:
                 await websocket.close()
         except RuntimeError:
             # WebSocket already closed, ignore
@@ -228,13 +233,18 @@ async def _handle_segment_processed(
     websocket: WebSocket,
     conversation_id: int,
     segment_info: dict,
-    db: Session,
     engine
 ):
     """
     Callback when StreamingRecorder finishes processing a segment.
-    Runs diarization + transcription, saves to DB, sends to client.
+    Runs diarization + transcription (off the event loop), saves to DB, sends to client.
+
+    Owns its own DB session: the request-scoped session held by the WebSocket
+    handler is not safe to share with this thread-scheduled coroutine, and the
+    blocking GPU call below runs in a worker thread that also needs to touch the
+    session for speaker/emotion profile lookups.
     """
+    db = SessionLocal()
     try:
         # Get conversation
         conversation = db.query(Conversation).filter(
@@ -250,135 +260,85 @@ async def _handle_segment_processed(
         end_offset = segment_info["end_offset"]
 
         if not os.path.exists(segment_file):
-            print(f"Segment file not found: {segment_file}")
+            logger.info(f"Segment file not found: {segment_file}")
             return
 
-        # Get known speakers
-        speakers = db.query(Speaker).all()
-        known_speakers = [(s.id, s.name, s.get_embedding()) for s in speakers]
+        known_speakers = load_known_speakers(db)
 
         # Get threshold from config
         config = get_config()
         settings = config.get_settings()
         threshold = settings.speaker_threshold
 
-        # Process with diarization + transcription
-        result = engine.transcribe_with_diarization(
+        # Process with diarization + transcription — heavy GPU work, run off the event loop
+        result = await asyncio.to_thread(
+            engine.transcribe_with_diarization,
             segment_file,
             known_speakers,
             threshold=threshold,
-            db_session=db
+            db_session=db,
         )
 
         # Save segments to database
         conv_start = conversation.start_time
         segments_data = []
 
-        print(f"📝 Processing {len(result['segments'])} segment(s) from transcription")
+        logger.info(f"📝 Processing {len(result['segments'])} segment(s) from transcription")
 
         for seg in result["segments"]:
-            # Determine speaker
-            speaker_id = None
-            speaker_name = seg["speaker"]
-            confidence = seg.get("confidence", 0.0)
-
-            if seg.get("is_known"):
-                speaker = db.query(Speaker).filter(Speaker.name == speaker_name).first()
-                if speaker:
-                    speaker_id = speaker.id
-            else:
-                # Auto-enroll unknown speakers with embeddings (enables clustering)
-                embedding = seg.get("embedding")
-                if embedding is not None and speaker_name and speaker_name.startswith("Unknown_"):
-                    from .diarization import auto_enroll_unknown_speaker
-                    speaker_id, speaker_name = auto_enroll_unknown_speaker(
-                        embedding, db, threshold=threshold
-                    )
-                    # Add newly enrolled speaker to cache (avoids cache invalidation)
-                    if speaker_id:
-                        engine.add_speaker_to_cache(
-                            speaker_id=speaker_id,
-                            speaker_name=speaker_name,
-                            embedding=embedding,
-                            profile_type='general'
-                        )
-                    # Update confidence since we're using the enrolled speaker
-                    confidence = 1.0 if speaker_id else confidence
-
-            # Adjust offsets relative to conversation start
-            seg_start_offset = start_offset + seg["start"]
-            seg_end_offset = start_offset + seg["end"]
-
-            # Serialize word-level data as JSON if available
-            words_json = None
-            if "words" in seg and seg["words"]:
-                words_json = json.dumps(seg["words"])
-
-            segment = ConversationSegment(
+            segment = create_segment_from_result(
+                seg=seg,
                 conversation_id=conversation_id,
-                speaker_id=speaker_id,
-                speaker_name=speaker_name,
-                text=seg["text"],
-                start_time=conv_start + timedelta(seconds=seg_start_offset),
-                end_time=conv_start + timedelta(seconds=seg_end_offset),
-                start_offset=seg_start_offset,
-                end_offset=seg_end_offset,
-                confidence=confidence,
-                emotion_category=seg.get("emotion_category"),
-                emotion_confidence=seg.get("emotion_confidence"),
-                detector_breakdown=json.dumps(seg["detector_breakdown"]) if seg.get("detector_breakdown") else None,
+                conv_start=conv_start,
+                db=db,
+                threshold=threshold,
                 segment_audio_path=segment_file,
-                words_data=words_json,
-                avg_logprob=seg.get("avg_logprob")
+                start_offset_base=start_offset,
+                engine=engine,
             )
-
-            # Store embeddings for fast recalculation (no audio re-extraction needed)
-            if seg.get("embedding") is not None:
-                segment.set_speaker_embedding(seg["embedding"])
-            if seg.get("emotion_embedding") is not None:
-                segment.set_emotion_embedding(seg["emotion_embedding"])
-
-            db.add(segment)
             db.flush()
 
-            # Ensure all numeric values are Python native types for JSON serialization
-            emotion_conf = seg.get("emotion_confidence")
+            # Build response data from the created segment object
+            emotion_conf = segment.emotion_confidence
             detector_breakdown = seg.get("detector_breakdown")
 
             segments_data.append({
                 "segment_id": segment.id,
-                "speaker_name": speaker_name,
-                "text": seg["text"],
-                "start_offset": float(seg_start_offset),
-                "end_offset": float(seg_end_offset),
-                "confidence": float(confidence) if confidence is not None else 0.0,
-                "emotion_category": seg.get("emotion_category"),
+                "speaker_name": segment.speaker_name,
+                "text": segment.text,
+                "start_offset": float(segment.start_offset),
+                "end_offset": float(segment.end_offset),
+                "confidence": float(segment.confidence) if segment.confidence is not None else 0.0,
+                "emotion_category": segment.emotion_category,
                 "emotion_confidence": float(emotion_conf) if emotion_conf is not None else None,
                 "detector_breakdown": convert_numpy_to_native(detector_breakdown) if detector_breakdown else None,
                 "is_known": seg.get("is_known", False),
-                "words": seg.get("words", []),  # Include word-level data
-                "avg_logprob": seg.get("avg_logprob")
+                "words": seg.get("words", []),
+                "avg_logprob": segment.avg_logprob
             })
 
-        # Update conversation stats
-        conversation.num_segments = db.query(ConversationSegment).filter(
-            ConversationSegment.conversation_id == conversation_id
-        ).count()
+        # Update conversation stats (increment rather than re-count)
+        conversation.num_segments = (conversation.num_segments or 0) + len(result["segments"])
 
         db.commit()
 
         # Send segments to client
-        print(f"📤 Sending {len(segments_data)} segment(s) to frontend")
+        logger.info(f"📤 Sending {len(segments_data)} segment(s) to client")
         for seg_data in segments_data:
-            print(f"   → Segment: {seg_data['speaker_name']}: {seg_data['text'][:50]}...")
+            logger.info(f"   → Segment: {seg_data['speaker_name']}: {seg_data['text'][:50]}...")
             await send_message(websocket, "segment", seg_data)
 
         # Queue async GPU cleanup (non-blocking)
         engine.clear_gpu_cache_async("segment_complete")
 
     except Exception as e:
-        print(f"Error processing segment: {e}")
-        await send_message(websocket, "error", {"message": f"Segment processing error: {str(e)}"})
+        logger.error(f"Error processingsegment: {e}")
+        import traceback
+        traceback.print_exc()
+        db.rollback()
+        await send_message(websocket, "error", {"message": "Segment processing error"})
+    finally:
+        db.close()
 
 
 async def _finalize_recording(
@@ -392,33 +352,33 @@ async def _finalize_recording(
     Finalize recording: stop recorder, concatenate segments, convert to MP3.
     """
     try:
-        print(f"Finalizing recording for conversation {conversation_id}")
+        logger.info(f"Finalizing recording for conversation {conversation_id}")
 
-        # Stop recorder and wait for queue to finish
-        recorder.stop_recording()
+        # Both calls block for many seconds — run off the event loop so other
+        # clients aren't frozen while one user stops a recording.
+        await asyncio.to_thread(recorder.stop_recording)
+        full_audio_path = await asyncio.to_thread(recorder.concatenate_segments)
 
-        # Concatenate segments
-        full_audio_path = recorder.concatenate_segments()
+        # Refresh BEFORE mutating: the per-segment callback owns its own Session
+        # and commits num_segments from a worker thread, so this handler's cached
+        # instance is stale. Refresh() overwrites every attribute, so any dirty
+        # change made before this line would be silently discarded.
+        db.refresh(conversation)
 
         if full_audio_path and os.path.exists(full_audio_path):
             # Keep WAV file (no MP3 conversion - WAV avoids pyannote 24ms boundary bug)
             conversation.audio_path = full_audio_path
             conversation.audio_format = "wav"
 
-        # Update conversation status
         conversation.status = "completed"
-        conversation.end_time = datetime.utcnow()
+        conversation.end_time = utc_now()
 
-        # Calculate duration
-        if conversation.num_segments and conversation.num_segments > 0:
-            last_segment = db.query(ConversationSegment).filter(
-                ConversationSegment.conversation_id == conversation_id
-            ).order_by(ConversationSegment.end_offset.desc()).first()
+        last_segment = db.query(ConversationSegment).filter(
+            ConversationSegment.conversation_id == conversation_id
+        ).order_by(ConversationSegment.end_offset.desc()).first()
+        if last_segment:
+            conversation.duration = last_segment.end_offset
 
-            if last_segment:
-                conversation.duration = last_segment.end_offset
-
-        # Count speakers
         speaker_count = db.query(ConversationSegment.speaker_name).filter(
             ConversationSegment.conversation_id == conversation_id
         ).distinct().count()
@@ -426,8 +386,7 @@ async def _finalize_recording(
 
         db.commit()
 
-        # Send completion message
-        if websocket and websocket.client_state.CONNECTED:
+        if websocket and websocket.client_state == WebSocketState.CONNECTED:
             await send_message(websocket, "completed", {
                 "conversation_id": conversation_id,
                 "num_segments": conversation.num_segments,
@@ -436,18 +395,17 @@ async def _finalize_recording(
                 "message": "Recording completed and saved"
             })
 
-        print(f"Recording finalized: {conversation.num_segments} segments, {conversation.num_speakers} speakers")
+        logger.info(f"Recording finalized: {conversation.num_segments} segments, {conversation.num_speakers} speakers")
 
-        # Force GPU cleanup after recording stops (free up VRAM)
         engine = get_engine()
-        print(f"🧹 Forcing GPU cleanup after recording stop...")
-        engine.clear_gpu_cache()  # Blocking cleanup to free VRAM immediately
-        print(f"✅ GPU cleanup complete")
+        engine.clear_gpu_cache()
 
     except Exception as e:
-        print(f"Error finalizing recording: {e}")
+        logger.info(f"Error finalizing recording: {e}")
+        import traceback
+        traceback.print_exc()
         conversation.status = "failed"
         db.commit()
 
-        if websocket and websocket.client_state.CONNECTED:
-            await send_message(websocket, "error", {"message": f"Finalization error: {str(e)}"})
+        if websocket and websocket.client_state == WebSocketState.CONNECTED:
+            await send_message(websocket, "error", {"message": "Finalization error"})

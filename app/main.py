@@ -1,5 +1,6 @@
 import warnings
 import os
+import logging
 
 # Suppress harmless warnings for cleaner output
 os.environ["PYTHONWARNINGS"] = "ignore"
@@ -9,6 +10,16 @@ warnings.filterwarnings("ignore", message=".*Lightning automatically upgraded.*"
 warnings.filterwarnings("ignore", message=".*TF32.*")
 warnings.filterwarnings("ignore", message=".*does not have many workers.*")
 
+# One central logging config for every module in this package. Per-module
+# loggers (`logging.getLogger(__name__)`) respect LOG_LEVEL so operators can
+# silence specific subsystems without touching code.
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S",
+)
+logger = logging.getLogger(__name__)
+
 import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -16,6 +27,7 @@ from contextlib import asynccontextmanager
 import torch
 
 from .database import init_db
+from .services import data_path
 from .api import router, get_engine
 from .conversation_api import router as conversation_router
 from .mcp_api import router as mcp_router
@@ -27,20 +39,19 @@ from .streaming_websocket import router as streaming_router
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize database and directories on startup"""
-    print("Initializing database...")
+    logger.info("Initializing database...")
     init_db()
-    print("Database initialized!")
+    logger.info("Database initialized!")
 
     # Create necessary directories (use relative paths for local dev, absolute for Docker)
-    data_path = os.getenv("DATA_PATH", "./data")
+    root = data_path()
     volumes_path = os.getenv("VOLUMES_PATH", "./volumes")
-
-    os.makedirs(f"{data_path}/recordings", exist_ok=True)
-    os.makedirs(f"{data_path}/temp", exist_ok=True)
+    os.makedirs(os.path.join(root, "recordings"), exist_ok=True)
+    os.makedirs(os.path.join(root, "temp"), exist_ok=True)
     os.makedirs(volumes_path, exist_ok=True)
 
-    # Preload AI models for faster first request
-    print("\n=== Preloading AI models ===")
+    # Preload ML models for faster first request
+    logger.info("\n=== Preloading models ===")
     engine = get_engine()
 
     # Load models (this loads into CPU/RAM but may not allocate VRAM yet)
@@ -51,7 +62,7 @@ async def lifespan(app: FastAPI):
 
     # Force VRAM allocation by running a warmup pass (only on GPU)
     if torch.cuda.is_available():
-        print("Running GPU warmup to allocate VRAM...")
+        logger.info("Running GPU warmup to allocate VRAM...")
         import tempfile
         import wave
         import numpy as np
@@ -86,7 +97,7 @@ async def lifespan(app: FastAPI):
                 wf.writeframes(audio.tobytes())
 
         try:
-            print(f"  - Created {duration}s test audio file")
+            logger.info(f"  - Created {duration}s test audio file")
 
             # Create dummy speaker to exercise speaker matching code path
             dummy_embedding = np.random.randn(512).astype(np.float32)
@@ -98,7 +109,7 @@ async def lifespan(app: FastAPI):
             settings = config.get_settings()
 
             # Warmup: full pipeline with speaker matching
-            print("  - Warming up models (diarization, embedding, whisper, matching)...")
+            logger.info("  - Warming up models (diarization, embedding, whisper, matching)...")
             with torch.no_grad():
                 _ = engine.transcribe_with_diarization(
                     test_audio_path,
@@ -106,25 +117,25 @@ async def lifespan(app: FastAPI):
                     threshold=settings.speaker_threshold
                 )
 
-            print("GPU warmup complete")
+            logger.info("GPU warmup complete")
 
             # Print VRAM usage (current = after cleanup, peak = during processing)
             if torch.cuda.is_available():
                 current_allocated = torch.cuda.memory_allocated() / 1024**3
                 peak_allocated = torch.cuda.max_memory_allocated() / 1024**3
                 reserved = torch.cuda.memory_reserved() / 1024**3
-                print(f"  - VRAM current: {current_allocated:.2f} GB (after cleanup)")
-                print(f"  - VRAM peak: {peak_allocated:.2f} GB (during processing)")
-                print(f"  - VRAM reserved: {reserved:.2f} GB")
+                logger.info(f"  - VRAM current: {current_allocated:.2f} GB (after cleanup)")
+                logger.info(f"  - VRAM peak: {peak_allocated:.2f} GB (during processing)")
+                logger.info(f"  - VRAM reserved: {reserved:.2f} GB")
 
         except Exception as e:
-            print(f"Warmup error (non-critical): {e}")
+            logger.info(f"Warmup error (non-critical): {e}")
         finally:
             # Clean up test file (os already imported at top)
             if os.path.exists(test_audio_path):
                 os.unlink(test_audio_path)
 
-    print("=== All models loaded and ready! ===\n")
+    logger.info("=== All models loaded and ready! ===\n")
 
     yield
     # Cleanup on shutdown (if needed)
@@ -138,14 +149,19 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# Add CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# CORS: internal-network-only by default. Set CORS_ORIGINS to a comma-separated
+# list of origins (e.g. "http://host:3000,http://host:8080") if a browser UI needs access.
+# Browsers never send a trailing slash on Origin, so strip one if the user
+# included it in CORS_ORIGINS — otherwise Starlette's exact-string match misses.
+_cors_origins = [o.strip().rstrip("/") for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
+if _cors_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_cors_origins,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
 # Include API routers
 app.include_router(router, prefix="/api/v1", tags=["Speaker Diarization"])
@@ -163,17 +179,37 @@ async def root():
         "message": "Speaker Diarization API",
         "docs": "/docs",
         "api": "/api/v1",
-        "mcp": "/mcp (AI agent interface - JSON-RPC)",
-        "frontend": "http://localhost:3000/voice (Next.js UI)"
+        "mcp": "/mcp (MCP JSON-RPC interface)",
     }
 
 
 if __name__ == "__main__":
     # Start FastAPI server
-    print("Starting server...")
+    logger.info("Starting server...")
+
+    # Check for SSL certificates (enables HTTPS/WSS)
+    # Try local path first, then Docker path
+    script_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    local_cert = os.path.join(script_dir, "certs", "cert.pem")
+    local_key = os.path.join(script_dir, "certs", "key.pem")
+
+    if os.path.exists(local_cert) and os.path.exists(local_key):
+        ssl_cert, ssl_key = local_cert, local_key
+    else:
+        ssl_cert = "/app/certs/cert.pem"
+        ssl_key = "/app/certs/key.pem"
+
+    ssl_opts = {}
+    if os.path.exists(ssl_cert) and os.path.exists(ssl_key):
+        ssl_opts = {"ssl_certfile": ssl_cert, "ssl_keyfile": ssl_key}
+        logger.info("🔒 SSL enabled - server will use HTTPS/WSS")
+    else:
+        logger.info("⚠️  No SSL certs found - server will use HTTP/WS")
+
     uvicorn.run(
         app,
         host="0.0.0.0",
-        port=8000,
-        log_level="info"
+        port=int(os.getenv("PORT", "8418")),
+        log_level="info",
+        **ssl_opts
     )

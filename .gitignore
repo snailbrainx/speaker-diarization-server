@@ -2,6 +2,12 @@
 .env
 *.env
 
+# AI tooling artifacts (per-user, should never be committed)
+.claude/
+CLAUDE.md
+AGENTS.md
+GEMINI.md
+
 # Python
 __pycache__/
 *.py[cod]
@@ -29,12 +35,23 @@ data/*
 backups/*
 !backups/.gitkeep
 *.db
+*.db-shm
+*.db-wal
+*.db-journal
 *.sqlite
+*.sqlite3
+*.sqlite-journal
 *.wav
 *.mp3
 *.m4a
 *.flac
 *.ogg
+*.opus
+*.webm
+*.mp4
+*.aac
+*.wma
+*.aiff
 
 # IDE
 .vscode/
@@ -46,8 +63,8 @@ backups/*
 .DS_Store
 Thumbs.db
 
-# Docker
-.dockerignore
+# SSL certificates
+certs/
 
-# Frontend (separate repository)
-anna-frontend/
+# Plan docs (local only)
+docs/superpowers/

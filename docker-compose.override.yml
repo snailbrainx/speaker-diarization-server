@@ -1,0 +1,8 @@
+# Development override: bind-mounts the live app source over the image so
+# code changes don't require a rebuild. docker compose auto-loads this file
+# on top of docker-compose.yml. Remove or rename it for a production run
+# that relies solely on the baked image (`docker compose -f docker-compose.yml up`).
+services:
+  speaker-diarization:
+    volumes:
+      - ./app:/app/app

@@ -3,8 +3,8 @@ MCP (Model Context Protocol) API Endpoint
 
 Standard MCP server over HTTP (SSE transport) at /mcp endpoint.
 
-Allows AI agents to connect from anywhere on the network:
-- Flowise: {"url": "http://10.x.x.x:8000/mcp", "transport": "http"}
+Allows MCP clients to connect from anywhere on the network:
+- Flowise: {"url": "http://10.x.x.x:8418/mcp", "transport": "http"}
 - Other MCP clients via HTTP
 
 Features:
@@ -20,19 +20,82 @@ from fastapi import APIRouter, HTTPException, Depends, Request, Body
 from fastapi.responses import StreamingResponse, JSONResponse
 from sqlalchemy.orm import Session
 from typing import Optional, Any, Dict
-import httpx
+import inspect
+import typing
 import json
 import asyncio
+import os
 from datetime import datetime
 
 from .database import get_db
 from .models import Speaker, Conversation, ConversationSegment
+from .schemas import SpeakerRename, ConversationUpdate, IdentifySpeakerRequest
+from .services import delete_unknown_speakers
+from .api import (
+    rename_speaker as _rename_speaker_api,
+    delete_speaker as _delete_speaker_api,
+    get_engine,
+)
+from .conversation_api import (
+    identify_speaker_in_segment as _identify_speaker_api,
+    reprocess_conversation as _reprocess_api,
+    update_conversation as _update_conversation_api,
+)
 
 
-router = APIRouter(tags=["MCP"])
+router = APIRouter(prefix="/mcp", tags=["MCP"])
 
-# Store active SSE connections for ping
-active_connections: Dict[str, bool] = {}
+
+_JSON_TYPE_BY_PY = {
+    int: "integer",
+    float: "number",
+    bool: "boolean",
+    str: "string",
+}
+
+
+def _unwrap_optional(annotation):
+    """Return the inner type of Optional[T] / Union[T, None], else annotation."""
+    if typing.get_origin(annotation) is typing.Union:
+        args = [a for a in typing.get_args(annotation) if a is not type(None)]
+        if len(args) == 1:
+            return args[0]
+    return annotation
+
+
+def _json_type(annotation) -> dict:
+    """Map a Python annotation to a JSON-Schema type fragment."""
+    annotation = _unwrap_optional(annotation)
+    origin = typing.get_origin(annotation)
+    if origin in (list, tuple):
+        args = typing.get_args(annotation)
+        item_t = _unwrap_optional(args[0]) if args else str
+        return {"type": "array", "items": {"type": _JSON_TYPE_BY_PY.get(item_t, "string")}}
+    if origin is dict:
+        return {"type": "object"}
+    return {"type": _JSON_TYPE_BY_PY.get(annotation, "string")}
+
+
+def _params_schema(func, params) -> dict:
+    """Build a JSON-Schema object from a tool function's type hints.
+
+    Returns {"type": "object", "properties": {...}, "required": [...]} so MCP
+    clients can validate required vs optional inputs.
+    """
+    sig = inspect.signature(func)
+    properties: Dict[str, dict] = {}
+    required = []
+    for p in params:
+        param = sig.parameters.get(p)
+        annotation = param.annotation if param else inspect.Parameter.empty
+        properties[p] = _json_type(annotation)
+        if param is not None and param.default is inspect.Parameter.empty:
+            required.append(p)
+    schema: Dict[str, Any] = {"type": "object", "properties": properties}
+    if required:
+        schema["required"] = required
+    return schema
+
 
 
 # ============================================================================
@@ -95,7 +158,8 @@ async def identify_speaker_in_segment(
     conversation_id: int,
     segment_id: int,
     speaker_name: str,
-    auto_enroll: bool = True
+    auto_enroll: bool = True,
+    db: Session = None,
 ) -> dict:
     """
     Identify or correct speaker in a segment.
@@ -105,34 +169,27 @@ async def identify_speaker_in_segment(
 
     System will automatically update all matching past segments.
     """
-    async with httpx.AsyncClient(base_url="http://localhost:8000/api/v1") as client:
-        try:
-            response = await client.post(
-                f"/conversations/{conversation_id}/segments/{segment_id}/identify",
-                json={"speaker_name": speaker_name, "enroll": auto_enroll}
-            )
-            response.raise_for_status()
-            result = response.json()
-            # Add success context
-            return {
-                "success": True,
-                "speaker_name": speaker_name,
-                "enrolled": auto_enroll,
-                "segments_updated": result.get("segments_updated", 0),
-                "message": f"Successfully identified speaker as '{speaker_name}'. " +
-                          (f"Updated {result.get('segments_updated', 0)} past segments automatically." if result.get('segments_updated') else ""),
-                "details": result
-            }
-        except httpx.HTTPStatusError as e:
-            error_detail = "Unknown error"
-            try:
-                error_data = e.response.json()
-                error_detail = error_data.get("detail", str(e))
-            except:
-                error_detail = e.response.text or str(e)
-            return {"error": f"Failed to identify speaker: {error_detail}", "status_code": e.response.status_code}
-        except httpx.HTTPError as e:
-            return {"error": f"Network error: {str(e)}"}
+    try:
+        result = await _identify_speaker_api(
+            conversation_id=conversation_id,
+            segment_id=segment_id,
+            request=IdentifySpeakerRequest(speaker_name=speaker_name, enroll=auto_enroll),
+            db=db,
+            engine=get_engine(),
+        )
+    except HTTPException as e:
+        return {"error": f"Failed to identify speaker: {e.detail}", "status_code": e.status_code}
+
+    updated = result.get("segments_updated", 0) if isinstance(result, dict) else 0
+    return {
+        "success": True,
+        "speaker_name": speaker_name,
+        "enrolled": auto_enroll,
+        "segments_updated": updated,
+        "message": f"Successfully identified speaker as '{speaker_name}'." +
+                  (f" Updated {updated} past segments automatically." if updated else ""),
+        "details": result,
+    }
 
 
 async def list_speakers(db: Session) -> dict:
@@ -205,54 +262,48 @@ async def list_conversations(skip: int = 0, limit: int = 10, db: Session = None)
     }
 
 
-async def rename_speaker(speaker_id: int, new_name: str) -> dict:
+async def rename_speaker(speaker_id: int, new_name: str, db: Session = None) -> dict:
     """Rename speaker (updates all past segments)"""
-    async with httpx.AsyncClient(base_url="http://localhost:8000/api/v1") as client:
-        try:
-            response = await client.patch(
-                f"/speakers/{speaker_id}/rename",
-                json={"new_name": new_name}
-            )
-            response.raise_for_status()
-            return response.json()
-        except httpx.HTTPError as e:
-            return {"error": f"API error: {str(e)}"}
+    try:
+        speaker = await _rename_speaker_api(
+            speaker_id=speaker_id,
+            rename_data=SpeakerRename(new_name=new_name),
+            db=db,
+        )
+    except HTTPException as e:
+        return {"error": f"API error: {e.detail}", "status_code": e.status_code}
+
+    return {"id": speaker.id, "name": speaker.name}
 
 
-async def delete_speaker(speaker_id: int) -> dict:
+async def delete_speaker(speaker_id: int, db: Session = None) -> dict:
     """Delete speaker profile"""
-    async with httpx.AsyncClient(base_url="http://localhost:8000/api/v1") as client:
-        try:
-            response = await client.delete(f"/speakers/{speaker_id}")
-            response.raise_for_status()
-            return response.json()
-        except httpx.HTTPError as e:
-            return {"error": f"API error: {str(e)}"}
+    try:
+        return await _delete_speaker_api(speaker_id=speaker_id, db=db)
+    except HTTPException as e:
+        return {"error": f"API error: {e.detail}", "status_code": e.status_code}
 
 
-async def reprocess_conversation(conversation_id: int) -> dict:
+async def reprocess_conversation(conversation_id: int, db: Session = None) -> dict:
     """Re-analyze conversation with current speaker profiles"""
-    async with httpx.AsyncClient(base_url="http://localhost:8000/api/v1") as client:
-        try:
-            response = await client.post(f"/conversations/{conversation_id}/reprocess")
-            response.raise_for_status()
-            return response.json()
-        except httpx.HTTPError as e:
-            return {"error": f"API error: {str(e)}"}
+    try:
+        return await _reprocess_api(conversation_id=conversation_id, db=db, engine=get_engine())
+    except HTTPException as e:
+        return {"error": f"API error: {e.detail}", "status_code": e.status_code}
 
 
-async def update_conversation_title(conversation_id: int, title: str) -> dict:
+async def update_conversation_title(conversation_id: int, title: str, db: Session = None) -> dict:
     """Update conversation title"""
-    async with httpx.AsyncClient(base_url="http://localhost:8000/api/v1") as client:
-        try:
-            response = await client.patch(
-                f"/conversations/{conversation_id}",
-                json={"title": title}
-            )
-            response.raise_for_status()
-            return response.json()
-        except httpx.HTTPError as e:
-            return {"error": f"API error: {str(e)}"}
+    try:
+        conv = await _update_conversation_api(
+            conversation_id=conversation_id,
+            update_data=ConversationUpdate(title=title),
+            db=db,
+        )
+    except HTTPException as e:
+        return {"error": f"API error: {e.detail}", "status_code": e.status_code}
+
+    return {"id": conv.id, "title": conv.title}
 
 
 async def delete_all_unknown_speakers(db: Session) -> dict:
@@ -262,34 +313,11 @@ async def delete_all_unknown_speakers(db: Session) -> dict:
     Useful for cleanup after identifying all speakers in conversations.
     Returns count of deleted speakers.
     """
-    from .models import Speaker, SpeakerEmotionProfile, ConversationSegment
-
-    unknown_speakers = db.query(Speaker).filter(Speaker.name.like("Unknown_%")).all()
-
-    if not unknown_speakers:
-        return {"message": "No unknown speakers found", "deleted_count": 0}
-
-    count = len(unknown_speakers)
-    names = [s.name for s in unknown_speakers]
-    speaker_ids = [s.id for s in unknown_speakers]
-
-    # 1. Set speaker_id to NULL in segments (SQLite FK constraint is NO ACTION, not SET NULL)
-    if speaker_ids:
-        db.query(ConversationSegment).filter(
-            ConversationSegment.speaker_id.in_(speaker_ids)
-        ).update({"speaker_id": None}, synchronize_session=False)
-
-    # 2. Delete emotion profiles
-    for speaker in unknown_speakers:
-        db.query(SpeakerEmotionProfile).filter(
-            SpeakerEmotionProfile.speaker_id == speaker.id
-        ).delete(synchronize_session=False)
-
-    # 3. Delete speakers
-    for speaker in unknown_speakers:
-        db.delete(speaker)
-
+    count, names = delete_unknown_speakers(db, engine=get_engine())
     db.commit()
+
+    if not count:
+        return {"message": "No unknown speakers found", "deleted_count": 0}
 
     return {
         "success": True,
@@ -329,7 +357,6 @@ async def search_conversations_by_speaker(speaker_name: str, db: Session, limit:
     Raises:
         Error if speaker doesn't exist in database
     """
-    from .models import Speaker, Conversation, ConversationSegment
     from sqlalchemy import func
 
     # Validate speaker exists
@@ -337,49 +364,39 @@ async def search_conversations_by_speaker(speaker_name: str, db: Session, limit:
     if not speaker:
         return {"error": f"Speaker '{speaker_name}' not found. Use list_speakers tool to see available speakers."}
 
-    # Get all distinct conversations where this speaker appears
-    # Join ConversationSegment with Conversation to get conversation details
-    conversations_query = (
-        db.query(Conversation)
+    # Single grouped query: one row per conversation with that speaker's segment count.
+    segment_count = func.count(ConversationSegment.id).label("speaker_segments")
+    rows_query = (
+        db.query(Conversation, segment_count)
         .join(ConversationSegment, Conversation.id == ConversationSegment.conversation_id)
         .filter(ConversationSegment.speaker_id == speaker.id)
-        .distinct()
-        .order_by(Conversation.start_time.desc())  # Most recent first
+        .group_by(Conversation.id)
+        .order_by(Conversation.start_time.desc())
     )
 
-    total_count = conversations_query.count()
-    conversations = conversations_query.offset(skip).limit(limit).all()
+    total_count = rows_query.count()
+    rows = rows_query.offset(skip).limit(limit).all()
 
-    # Format results
-    conversation_list = []
-    for conv in conversations:
-        # Count segments by this speaker in this conversation
-        speaker_segment_count = (
-            db.query(func.count(ConversationSegment.id))
-            .filter(
-                ConversationSegment.conversation_id == conv.id,
-                ConversationSegment.speaker_id == speaker.id
-            )
-            .scalar()
-        )
-
-        conversation_list.append({
+    conversation_list = [
+        {
             "conversation_id": conv.id,
             "title": conv.title or f"Conversation {conv.id}",
             "datetime": conv.start_time.isoformat() if conv.start_time else None,
             "duration_seconds": conv.duration,
             "duration_minutes": round(conv.duration / 60, 1) if conv.duration else None,
             "total_segments": conv.num_segments,
-            "speaker_segments": speaker_segment_count,
-            "audio_path": conv.audio_path
-        })
+            "speaker_segments": speaker_segments,
+            "audio_path": conv.audio_path,
+        }
+        for conv, speaker_segments in rows
+    ]
 
     return {
         "speaker_name": speaker.name,
         "speaker_id": speaker.id,
         "total_conversations": total_count,
         "returned_count": len(conversation_list),
-        "conversations": conversation_list
+        "conversations": conversation_list,
     }
 
 
@@ -450,7 +467,7 @@ TOOLS = {
 # HTTP Endpoints
 # ============================================================================
 
-@router.get("/", include_in_schema=False)
+@router.get("", include_in_schema=False)
 async def mcp_info():
     """
     MCP server information endpoint.
@@ -462,10 +479,10 @@ async def mcp_info():
         "version": "1.0.0",
         "protocol": "MCP 2024-11-05",
         "transport": "HTTP (SSE)",
-        "description": "AI agent interface for speaker diarization system",
+        "description": "Speaker diarization MCP interface",
         "endpoints": {
             "sse": "/mcp/sse",
-            "messages": "/mcp/messages"
+            "rpc": "/mcp"
         },
         "capabilities": {
             "tools": True,
@@ -475,7 +492,7 @@ async def mcp_info():
         "tools_count": len(TOOLS),
         "connection": {
             "example": {
-                "url": "http://localhost:8000/mcp",
+                "url": f"http://localhost:{os.getenv('PORT', '8418')}/mcp",
                 "transport": "http"
             }
         }
@@ -484,35 +501,17 @@ async def mcp_info():
 
 @router.get("/sse", include_in_schema=False)
 async def mcp_sse(request: Request):
-    """
-    MCP SSE endpoint for server-to-client messages.
-
-    Maintains persistent connection for server notifications and ping/keepalive.
-    """
-    connection_id = f"conn_{datetime.now().timestamp()}"
-    active_connections[connection_id] = True
-
+    """MCP SSE endpoint — maintains a keepalive ping until the client disconnects."""
     async def event_stream():
         try:
-            # Send initial connection message
             yield f"data: {json.dumps({'type': 'connection', 'status': 'connected'})}\n\n"
-
-            # Keep connection alive with ping every 30 seconds
-            while active_connections.get(connection_id, False):
+            while not await request.is_disconnected():
                 await asyncio.sleep(30)
-
-                # Check if client disconnected
                 if await request.is_disconnected():
                     break
-
-                # Send ping
                 yield f"event: ping\ndata: {json.dumps({'timestamp': datetime.now().isoformat()})}\n\n"
-
         except asyncio.CancelledError:
             pass
-        finally:
-            # Clean up connection
-            active_connections.pop(connection_id, None)
 
     return StreamingResponse(
         event_stream(),
@@ -520,12 +519,12 @@ async def mcp_sse(request: Request):
         headers={
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
-            "X-Accel-Buffering": "no"
-        }
+            "X-Accel-Buffering": "no",
+        },
     )
 
 
-@router.post("/mcp", include_in_schema=False)
+@router.post("", include_in_schema=False)
 async def mcp_rpc(body: Dict[str, Any] = Body(...), db: Session = Depends(get_db)):
     """MCP JSON-RPC endpoint"""
     req_id = body.get("id")
@@ -557,7 +556,7 @@ async def mcp_rpc(body: Dict[str, Any] = Body(...), db: Session = Depends(get_db
                     {
                         "name": name,
                         "description": tool["description"],
-                        "inputSchema": {"type": "object", "properties": {p: {"type": "string"} for p in tool["params"]}}
+                        "inputSchema": _params_schema(tool["function"], tool["params"]),
                     }
                     for name, tool in TOOLS.items()
                 ]
@@ -577,7 +576,7 @@ async def mcp_rpc(body: Dict[str, Any] = Body(...), db: Session = Depends(get_db
             })
 
         tool = TOOLS[tool_name]
-        if "db" in tool["function"].__code__.co_varnames:
+        if "db" in inspect.signature(tool["function"]).parameters:
             arguments["db"] = db
 
         try:
@@ -591,14 +590,16 @@ async def mcp_rpc(body: Dict[str, Any] = Body(...), db: Session = Depends(get_db
 
             return JSONResponse({
                 "jsonrpc": "2.0",
-                "result": {"content": [{"type": "text", "text": str(result)}]},
+                "result": {"content": [{"type": "text", "text": json.dumps(result, default=str)}]},
                 "id": req_id
             })
 
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             return JSONResponse({
                 "jsonrpc": "2.0",
-                "error": {"code": -32603, "message": "Internal error", "data": str(e)},
+                "error": {"code": -32603, "message": "Internal error"},
                 "id": req_id
             })
 

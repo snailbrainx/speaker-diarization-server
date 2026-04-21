@@ -1,42 +1,44 @@
 #!/bin/bash
+# Local development runner — runs the app outside Docker for faster iteration.
+set -euo pipefail
 
-# Local development runner for speaker diarization app
-# This script runs the app outside of Docker for faster development
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
 
-# Get script directory
-SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
-
-# Load environment variables
 set -a
-source .env
+source "$SCRIPT_DIR/.env"
 set +a
 
-# Use the same model cache as Docker to avoid re-downloading
+# Share the Docker model cache so we don't re-download gigabytes of pyannote/whisper.
 export HF_HOME="$SCRIPT_DIR/volumes/huggingface_cache"
 export WHISPER_CACHE_DIR="$SCRIPT_DIR/volumes/whisper_cache"
 
-# Set data paths for local development (not Docker /app paths)
 export DATA_PATH="$SCRIPT_DIR/data"
 export VOLUMES_PATH="$SCRIPT_DIR/volumes"
+export DATABASE_URL="sqlite:///$SCRIPT_DIR/volumes/speakers.db"
 
-# Activate virtual environment
-source venv/bin/activate
+# Force CUDA to enumerate GPUs by PCI slot (matches nvidia-smi indices).
+# The default FASTEST_FIRST silently remaps CUDA_VISIBLE_DEVICES=0 onto
+# whichever card it considers fastest, which is rarely what you want.
+export CUDA_DEVICE_ORDER=PCI_BUS_ID
 
-# Set LD_LIBRARY_PATH for cuDNN 9 and cuBLAS (required by faster-whisper/ctranslate2)
-CUDNN_PATH="$SCRIPT_DIR/venv/lib/python3.12/site-packages/nvidia/cudnn/lib"
-CUBLAS_PATH="$SCRIPT_DIR/venv/lib/python3.12/site-packages/nvidia/cublas/lib"
-export LD_LIBRARY_PATH="$CUDNN_PATH:$CUBLAS_PATH:$LD_LIBRARY_PATH"
+source "$SCRIPT_DIR/venv/bin/activate"
+
+# faster-whisper/ctranslate2 need cuDNN + cuBLAS on LD_LIBRARY_PATH.
+# Glob the site-packages path so the script doesn't care whether the venv
+# was created with python3.11, 3.12, or a future interpreter.
+SITE_PACKAGES=$(echo "$SCRIPT_DIR"/venv/lib/python*/site-packages)
+CUDNN_PATH="$SITE_PACKAGES/nvidia/cudnn/lib"
+CUBLAS_PATH="$SITE_PACKAGES/nvidia/cublas/lib"
+export LD_LIBRARY_PATH="$CUDNN_PATH:$CUBLAS_PATH:${LD_LIBRARY_PATH:-}"
 echo "cuDNN/cuBLAS libraries: $CUDNN_PATH"
 
-# Create necessary directories
 mkdir -p volumes data/recordings data/temp
 
-# Run the application
-export PORT=${PORT:-8000}
+export PORT="${PORT:-8418}"
 echo "Starting speaker diarization app locally..."
-echo "Web UI: http://localhost:$PORT/gradio"
-echo "API: http://localhost:$PORT"
+echo "API:      http://localhost:$PORT"
 echo "API Docs: http://localhost:$PORT/docs"
 echo ""
 
-python -m app.main
+exec python -m app.main

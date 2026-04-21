@@ -1,0 +1,77 @@
+# Keep the Docker build context small. The Dockerfile only COPYs
+# requirements.txt and app/, so everything else is wasted upload.
+
+# Local Python environments (can be multi-GB)
+venv/
+env/
+.venv/
+**/__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Runtime data — never baked into the image, mounted at runtime instead
+data/
+volumes/
+backups/
+certs/
+
+# Audio / DB / logs
+*.wav
+*.mp3
+*.m4a
+*.flac
+*.ogg
+*.opus
+*.webm
+*.mp4
+*.aac
+*.wma
+*.aiff
+*.db
+*.db-shm
+*.db-wal
+*.db-journal
+*.sqlite
+*.sqlite3
+*.sqlite-journal
+*.log
+
+# VCS + CI
+.git/
+.gitignore
+.github/
+
+# Docs + screenshots — README-only, not needed in the image
+screenshots/
+docs/
+README.md
+LICENSE
+
+# Local-only docker-compose files and shell runners
+docker-compose.override.yml
+run_local.sh
+run_batch.sh
+batch_process.py
+
+# Secrets and local env
+.env
+.env.*
+*.pem
+*.key
+
+# AI / editor artifacts
+.claude/
+CLAUDE.md
+AGENTS.md
+GEMINI.md
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test artifacts
+tests/
+.pytest_cache/
