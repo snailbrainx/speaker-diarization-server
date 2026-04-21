@@ -189,6 +189,62 @@ Key behaviors:
 - **Dual-detector emotion** — emotion2vec always runs; if the speaker has ≥ 3 voice samples for an emotion, a voice-profile detector also runs. Best match wins with deterministic tie-break rules.
 - **Personalized learning** — user emotion corrections store both the 1024-D emotion embedding and the 512-D voice embedding, merged with weighted averaging into the speaker's profile.
 
+## Emotion Recognition
+
+### Categories (9)
+
+emotion2vec+ large classifies each segment into one of these labels:
+
+`angry` · `disgusted` · `fearful` · `happy` · `neutral` · `other` · `sad` · `surprised` · `unknown`
+
+### Dual-detector decision
+
+Every segment runs the emotion2vec base detector. If the speaker has **≥ 3 user-corrected samples** for any emotion, a second per-speaker voice-profile detector runs in parallel. The two scores are combined:
+
+| Case                                        | Final emotion                     |
+|---------------------------------------------|-----------------------------------|
+| Only emotion2vec has a confident match      | emotion2vec winner                |
+| emotion2vec returns `neutral` or `<unk>`    | `neutral`                         |
+| Both detectors agree                        | agreed emotion (higher confidence)|
+| Detectors disagree                          | `neutral` (conservative fallback) |
+| Voice-profile detector wins (≥ threshold)   | profile winner                    |
+
+The server returns the raw scores from both detectors so clients can override the fallback if they want.
+
+### Personalization flow
+
+1. User uploads audio → segment 7 is labeled `neutral` by emotion2vec with 0.94 confidence.
+2. User disagrees, `POST /api/v1/conversations/{id}/segments/7/correct-emotion` with `{"emotion_category": "surprised"}`.
+3. Server stores both the **1024-D emotion2vec embedding** and the **512-D pyannote voice embedding** into the speaker's `surprised` profile, averaged with any previous samples (EWMA-style).
+4. Once that profile reaches 3 samples, the voice-profile detector activates for this speaker's future segments.
+5. When a later segment has similar vocal characteristics, the voice-profile detector returns `surprised` above threshold and wins over the emotion2vec guess.
+
+Corrections also set `emotion_corrected=true` on the segment, so they are kept out of personalization training loops (no feedback contamination).
+
+### Example — dual-detector output
+
+Segment from a laughing 10 s clip with no prior voice profile for this speaker:
+
+```json
+{
+  "text": "Oh my god that is funny. Oh wow. Oh that's brilliant.",
+  "emotion_category": "neutral",
+  "emotion_confidence": 0.937,
+  "detector_breakdown": {
+    "emotion2vec_detector": { "emotion": "surprised", "confidence": 0.937 },
+    "voice_profile_detector": null,
+    "final_decision": {
+      "emotion": "neutral",
+      "confidence": 0.937,
+      "reason": "Disagree: surprised vs neutral",
+      "voice_profile_available": false
+    }
+  }
+}
+```
+
+emotion2vec said *surprised* but the personalized detector is unavailable (no 3+ samples yet), so the server falls back to `neutral`. After three corrections to `surprised` for this speaker, the profile detector would agree and the final decision flips.
+
 ## REST API
 
 Full interactive docs at `/docs` (Swagger UI). The OpenAPI JSON is at `/openapi.json`. Endpoint groups:
@@ -205,17 +261,60 @@ Full interactive docs at `/docs` (Swagger UI). The OpenAPI JSON is at `/openapi.
 - `GET/POST /api/v1/profiles`, checkpoints, download, import, restore — backup/restore.
 - `WS /api/v1/streaming/ws` — live audio ingestion.
 
-### Example
+### Example — upload + process
 
 ```bash
-# Upload and process audio
 curl -X POST http://localhost:8418/api/v1/process \
   -F "audio_file=@meeting.wav"
+```
 
+Response (trimmed to one segment for readability):
+
+```json
+{
+  "id": 42,
+  "title": "Uploaded: meeting.wav",
+  "duration": 137.39,
+  "status": "completed",
+  "num_segments": 24,
+  "num_speakers": 2,
+  "transcript_segments": [
+    {
+      "id": 911,
+      "conversation_id": 42,
+      "speaker_id": 17,
+      "speaker_name": "Unknown_1776798145477718",
+      "text": "Call me Ishmael. Some years ago, never mind how long precisely...",
+      "start_offset": 0.05,
+      "end_offset": 6.71,
+      "confidence": 1.0,
+      "emotion_category": "neutral",
+      "emotion_confidence": 1.0,
+      "emotion_corrected": false,
+      "emotion_misidentified": false,
+      "detector_breakdown": null,
+      "words": [
+        { "word": " Call",    "start": 0.05, "end": 0.57, "probability": 0.91 },
+        { "word": " me",      "start": 0.57, "end": 0.75, "probability": 0.99 },
+        { "word": " Ishmael.","start": 0.75, "end": 1.37, "probability": 0.99 }
+      ]
+    }
+  ]
+}
+```
+
+Unidentified voices are auto-enrolled as `Unknown_<ts>` so they accumulate samples. Rename retroactively:
+
+```bash
 # Identify an unknown speaker (retroactively labels every past segment with that voice)
-curl -X POST http://localhost:8418/api/v1/conversations/5/segments/123/identify \
+curl -X POST http://localhost:8418/api/v1/conversations/42/segments/911/identify \
   -H 'Content-Type: application/json' \
   -d '{"speaker_name": "Alice", "enroll": true}'
+
+# Correct an emotion (feeds personalization)
+curl -X POST http://localhost:8418/api/v1/conversations/42/segments/911/correct-emotion \
+  -H 'Content-Type: application/json' \
+  -d '{"emotion_category": "surprised"}'
 ```
 
 ## MCP Server
