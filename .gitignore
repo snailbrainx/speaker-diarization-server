@@ -35,12 +35,23 @@ data/*
 backups/*
 !backups/.gitkeep
 *.db
+*.db-shm
+*.db-wal
+*.db-journal
 *.sqlite
+*.sqlite3
+*.sqlite-journal
 *.wav
 *.mp3
 *.m4a
 *.flac
 *.ogg
+*.opus
+*.webm
+*.mp4
+*.aac
+*.wma
+*.aiff
 
 # IDE
 .vscode/

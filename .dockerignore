@@ -21,8 +21,18 @@ certs/
 *.m4a
 *.flac
 *.ogg
+*.opus
+*.webm
+*.mp4
+*.aac
+*.wma
+*.aiff
 *.db
+*.db-shm
+*.db-wal
+*.db-journal
 *.sqlite
+*.sqlite3
 *.sqlite-journal
 *.log
 
