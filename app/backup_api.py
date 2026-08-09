@@ -9,12 +9,13 @@ profile contains thousands of segments.
 import asyncio
 import io
 import json
+import logging
 import os
 import re
 import traceback
 import zipfile
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
@@ -27,6 +28,8 @@ from .models import Speaker, ConversationSegment, SpeakerEmotionProfile
 from .config import VoiceSettings, get_config
 
 router = APIRouter(prefix="/profiles", tags=["Voice Profiles"])
+
+logger = logging.getLogger(__name__)
 
 _BACKUPS_DIR = "backups"
 _TIMESTAMP_RE = re.compile(r"^\d{8}_\d{6}$")
@@ -142,6 +145,43 @@ def _dump_json(path: str, payload: dict) -> None:
 def _read_json(path: str) -> dict:
     with open(path, 'r') as f:
         return json.load(f)
+
+
+# OPUS-014: listing profiles/checkpoints used to fully parse EVERY backup file
+# on each request just to count speakers/segments. Cache the parsed summary per
+# (path, mtime_ns, size) — backups are immutable once written, so the stat
+# tuple is a sound cache key.
+_SUMMARY_CACHE: Dict[str, Tuple[tuple, dict]] = {}
+_SUMMARY_CACHE_MAX = 512
+
+
+def _backup_summary(filepath: str) -> Optional[dict]:
+    """Parsed summary of a backup file, cached by stat signature."""
+    try:
+        st = os.stat(filepath)
+    except OSError:
+        return None
+    key = (filepath, st.st_mtime_ns, st.st_size)
+    cached = _SUMMARY_CACHE.get(filepath)
+    if cached and cached[0] == key:
+        return cached[1]
+    try:
+        data = _read_json(filepath)
+    except (json.JSONDecodeError, OSError, KeyError):
+        return None
+    summary = {
+        "name": data.get("name", os.path.basename(filepath)),
+        "description": data.get("description", ""),
+        "filename": os.path.basename(filepath),
+        "timestamp": data.get("timestamp", ""),
+        "speakers_count": len(data.get("speakers", [])),
+        "segments_count": len(data.get("segments", [])),
+        "created_at": datetime.fromtimestamp(st.st_ctime).isoformat(),
+    }
+    if len(_SUMMARY_CACHE) >= _SUMMARY_CACHE_MAX:
+        _SUMMARY_CACHE.clear()
+    _SUMMARY_CACHE[filepath] = (key, summary)
+    return summary
 
 
 def save_current_state(profile_name: str, description: str, db: Session, allow_overwrite: bool = False) -> dict:
@@ -288,20 +328,10 @@ def _scan_profiles() -> list:
     for filename in os.listdir(_BACKUPS_DIR):
         if not filename.startswith("profile_") or not filename.endswith(".json"):
             continue
-        filepath = os.path.join(_BACKUPS_DIR, filename)
-        try:
-            data = _read_json(filepath)
-        except (json.JSONDecodeError, OSError, KeyError):
+        summary = _backup_summary(os.path.join(_BACKUPS_DIR, filename))
+        if summary is None:
             continue
-        profiles.append({
-            "name": data.get("name", filename),
-            "description": data.get("description", ""),
-            "filename": filename,
-            "timestamp": data.get("timestamp", ""),
-            "speakers_count": len(data.get("speakers", [])),
-            "segments_count": len(data.get("segments", [])),
-            "created_at": datetime.fromtimestamp(os.stat(filepath).st_ctime).isoformat(),
-        })
+        profiles.append(summary)
     profiles.sort(key=lambda x: x["name"])
     return profiles
 
@@ -355,9 +385,11 @@ async def create_checkpoint(profile_name: str, db: Session = Depends(get_db)):
                 pass
 
         settings = get_config().get_settings()
-        # Checkpoints don't save emotion profiles (lightweight by design) but do
-        # store every tunable setting so they can be cleanly reverted.
-        speakers = _serialize_speakers(db, include_emotion_profiles=False)
+        # Checkpoints include emotion profiles: restore is a destructive
+        # wipe-and-rebuild, so anything the checkpoint omits is permanently
+        # deleted by a successful restore (SOL-003). Keeping them makes the
+        # checkpoint→restore round-trip lossless.
+        speakers = _serialize_speakers(db, include_emotion_profiles=True)
         segments = _serialize_segments(db)
 
         checkpoint_data = {
@@ -394,18 +426,16 @@ def _scan_checkpoints(profile_name: str) -> list:
     for filename in os.listdir(_BACKUPS_DIR):
         if not filename.startswith(prefix) or not filename.endswith(".json"):
             continue
-        filepath = os.path.join(_BACKUPS_DIR, filename)
-        try:
-            data = _read_json(filepath)
-        except (json.JSONDecodeError, OSError, KeyError):
+        summary = _backup_summary(os.path.join(_BACKUPS_DIR, filename))
+        if summary is None:
             continue
         checkpoints.append({
             "filename": filename,
-            "timestamp": data.get("timestamp", ""),
+            "timestamp": summary["timestamp"],
             "profile_name": profile_name,
-            "speakers_count": len(data.get("speakers", [])),
-            "segments_count": len(data.get("segments", [])),
-            "created_at": datetime.fromtimestamp(os.stat(filepath).st_ctime).isoformat(),
+            "speakers_count": summary["speakers_count"],
+            "segments_count": summary["segments_count"],
+            "created_at": summary["created_at"],
         })
     checkpoints.sort(key=lambda x: x["timestamp"], reverse=True)
     return checkpoints
@@ -467,6 +497,9 @@ async def restore_from_file(filename: str, db: Session = Depends(get_db)):
         # Everything below is ONE transaction: wipe, rebuild speakers and
         # emotion profiles, and segment remap commit together. Any failure
         # rolls the database back to its pre-restore state.
+        # Explicit deletes — never rely on DB-level CASCADE, which only works
+        # when PRAGMA foreign_keys is ON for this exact connection.
+        db.query(SpeakerEmotionProfile).delete()
         db.query(ConversationSegment).update({"speaker_id": None})
         db.query(Speaker).delete()
 
@@ -521,6 +554,15 @@ async def restore_from_file(filename: str, db: Session = Depends(get_db)):
                 segments_updated += 1
 
         db.commit()
+
+        # Active streams keep an in-memory speaker cache keyed by the OLD
+        # speaker IDs; after a restore those IDs are gone. Drop the cache so
+        # the next match reloads from the restored database (OPUS-015/QWEN-006).
+        try:
+            from .api import get_engine
+            get_engine().clear_speaker_cache()
+        except Exception:
+            logger.info("Speaker cache invalidation skipped after restore")
 
         # Apply persisted settings only after the database restore succeeded,
         # so a failed restore never also mutates runtime settings.

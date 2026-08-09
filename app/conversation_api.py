@@ -189,6 +189,16 @@ async def reprocess_conversation(
 
     db.commit()
 
+    # Clean up Unknown_* speakers that lost all their segments during
+    # reprocessing (the old segments were deleted above). The initial
+    # processing path does this via the identify flow; reprocess did not.
+    deleted_unknowns = cleanup_orphaned_unknowns(db, engine=engine)
+    if deleted_unknowns:
+        logger.info(f"🗑️ Auto-deleted orphaned speakers after reprocess: {deleted_unknowns}")
+        db.commit()
+
+    db.commit()
+
     # Clear GPU cache after reprocessing
     engine.clear_gpu_cache()
 

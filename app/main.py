@@ -43,6 +43,25 @@ async def lifespan(app: FastAPI):
     init_db()
     logger.info("Database initialized!")
 
+    # OPUS-019/QWEN-016: a WebSocket that dies mid-recording (client crash,
+    # server restart) leaves the conversation row stuck in status="recording"
+    # forever. Nothing is actually recording after a restart, so reconcile.
+    try:
+        from .database import SessionLocal
+        from .models import Conversation as _Conversation
+        reconcile_db = SessionLocal()
+        try:
+            stuck = reconcile_db.query(_Conversation).filter(
+                _Conversation.status.in_(["recording", "processing"])
+            ).update({"status": "failed"}, synchronize_session=False)
+            if stuck:
+                logger.info(f"Reconciled {stuck} conversation(s) stuck in recording/processing after restart")
+            reconcile_db.commit()
+        finally:
+            reconcile_db.close()
+    except Exception as e:
+        logger.info(f"Conversation reconciliation skipped: {e}")
+
     # Create necessary directories (use relative paths for local dev, absolute for Docker)
     root = data_path()
     volumes_path = os.getenv("VOLUMES_PATH", "./volumes")

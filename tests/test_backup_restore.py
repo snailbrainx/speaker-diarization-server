@@ -4,6 +4,7 @@ and profile-overwrite protection (OPUS-004/QWEN-017).
 All failures reproduced against pinned SHA 700976f; all pass after the fix.
 """
 import json
+import os
 
 import pytest
 from app.database import Base
@@ -15,6 +16,18 @@ from sqlalchemy.orm import sessionmaker
 @pytest.fixture()
 def db_session(tmp_path):
     engine = create_engine(f"sqlite:///{tmp_path}/test.db")
+
+    # Mirror app.database production pragmas so FK cascades behave identically.
+    from sqlalchemy import event
+
+    @event.listens_for(engine, "connect")
+    def _pragmas(dbapi_conn, _record):
+        cursor = dbapi_conn.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA busy_timeout=30000")
+        cursor.close()
+
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine)
     db = Session()
@@ -115,6 +128,46 @@ class TestRestoreAtomicity:
 
         names = [s.name for s in db_session.query(Speaker).all()]
         assert names == ["Keeper"]
+
+
+class TestCheckpointRestoreRoundTrip:
+    def test_checkpoint_restore_preserves_emotion_profiles(self, db_session, backup_dir, monkeypatch):
+        """SOL-003: checkpoints used to omit emotion profiles, so restoring one
+        silently deleted all learned emotion state. Round-trip must be lossless."""
+        import numpy as np
+        from app import backup_api
+        from app.models import SpeakerEmotionProfile
+
+        speaker = _make_speaker(db_session, "Trained")
+        prof = SpeakerEmotionProfile(
+            speaker_id=speaker.id,
+            emotion_category="happy",
+            sample_count=4,
+        )
+        prof.set_embedding(np.full(1024, 0.25, dtype=np.float32))
+        db_session.add(prof)
+        db_session.commit()
+
+        monkeypatch.chdir(backup_dir.parent)
+        import asyncio
+        created = asyncio.run(backup_api.create_checkpoint(profile_name="rt", db=db_session))
+        ckpt_file = backup_dir / [
+            f for f in os.listdir(backup_dir) if f.startswith("checkpoint_rt_")
+        ][0]
+        assert ckpt_file.exists()
+
+        # Checkpoint must actually contain the emotion profile now.
+        payload = json.loads(ckpt_file.read_text())
+        assert payload["speakers"][0].get("emotion_profiles"), (
+            "checkpoint must serialize emotion profiles or restore destroys them"
+        )
+
+        asyncio.run(backup_api.restore_from_file(filename=ckpt_file.name, db=db_session))
+        db_session.expire_all()
+        profiles = db_session.query(SpeakerEmotionProfile).all()
+        assert len(profiles) == 1, f"emotion profiles lost after checkpoint restore: {len(profiles)}"
+        assert profiles[0].emotion_category == "happy"
+        assert profiles[0].sample_count == 4
 
 
 class TestProfileOverwriteProtection:

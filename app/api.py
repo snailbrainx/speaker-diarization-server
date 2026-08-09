@@ -104,7 +104,10 @@ async def enroll_speaker(
     temp_dir = os.path.join(data_path(), "temp")
     os.makedirs(temp_dir, exist_ok=True)
     safe_filename = os.path.basename(audio_file.filename or "upload")
-    temp_path = os.path.join(temp_dir, safe_filename)
+    # Unique temp name: concurrent enrolls with the same client filename used
+    # to write to the same path and delete each other's file mid-stream.
+    import uuid as _uuid
+    temp_path = os.path.join(temp_dir, f"{_uuid.uuid4().hex[:12]}_{safe_filename}")
 
     def _stream_upload():
         with open(temp_path, "wb") as buffer:
@@ -137,6 +140,13 @@ async def enroll_speaker(
         db.add(speaker)
         db.commit()
         db.refresh(speaker)
+
+        # Make active streams aware of the new speaker immediately; their
+        # in-memory cache was loaded before this enrollment (OPUS-015).
+        try:
+            engine.add_speaker_to_cache(speaker.id, speaker.name, embedding)
+        except Exception:
+            engine.clear_speaker_cache()
 
         # Clear GPU cache after embedding extraction
         engine.clear_gpu_cache()
@@ -203,9 +213,12 @@ async def delete_speaker(speaker_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Speaker not found")
 
     # 1. Set speaker_id to NULL in segments (SQLite FK constraint is NO ACTION, not SET NULL)
+    # Also replace the now-dead speaker name: segments must not keep displaying
+    # a deleted speaker (GLM-012). Use "Unknown" (not "Unknown_XX") so the
+    # retroactive Unknown_* relabel logic can never re-match these segments.
     db.query(ConversationSegment).filter(
         ConversationSegment.speaker_id == speaker_id
-    ).update({"speaker_id": None}, synchronize_session=False)
+    ).update({"speaker_id": None, "speaker_name": "Unknown"}, synchronize_session=False)
 
     # 2. Delete emotion profiles
     db.query(SpeakerEmotionProfile).filter(

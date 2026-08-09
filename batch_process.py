@@ -241,8 +241,9 @@ def worker_main(gpu_id, file_queue, result_queue, known_speakers_raw,
                     ]
                 json_result["segments"].append(seg_data)
 
-            with open(json_path, "w") as f:
+            with open(json_path + ".tmp", "w") as f:
                 json.dump(json_result, f, indent=2, default=str)
+            os.replace(json_path + ".tmp", json_path)
 
             # Write human-readable transcript
             with open(txt_path, "w", encoding="utf-8") as f:
