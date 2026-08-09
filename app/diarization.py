@@ -373,7 +373,7 @@ class SpeakerRecognitionEngine:
             return self._whisper_model
         with self._model_lock:
             if self._whisper_model is None:
-                model_name = os.getenv("WHISPER_MODEL", "large-v3-turbo")
+                model_name = os.getenv("WHISPER_MODEL", "large-v3")
                 device_name = "cuda" if torch.cuda.is_available() else "cpu"
                 compute_type = "float16" if torch.cuda.is_available() else "int8"
                 logger.info(f"Loading faster-whisper model ({model_name}) on {device_name} / {compute_type}...")
