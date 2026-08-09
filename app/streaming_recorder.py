@@ -62,6 +62,11 @@ class StreamingRecorder:
         # Threading
         self.executor = ThreadPoolExecutor(max_workers=max_workers)
         self.processing_futures: List = []
+        # Hard cap on buffered audio: without it a client that streams without
+        # pausing grows this list without bound (RAM), and the buffer is only
+        # ever flushed on silence. At 48 kHz mono float32 this is ~23 MB/s, so
+        # cap at ~2 minutes of audio; a longer utterance flushes in pieces.
+        self.MAX_BUFFER_SECONDS = 120.0
         # Guards current_buffer, total_segments, segments_queued, segment_paths,
         # cumulative_offset, and last_speech_time against concurrent flushes
         # (process_audio_chunk from the WS thread vs. stop_recording's tail flush).
@@ -152,6 +157,20 @@ class StreamingRecorder:
         if audio_data.dtype != np.float32:
             audio_data = audio_data.astype(np.float32) / 32768.0
 
+        # Reject non-finite frames: NaN propagates into the WAV segment, the
+        # GPU pipeline, and the JSON status messages (invalid JSON to clients).
+        if not np.isfinite(audio_data).all():
+            logger.info("Dropping audio chunk containing non-finite samples")
+            return {
+                "status": "recording",
+                "audio_level": 0.0,
+                "speech_detected": self.speech_detected,
+                "segments_queued": self.segments_queued,
+                "segments_processed": self.segments_processed,
+                "buffer_size": len(self.current_buffer),
+                "cumulative_offset": self.cumulative_offset,
+            }
+
         energy = float(np.sqrt(np.mean(audio_data ** 2)))
 
         if self.on_audio_level:
@@ -169,6 +188,13 @@ class StreamingRecorder:
                 silence_elapsed = time.time() - self.last_speech_time
                 if silence_elapsed >= self.silence_duration and len(self.current_buffer) > 10:
                     self._flush_locked()
+
+            # Bound RAM: force-flush if the unflushed buffer exceeds the cap
+            # (continuous speech with no silence pause).
+            buffered_seconds = sum(len(chunk) for chunk in self.current_buffer) / self.sample_rate
+            if buffered_seconds >= self.MAX_BUFFER_SECONDS:
+                logger.info(f"Buffer cap reached ({buffered_seconds:.0f}s) — flushing")
+                self._flush_locked()
 
             buffer_size = len(self.current_buffer)
             cumulative_offset = self.cumulative_offset

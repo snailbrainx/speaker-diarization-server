@@ -131,11 +131,25 @@ async def websocket_endpoint(
         # Use asyncio.run_coroutine_threadsafe to schedule from background thread.
         # The coroutine creates its own DB session — the request-scoped `db` is not
         # thread-safe and may conflict with the main handler's usage.
+        #
+        # IMPORTANT: block on the returned future. The recorder's
+        # stop_recording() waits on its worker futures; if this callback
+        # returned as soon as the coroutine was merely SCHEDULED, stop_recording
+        # would report "all segments processed" while transcription/DB writes
+        # were still in flight (wrong final metadata, undelivered segments,
+        # lost num_segments increments, unbounded concurrent GPU work).
         def segment_callback(seg_info):
-            asyncio.run_coroutine_threadsafe(
+            future = asyncio.run_coroutine_threadsafe(
                 _handle_segment_processed(websocket, conversation_id, seg_info, get_engine()),
                 loop
             )
+            try:
+                future.result()
+            except RuntimeError:
+                # Event loop already closed (client gone) — nothing to deliver.
+                logger.info(f"Segment {seg_info.get('id')} dropped: event loop closed")
+            except Exception as exc:
+                logger.error(f"Segment handler failed: {exc}")
 
         recorder.on_segment_processed = segment_callback
 
@@ -317,8 +331,15 @@ async def _handle_segment_processed(
                 "avg_logprob": segment.avg_logprob
             })
 
-        # Update conversation stats (increment rather than re-count)
-        conversation.num_segments = (conversation.num_segments or 0) + len(result["segments"])
+        # Update conversation stats with an atomic SQL increment. A
+        # read-modify-write on the ORM object across independent sessions
+        # loses concurrent increments (two segment handlers → stored value 1).
+        db.query(Conversation).filter(
+            Conversation.id == conversation_id
+        ).update(
+            {"num_segments": Conversation.num_segments + len(result["segments"])},
+            synchronize_session=False,
+        )
 
         db.commit()
 

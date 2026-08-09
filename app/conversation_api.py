@@ -120,6 +120,18 @@ async def delete_conversation(conversation_id: int, db: Session = Depends(get_db
     if conversation.audio_path and os.path.exists(conversation.audio_path):
         os.remove(conversation.audio_path)
 
+    # Delete streaming segment WAVs (OPUS-013/QWEN-012): these are never
+    # removed otherwise and accumulate unboundedly under
+    # data/stream_segments/conv_<id>/.
+    try:
+        from .services import data_path as _data_path
+        seg_dir = os.path.join(_data_path(), "stream_segments", f"conv_{conversation_id}")
+        if os.path.isdir(seg_dir):
+            import shutil as _shutil
+            _shutil.rmtree(seg_dir, ignore_errors=True)
+    except Exception:
+        logger.info(f"Could not remove stream segment dir for conversation {conversation_id}")
+
     db.delete(conversation)
     db.commit()
 
@@ -334,7 +346,15 @@ async def identify_speaker_in_segment(
     if not audio_file:
         raise HTTPException(status_code=404, detail="Audio file not found (neither conversation audio nor segment audio exists)")
     if audio_file == segment.segment_audio_path:
-        logger.info(f"⚠️ WARNING: Using segment audio with conversation-relative offsets - may extract wrong audio!")
+        # Database offsets are conversation-relative; the per-segment file
+        # contains only the raw VAD chunk, so applying conversation offsets to
+        # it extracts the WRONG audio (clamped to the tail of the chunk).
+        # Refuse instead of silently embedding garbage audio.
+        raise HTTPException(
+            status_code=409,
+            detail="Full conversation audio is not available yet (recording still in progress). "
+                   "Re-run identification after the recording is finalised.",
+        )
 
     # Store the old speaker name and ID for propagation and embedding recalculation
     old_speaker_name = segment.speaker_name
@@ -396,12 +416,18 @@ async def identify_speaker_in_segment(
     segment.speaker_name = speaker.name
     segment.confidence = 1.0  # Manually identified
 
-    # UPDATE ALL OTHER SEGMENTS with the same old speaker name (retroactive identification!)
-    # SAFETY: Only do retroactive updates for Unknown speakers!
-    # If old speaker is already identified (Tommy, Diamond, etc.), only update THIS segment
+    # UPDATE OTHER SEGMENTS with the same old speaker name (retroactive
+    # identification!).
+    # SAFETY 1: Only do retroactive updates for Unknown speakers!
+    # If old speaker is already identified (Tommy, Diamond, etc.), only update THIS segment.
+    # SAFETY 2: Scoped to THIS conversation. Unknown_XX labels are assigned
+    # independently per conversation (the counter resets per recording), so a
+    # global match would relabel a DIFFERENT conversation's unrelated
+    # "Unknown_01" — including live-streaming chunks of other sessions.
     updated_count = 0
     if old_speaker_name and old_speaker_name != speaker.name and old_speaker_name.startswith("Unknown_"):
         updated_count = db.query(ConversationSegment).filter(
+            ConversationSegment.conversation_id == conversation_id,
             ConversationSegment.speaker_name == old_speaker_name,
             ConversationSegment.id != segment_id  # Don't update the one we just did
         ).update({
@@ -704,7 +730,10 @@ async def get_segment_audio(
     # Create temporary directory for extracted segments
     temp_dir = os.path.join(data_path(), "temp")
     os.makedirs(temp_dir, exist_ok=True)
-    temp_path = os.path.join(temp_dir, f"segment_{segment_id}_{int(datetime.now().timestamp())}.wav")
+    # uuid suffix: second-resolution timestamps collide for concurrent
+    # requests of the same segment (one 500s / truncated file served).
+    import uuid as _uuid
+    temp_path = os.path.join(temp_dir, f"segment_{segment_id}_{int(datetime.now().timestamp())}_{_uuid.uuid4().hex[:8]}.wav")
 
     try:
         # Use ffmpeg to extract the specific time range with small padding at end
@@ -878,76 +907,100 @@ async def correct_emotion_in_segment(
     sample_count = 0
     voice_samples = 0
     if learn and emotion_embedding is not None:
-        # Get or create emotion profile
-        profile = db.query(SpeakerEmotionProfile).filter(
-            SpeakerEmotionProfile.speaker_id == segment.speaker_id,
-            SpeakerEmotionProfile.emotion_category == corrected_emotion
-        ).first()
-
-        if profile:
-            # MERGE EMOTION embeddings (weighted average)
-            existing_emb = profile.get_embedding()
-
-            # Weighted average: existing embedding has more weight based on sample count
-            weight = profile.sample_count / (profile.sample_count + 1)
-            merged_emb = (existing_emb * weight) + (emotion_embedding * (1 - weight))
-
-            profile.set_embedding(merged_emb)
-            profile.sample_count += 1
-            profile.updated_at = utc_now()
-
-            sample_count = profile.sample_count
-            logger.info(f"✓ Merged segment {segment_id} into '{corrected_emotion}' profile (now {sample_count} emotion samples)")
-        else:
-            # Create new profile
-            profile = SpeakerEmotionProfile(
-                speaker_id=segment.speaker_id,
-                emotion_category=corrected_emotion,
-                sample_count=1,
-                voice_sample_count=0
+        if old_emotion_corrected:
+            # Re-correction of an already-corrected segment: the incremental
+            # weighted-average merge below would count this segment a SECOND
+            # time, permanently biasing the profile (weight drifts from 1/2 to
+            # 2/3 for the repeated sample). Recalculate from all corrected
+            # segments instead — idempotent by construction.
+            recalc_result = await asyncio.to_thread(
+                recalculate_emotion_profile,
+                segment.speaker_id,
+                corrected_emotion,
+                db,
+                engine,
             )
-            profile.set_embedding(emotion_embedding)
-            db.add(profile)
+            profile = db.query(SpeakerEmotionProfile).filter(
+                SpeakerEmotionProfile.speaker_id == segment.speaker_id,
+                SpeakerEmotionProfile.emotion_category == corrected_emotion
+            ).first()
+            if profile:
+                sample_count = profile.sample_count
+                voice_samples = profile.voice_sample_count or 0
+            logger.info(f"✓ Re-correction: recalculated '{corrected_emotion}' profile from all corrections ({recalc_result})")
+            merge_msg = f" (recalculated: {sample_count} samples)"
+        else:
+            # First correction of this segment: incremental merge is safe.
+            # Get or create emotion profile
+            profile = db.query(SpeakerEmotionProfile).filter(
+                SpeakerEmotionProfile.speaker_id == segment.speaker_id,
+                SpeakerEmotionProfile.emotion_category == corrected_emotion
+            ).first()
 
-            sample_count = 1
-            logger.info(f"✓ Created new '{corrected_emotion}' profile with segment {segment_id}")
-        
-        # NEW: Also merge VOICE embedding for this emotion (Detector 2 data)
-        voice_emb = segment.get_speaker_embedding()
-        if voice_emb is not None and not np.isnan(voice_emb).any():
-            existing_voice_emb = profile.get_voice_embedding()
+            if profile:
+                # MERGE EMOTION embeddings (weighted average)
+                existing_emb = profile.get_embedding()
 
-            if existing_voice_emb is not None and not np.isnan(existing_voice_emb).any():
-                # Merge with existing voice profile for this emotion
-                voice_weight = profile.voice_sample_count / (profile.voice_sample_count + 1)
-                merged_voice = (existing_voice_emb * voice_weight) + (voice_emb * (1 - voice_weight))
-                profile.set_voice_embedding(merged_voice)
-                profile.voice_sample_count += 1
-                logger.info(f"  → Also merged voice embedding (now {profile.voice_sample_count} voice samples)")
+                # Weighted average: existing embedding has more weight based on sample count
+                weight = profile.sample_count / (profile.sample_count + 1)
+                merged_emb = (existing_emb * weight) + (emotion_embedding * (1 - weight))
+
+                profile.set_embedding(merged_emb)
+                profile.sample_count += 1
+                profile.updated_at = utc_now()
+
+                sample_count = profile.sample_count
+                logger.info(f"✓ Merged segment {segment_id} into '{corrected_emotion}' profile (now {sample_count} emotion samples)")
             else:
-                # First voice sample for this emotion
-                profile.set_voice_embedding(voice_emb)
-                profile.voice_sample_count = 1
-                logger.info(f"  → Added first voice sample for '{corrected_emotion}' profile")
+                # Create new profile
+                profile = SpeakerEmotionProfile(
+                    speaker_id=segment.speaker_id,
+                    emotion_category=corrected_emotion,
+                    sample_count=1,
+                    voice_sample_count=0
+                )
+                profile.set_embedding(emotion_embedding)
+                db.add(profile)
 
-            voice_samples = profile.voice_sample_count
-            
-            # Also update generic speaker profile (keeps it current)
-            speaker = db.query(Speaker).filter(Speaker.id == segment.speaker_id).first()
-            if speaker:
-                existing_speaker_emb = speaker.get_embedding()
-                # Get all non-misidentified segments for this speaker
-                all_segments = db.query(ConversationSegment).filter(
-                    ConversationSegment.speaker_id == speaker.id,
-                    ConversationSegment.is_misidentified == False
-                ).count()
-                
-                if all_segments > 0:
-                    speaker_weight = (all_segments - 1) / all_segments
-                    merged_speaker = (existing_speaker_emb * speaker_weight) + (voice_emb * (1 - speaker_weight))
-                    speaker.set_embedding(merged_speaker)
-        
-        merge_msg = f" (emotion: {sample_count} samples, voice: {voice_samples} samples)"
+                sample_count = 1
+                logger.info(f"✓ Created new '{corrected_emotion}' profile with segment {segment_id}")
+
+            # Also merge VOICE embedding for this emotion (Detector 2 data)
+            voice_emb = segment.get_speaker_embedding()
+            if voice_emb is not None and not np.isnan(voice_emb).any():
+                existing_voice_emb = profile.get_voice_embedding()
+
+                if existing_voice_emb is not None and not np.isnan(existing_voice_emb).any():
+                    # Merge with existing voice profile for this emotion
+                    voice_weight = profile.voice_sample_count / (profile.voice_sample_count + 1)
+                    merged_voice = (existing_voice_emb * voice_weight) + (voice_emb * (1 - voice_weight))
+                    profile.set_voice_embedding(merged_voice)
+                    profile.voice_sample_count += 1
+                    logger.info(f"  → Also merged voice embedding (now {profile.voice_sample_count} voice samples)")
+                else:
+                    # First voice sample for this emotion
+                    profile.set_voice_embedding(voice_emb)
+                    profile.voice_sample_count = 1
+                    logger.info(f"  → Added first voice sample for '{corrected_emotion}' profile")
+
+                voice_samples = profile.voice_sample_count
+
+                # Also update generic speaker profile (keeps it current)
+                speaker = db.query(Speaker).filter(Speaker.id == segment.speaker_id).first()
+                if speaker:
+                    existing_speaker_emb = speaker.get_embedding()
+                    # Get all non-misidentified segments for this speaker
+                    all_segments = db.query(ConversationSegment).filter(
+                        ConversationSegment.speaker_id == speaker.id,
+                        ConversationSegment.is_misidentified == False
+                    ).count()
+
+                    if all_segments > 0:
+                        speaker_weight = (all_segments - 1) / all_segments
+                        merged_speaker = (existing_speaker_emb * speaker_weight) + (voice_emb * (1 - speaker_weight))
+                        speaker.set_embedding(merged_speaker)
+
+            merge_msg = f" (emotion: {sample_count} samples, voice: {voice_samples} samples)"
 
     db.commit()
     db.refresh(segment)

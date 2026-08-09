@@ -253,7 +253,10 @@ async def process_audio(
 
     # Save uploaded file with timestamp (basename strips any directory component)
     base_filename = os.path.basename(audio_file.filename or "upload")
-    temp_filename = f"uploaded_{timestamp}_{base_filename}"
+    # uuid suffix avoids collisions between uploads with the same name in the
+    # same second (they used to overwrite each other mid-stream).
+    import uuid as _uuid
+    temp_filename = f"uploaded_{timestamp}_{_uuid.uuid4().hex[:8]}_{base_filename}"
     temp_path = os.path.join(recordings_dir, temp_filename)
 
     def _stream_upload():

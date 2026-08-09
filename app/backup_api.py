@@ -124,10 +124,19 @@ def _serialize_segments(db: Session) -> list:
 
 
 def _dump_json(path: str, payload: dict) -> None:
-    tmp = f"{path}.tmp"
-    with open(tmp, 'w') as f:
-        json.dump(payload, f, indent=2)
-    os.replace(tmp, path)
+    import tempfile as _tempfile
+    target_dir = os.path.dirname(path) or "."
+    fd, tmp = _tempfile.mkstemp(
+        prefix=os.path.basename(path) + ".", suffix=".tmp", dir=target_dir
+    )
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(payload, f, indent=2)
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
 
 
 def _read_json(path: str) -> dict:
@@ -135,12 +144,24 @@ def _read_json(path: str) -> dict:
         return json.load(f)
 
 
-def save_current_state(profile_name: str, description: str, db: Session) -> dict:
-    """Save current speaker/segment state to profile file. Blocking — call via to_thread."""
+def save_current_state(profile_name: str, description: str, db: Session, allow_overwrite: bool = False) -> dict:
+    """Save current speaker/segment state to profile file. Blocking — call via to_thread.
+
+    allow_overwrite=False refuses to clobber an existing snapshot of the same
+    name (409). Silent overwrites are how operators lose their only backup:
+    `POST /profiles` or `/duplicate` with a reused name used to replace the
+    stored speakers+segments with whatever the DB holds at that moment —
+    including an EMPTY state right after a failed restore.
+    """
     safe_name = sanitize_filename(profile_name)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     os.makedirs(_BACKUPS_DIR, exist_ok=True)
     profile_file = _profile_path(safe_name)
+    if not allow_overwrite and os.path.exists(profile_file):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Profile '{profile_name}' already exists; use the update endpoint or choose a different name",
+        )
 
     settings = get_config().get_settings()
     speakers = _serialize_speakers(db, include_emotion_profiles=True)
@@ -173,6 +194,11 @@ async def create_profile(request: CreateProfileRequest, db: Session = Depends(ge
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         os.makedirs(_BACKUPS_DIR, exist_ok=True)
         profile_file = _profile_path(safe_name)
+        if os.path.exists(profile_file):
+            raise HTTPException(
+                status_code=409,
+                detail=f"Profile '{request.name}' already exists; choose a different name",
+            )
         defaults = VoiceSettings()
         profile_data = {
             "timestamp": timestamp,
@@ -207,13 +233,15 @@ async def create_profile(request: CreateProfileRequest, db: Session = Depends(ge
 async def duplicate_profile(request: CreateProfileRequest, db: Session = Depends(get_db)):
     """Duplicate current state into a new profile (speakers + segments + settings)."""
     try:
-        result = await asyncio.to_thread(save_current_state, request.name, request.description or "", db)
+        result = await asyncio.to_thread(save_current_state, request.name, request.description or "", db, False)
         return {
             "message": f"Profile '{request.name}' duplicated successfully",
             "name": request.name,
             "description": request.description or "",
             **result,
         }
+    except HTTPException:
+        raise
     except Exception:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail="Failed to duplicate profile")
@@ -240,7 +268,8 @@ async def update_profile(
 
     try:
         description = await asyncio.to_thread(_load_description)
-        result = await asyncio.to_thread(save_current_state, profile_name, description, db)
+        # PATCH is the explicit update path: overwrite is intended here.
+        result = await asyncio.to_thread(save_current_state, profile_name, description, db, True)
         return {
             "message": f"Profile '{profile_name}' updated successfully",
             "name": profile_name,
@@ -416,28 +445,33 @@ async def restore_from_file(filename: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="File not found")
 
     def _work() -> dict:
+        # Parse and validate BEFORE touching the database: a malformed file
+        # must never leave the DB wiped (previous code committed the wipe
+        # first and rolled back nothing on failure).
         data = _read_json(filepath)
 
-        # Restore any settings fields the file provides, leaving others at their
-        # current values. This is safer than back-filling every missing setting
-        # with a hard-coded default — checkpoints that predate a new setting
-        # won't clobber the user's current value.
-        if "settings" in data:
-            config = get_config()
-            current = _tunable_settings(config.get_settings())
-            current.update({
-                k: v for k, v in data["settings"].items()
-                if k in VoiceSettings.model_fields
-            })
-            config.update_settings(current)
-            config.reload_settings()
+        speakers_in = data.get("speakers", [])
+        names_in = [s.get("name") for s in speakers_in]
+        if len(names_in) != len(set(names_in)):
+            raise HTTPException(
+                status_code=400,
+                detail="Profile contains duplicate speaker names; restore aborted before any data was modified",
+            )
 
+        # Stable-key fallback map captured before the wipe: if the backup's
+        # speaker IDs do not match this database's IDs (restore onto a
+        # different DB), remap segments via speaker NAME instead of silently
+        # dropping every assignment.
+        current_name_by_id = {s.id: s.name for s in db.query(Speaker).all()}
+
+        # Everything below is ONE transaction: wipe, rebuild speakers and
+        # emotion profiles, and segment remap commit together. Any failure
+        # rolls the database back to its pre-restore state.
         db.query(ConversationSegment).update({"speaker_id": None})
         db.query(Speaker).delete()
-        db.commit()
 
         speaker_id_map: Dict[int, int] = {}
-        for speaker_data in data.get("speakers", []):
+        for speaker_data in speakers_in:
             old_id = speaker_data["id"]
             speaker = Speaker(name=speaker_data["name"])
             if speaker_data.get("embedding"):
@@ -462,27 +496,50 @@ async def restore_from_file(filename: str, db: Session = Depends(get_db)):
                     profile.set_voice_embedding(np.array(prof_data["voice_embedding"], dtype=np.float32))
                 db.add(profile)
 
-        db.commit()
+        db.flush()
+        new_id_by_name = {s.name: s.id for s in db.query(Speaker).all()}
 
         segments_updated = 0
+        segments_unmapped = 0
         for seg_data in data.get("segments", []):
             segment = db.query(ConversationSegment).filter(
                 ConversationSegment.id == seg_data["id"]
             ).first()
             if segment:
                 old_speaker_id = seg_data.get("speaker_id")
+                new_speaker_id = None
                 if old_speaker_id and old_speaker_id in speaker_id_map:
-                    segment.speaker_id = speaker_id_map[old_speaker_id]
+                    new_speaker_id = speaker_id_map[old_speaker_id]
+                elif old_speaker_id and old_speaker_id in current_name_by_id:
+                    new_speaker_id = new_id_by_name.get(current_name_by_id[old_speaker_id])
+                if new_speaker_id is not None:
+                    segment.speaker_id = new_speaker_id
+                elif old_speaker_id:
+                    segments_unmapped += 1
                 segment.speaker_name = seg_data.get("speaker_name")
                 segment.is_misidentified = seg_data.get("is_misidentified", False)
                 segments_updated += 1
+
         db.commit()
+
+        # Apply persisted settings only after the database restore succeeded,
+        # so a failed restore never also mutates runtime settings.
+        if "settings" in data:
+            config = get_config()
+            current = _tunable_settings(config.get_settings())
+            current.update({
+                k: v for k, v in data["settings"].items()
+                if k in VoiceSettings.model_fields
+            })
+            config.update_settings(current)
+            config.reload_settings()
 
         profile_name = data.get("name") or data.get("profile_name", "Unknown")
         return {
             "message": f"Restored profile '{profile_name}'",
             "speakers_restored": len(speaker_id_map),
             "segments_updated": segments_updated,
+            "segments_unmapped": segments_unmapped,
         }
 
     try:
