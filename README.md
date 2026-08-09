@@ -27,7 +27,7 @@ Example [Next.js frontend](https://github.com/snailbrainx/speaker_identity_nextj
 
 - **Persistent speaker identity** — enroll a voice once, recognized across every future recording.
 - **Retroactive updates** — identify one segment and every past segment with that voice re-labels automatically.
-- **Transcription** — faster-whisper (`large-v3-turbo` default, any Whisper variant), word-level timestamps, 99 languages.
+- **Transcription** — faster-whisper (`large-v3` default, any Whisper variant), word-level timestamps, 99 languages.
 - **Dual-detector emotion recognition** — emotion2vec+ (general) combined with per-speaker voice profiles (personalized). 9 categories.
 - **Live streaming** — WebSocket audio ingestion with VAD-gated segment flushing.
 - **Batch processing** — multi-GPU script for bulk ingest (`run_batch.sh`).
@@ -42,7 +42,7 @@ Example [Next.js frontend](https://github.com/snailbrainx/speaker_identity_nextj
 |-----------------|-----------------------------------------------------------------------------|
 | Diarization     | `pyannote/speaker-diarization-community-1` (pyannote.audio 4.0.1)           |
 | Speaker embed   | `pyannote/embedding` (512-D)                                                |
-| Transcription   | faster-whisper 1.2.1 / CTranslate2, `large-v3-turbo` default                |
+| Transcription   | faster-whisper 1.2.1 / CTranslate2, `large-v3` default                |
 | Emotion         | emotion2vec_plus_large via FunASR (1024-D, 9 categories)                    |
 | API             | FastAPI 0.115.5 + WebSockets + uvicorn                                      |
 | DB              | SQLAlchemy 2.0 / SQLite (WAL)                                               |
@@ -52,7 +52,7 @@ Example [Next.js frontend](https://github.com/snailbrainx/speaker_identity_nextj
 ## Requirements
 
 - **GPU:** NVIDIA with CUDA 12.x. Tested on RTX 3090 (24 GB) and RTX 5090. Runs on 6 GB+ cards if you pick a smaller Whisper model.
-- **VRAM ballpark:** 2–3 GB diarization/embedding + 2 GB emotion2vec + Whisper (0.5–4 GB depending on model). `large-v3-turbo` + emotion ≈ 6–7 GB total.
+- **VRAM ballpark:** 2–3 GB diarization/embedding + 2 GB emotion2vec + Whisper (0.5–4 GB depending on model). `large-v3` + emotion ≈ 8–9 GB total (turbo ≈ 6–7 GB).
 - **OS:** Linux (tested on Ubuntu). macOS/Windows via Docker Desktop + WSL2.
 - **Other:** ffmpeg, git. Python 3.11 or 3.12 if running outside Docker.
 - **HuggingFace token** with pyannote terms accepted (see below).
@@ -135,7 +135,7 @@ All configuration is environment variables (see `.env.example` for the curated l
 
 | Variable                       | Default                          | Purpose                                             |
 |--------------------------------|----------------------------------|-----------------------------------------------------|
-| `WHISPER_MODEL`                | `large-v3-turbo`                 | Any faster-whisper model ID. See `.env.example`.    |
+| `WHISPER_MODEL`                | `large-v3`                 | Any faster-whisper model ID. See `.env.example`.    |
 | `WHISPER_LANGUAGE`             | `en`                             | `auto` for 99-language detection, or ISO-639 code.  |
 | `EMOTION_MODEL`                | `iic/emotion2vec_plus_large`     | FunASR emotion model ID.                            |
 | `ENABLE_PERSONALIZED_EMOTIONS` | `true`                           | Use per-speaker voice profiles in emotion matching. |

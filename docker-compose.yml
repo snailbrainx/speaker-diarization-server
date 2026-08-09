@@ -44,7 +44,10 @@ services:
         reservations:
           devices:
             - driver: nvidia
-              count: all
+              # Pin a specific card by UUID (`nvidia-smi -L`) via GPU_DEVICE_ID in
+              # .env — e.g. GPU_DEVICE_ID=GPU-5e5ed3af-... . Unset means "all GPUs",
+              # which is the portable default for a fresh clone.
+              device_ids: ['${GPU_DEVICE_ID:-all}']
               capabilities: [gpu]
     restart: unless-stopped
 
