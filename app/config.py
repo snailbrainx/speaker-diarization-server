@@ -5,6 +5,8 @@ Supports runtime updates and persistence.
 import os
 import json
 import logging
+import tempfile
+import threading
 from typing import Dict, Any, Callable, Tuple
 from pydantic import BaseModel, Field
 
@@ -46,6 +48,11 @@ class ConfigManager:
 
     def __init__(self, config_file: str = "data/config.json"):
         self.config_file = config_file
+        # Guards the read-modify-write in update_settings and the file write in
+        # _save_settings. Without it, two concurrent POST /settings/voice
+        # requests race on a fixed temp filename (FileNotFoundError / lost
+        # updates) — observed 7/8 threads failing under a load probe.
+        self._lock = threading.Lock()
         self._settings: VoiceSettings = self._load_settings()
 
     def _load_settings(self) -> VoiceSettings:
@@ -72,7 +79,8 @@ class ConfigManager:
 
     def reload_settings(self) -> VoiceSettings:
         """Reload settings from config file (call after external updates)"""
-        self._settings = self._load_settings()
+        with self._lock:
+            self._settings = self._load_settings()
         return self._settings
 
     def update_settings(self, updates: Dict[str, Any]) -> VoiceSettings:
@@ -80,24 +88,39 @@ class ConfigManager:
         Update settings at runtime and persist to file.
         Returns updated settings.
         """
-        # Update settings object
-        current = self._settings.model_dump()
-        current.update(updates)
-        self._settings = VoiceSettings(**current)
+        with self._lock:
+            # Validate and persist the candidate BEFORE publishing it in
+            # memory. If the disk write fails (full/read-only filesystem),
+            # callers must continue to observe the previous settings rather
+            # than a value that the endpoint reported as failed.
+            current = self._settings.model_dump()
+            current.update(updates)
+            candidate = VoiceSettings(**current)
+            self._save_settings(candidate)
+            self._settings = candidate
+            return self._settings
 
-        # Persist to file
-        self._save_settings()
-
-        return self._settings
-
-    def _save_settings(self):
-        """Save settings to config file atomically (tempfile + os.replace)."""
+    def _save_settings(self, settings: VoiceSettings):
+        """Save settings to config file atomically (unique tempfile + os.replace)."""
         target_dir = os.path.dirname(self.config_file) or "."
         os.makedirs(target_dir, exist_ok=True)
-        tmp_path = f"{self.config_file}.tmp"
-        with open(tmp_path, 'w') as f:
-            json.dump(self._settings.model_dump(), f, indent=2)
-        os.replace(tmp_path, self.config_file)
+        # Unique temp file per save: a fixed "<name>.tmp" lets two writers
+        # delete each other's temp file mid-write.
+        fd, tmp_path = tempfile.mkstemp(
+            prefix=os.path.basename(self.config_file) + ".",
+            suffix=".tmp",
+            dir=target_dir,
+        )
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(settings.model_dump(), f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, self.config_file)
+        except BaseException:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+            raise
 
 
 # Global config manager instance

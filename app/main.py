@@ -24,6 +24,7 @@ import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
+from sqlalchemy import or_
 import torch
 
 from .database import init_db
@@ -42,6 +43,33 @@ async def lifespan(app: FastAPI):
     logger.info("Initializing database...")
     init_db()
     logger.info("Database initialized!")
+
+    # OPUS-019/QWEN-016: a WebSocket that dies mid-recording (client crash,
+    # server restart) leaves the conversation row stuck in status="recording"
+    # forever. Nothing is actually recording after a restart, so reconcile.
+    try:
+        from .database import SessionLocal
+        from .models import Conversation as _Conversation
+        reconcile_db = SessionLocal()
+        try:
+            stuck = reconcile_db.query(_Conversation).filter(
+                or_(
+                    _Conversation.processing_token.isnot(None),
+                    _Conversation.status.in_([
+                        "recording", "processing", "finalizing", "deleting"
+                    ]),
+                )
+            ).update(
+                {"status": "failed", "processing_token": None},
+                synchronize_session=False,
+            )
+            if stuck:
+                logger.info(f"Reconciled {stuck} conversation(s) stuck in recording/processing after restart")
+            reconcile_db.commit()
+        finally:
+            reconcile_db.close()
+    except Exception as e:  # noqa: BLE001 - startup reconciliation is best effort
+        logger.info(f"Conversation reconciliation skipped: {e}")
 
     # Create necessary directories (use relative paths for local dev, absolute for Docker)
     root = data_path()

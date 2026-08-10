@@ -1,9 +1,10 @@
+import logging
+import os
+import uuid
 from datetime import datetime, timezone
 
-import logging
-from sqlalchemy import create_engine, inspect, text, event
+from sqlalchemy import create_engine, event, inspect, text
 from sqlalchemy.orm import declarative_base, sessionmaker
-import os
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +32,10 @@ def set_sqlite_pragma(dbapi_conn, connection_record):
         cursor = dbapi_conn.cursor()
         cursor.execute("PRAGMA foreign_keys=ON")
         cursor.execute("PRAGMA journal_mode=WAL")
+        # Give writers 30 s to acquire the write lock before raising
+        # "database is locked". Python's sqlite3 default is 5 s, which is
+        # easily exceeded by transactions that wait on GPU work.
+        cursor.execute("PRAGMA busy_timeout=30000")
         cursor.close()
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -57,7 +62,12 @@ _MIGRATIONS = (
     ("conversation_segments", "speaker_embedding", "BLOB"),
     ("conversation_segments", "emotion_embedding", "BLOB"),
     ("speakers", "emotion_threshold", "REAL"),
+    ("conversations", "processing_token", "TEXT"),
+    ("conversations", "snapshot_uuid", "TEXT"),
+    ("conversation_segments", "snapshot_uuid", "TEXT"),
 )
+
+_SNAPSHOT_UUID_TABLES = ("conversations", "conversation_segments")
 
 
 def init_db():
@@ -81,3 +91,24 @@ def init_db():
                 continue
             conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {sql_type}"))
             logger.info(f"Added {column} column to {table}")
+
+        # SQLite integer primary keys can be reused after deletion. Backups
+        # therefore need a persistent row identity before they may replay
+        # historical segment state. Backfill existing installations and make
+        # the migration restart-safe; new rows receive the ORM default.
+        for table in _SNAPSHOT_UUID_TABLES:
+            if table not in existing_tables:
+                continue
+            missing_ids = conn.execute(text(
+                f"SELECT id FROM {table} "
+                "WHERE snapshot_uuid IS NULL OR snapshot_uuid = ''"
+            )).scalars().all()
+            for row_id in missing_ids:
+                conn.execute(
+                    text(f"UPDATE {table} SET snapshot_uuid = :value WHERE id = :id"),
+                    {"value": str(uuid.uuid4()), "id": row_id},
+                )
+            conn.execute(text(
+                f"CREATE UNIQUE INDEX IF NOT EXISTS ix_{table}_snapshot_uuid "
+                f"ON {table} (snapshot_uuid)"
+            ))

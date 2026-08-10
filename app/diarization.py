@@ -189,8 +189,10 @@ class SpeakerRecognitionEngine:
         self.hf_token = hf_token or os.getenv("HF_TOKEN")
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        # Load configuration from environment
-        self.context_padding = float(os.getenv("CONTEXT_PADDING", "0.15"))
+        # ConfigManager already handles persisted values plus non-empty env
+        # overrides. Reading the raw Compose env here made CONTEXT_PADDING=""
+        # crash startup and ignored later Settings API updates.
+        self.context_padding = get_config().get_settings().context_padding
 
         # Initialize models (lazy loading). `_EMOTION_MODEL_FAILED` is a sentinel
         # so a one-time load failure (e.g. transient HF outage) doesn't cause every
@@ -274,7 +276,7 @@ class SpeakerRecognitionEngine:
             return
 
         # Get VRAM threshold from env (default: 12GB)
-        threshold_gb = float(os.getenv("CLEANUP_VRAM_THRESHOLD_GB", "12"))
+        threshold_gb = float(os.getenv("CLEANUP_VRAM_THRESHOLD_GB") or "12")
 
         # Check current VRAM usage (reserved = what nvidia-smi shows)
         vram_used_gb = torch.cuda.memory_reserved() / (1024**3)
@@ -649,7 +651,10 @@ class SpeakerRecognitionEngine:
             Segment embedding as numpy array
         """
         if context_padding is None:
-            context_padding = self.context_padding
+            # Read at use time so a Settings API update applies without
+            # reconstructing the heavyweight engine.
+            context_padding = get_config().get_settings().context_padding
+            self.context_padding = context_padding
 
         # Get actual audio duration to prevent out-of-bounds
         try:
@@ -710,12 +715,26 @@ class SpeakerRecognitionEngine:
                 embeddings.append(None)
         return embeddings
 
+    def _preload_emotion_audio(self, audio_file: str) -> Optional["AudioSegment"]:
+        """Decode/resample once only when emotion inference is available."""
+        if self.emotion_model is None:
+            return None
+        full_audio = AudioSegment.from_file(audio_file)
+        if full_audio.frame_rate != 16000:
+            full_audio = full_audio.set_frame_rate(16000)
+        return full_audio
+
+    def preload_emotion_audio(self, audio_file: str) -> Optional["AudioSegment"]:
+        """Public decode-once contract for recalculation/profile callers."""
+        return self._preload_emotion_audio(audio_file)
+
     def extract_emotion(
         self,
         audio_file: str,
         start_time: Optional[float] = None,
         end_time: Optional[float] = None,
-        extract_embedding: bool = False
+        extract_embedding: bool = False,
+        preloaded_audio: Optional["AudioSegment"] = None,
     ) -> Optional[Dict]:
         """
         Extract emotion from audio file or segment using emotion2vec via FunASR
@@ -747,15 +766,22 @@ class SpeakerRecognitionEngine:
                 if (end_time - start_time) > MAX_EMOTION_DURATION_SEC:
                     end_time = start_time + MAX_EMOTION_DURATION_SEC
 
-                # Extract segment to temporary file
-                audio = AudioSegment.from_file(audio_file)
+                # Extract segment from preloaded audio when available.
+                # Callers processing many segments of one file (the main
+                # diarization loop) used to re-decode the ENTIRE file per
+                # segment (measured ~0.5 s/segment on a 30 min file); decode
+                # once and slice instead.
+                if preloaded_audio is not None:
+                    audio = preloaded_audio
+                else:
+                    audio = AudioSegment.from_file(audio_file)
                 start_ms = int(start_time * 1000)
                 end_ms = int(end_time * 1000)
                 segment = audio[start_ms:end_ms]
 
-                # Resample to 16kHz if needed (emotion2vec requirement)
-                # This won't affect faster-whisper or pyannote which handle their own resampling
-                if segment.frame_rate != 16000:
+                # Resample to 16kHz if needed (emotion2vec requirement).
+                # Preloaded audio is already 16kHz by contract.
+                if preloaded_audio is None and segment.frame_rate != 16000:
                     segment = segment.set_frame_rate(16000)
 
                 # Save to temp file
@@ -773,20 +799,31 @@ class SpeakerRecognitionEngine:
                     if os.path.exists(temp_path):
                         os.unlink(temp_path)
             else:
-                # Process entire file - need to check/resample first
+                # Process a bounded, normalized copy. Passing the original
+                # filename when it was already 16 kHz bypassed the duration
+                # slice above and sent the entire recording to emotion2vec.
                 audio = AudioSegment.from_file(audio_file)
 
                 # Cap duration to avoid OOM in emotion2vec attention (O(n^2) memory)
                 max_emotion_duration_ms = int(MAX_EMOTION_DURATION_SEC * 1000)
+                needs_temp_input = (
+                    len(audio) > max_emotion_duration_ms
+                    or audio.frame_rate != 16000
+                )
                 if len(audio) > max_emotion_duration_ms:
                     audio = audio[:max_emotion_duration_ms]
 
                 # Resample to 16kHz if needed
                 if audio.frame_rate != 16000:
                     audio = audio.set_frame_rate(16000)
-                    # Create temp file with resampled audio
-                    with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_file:
-                        audio.export(temp_file.name, format='wav')
+
+                if needs_temp_input:
+                    # Long already-16 kHz sources must still use the processed
+                    # object or the in-memory duration cap is silently bypassed.
+                    with tempfile.NamedTemporaryFile(
+                        suffix=".wav", delete=False
+                    ) as temp_file:
+                        audio.export(temp_file.name, format="wav")
                         temp_path = temp_file.name
 
                     try:
@@ -799,11 +836,10 @@ class SpeakerRecognitionEngine:
                         if os.path.exists(temp_path):
                             os.unlink(temp_path)
                 else:
-                    # Already 16kHz, use directly
                     result = self.emotion_model.generate(
                         audio_file,
                         granularity="utterance",
-                        extract_embedding=extract_embedding
+                        extract_embedding=extract_embedding,
                     )
 
             # FunASR emotion2vec returns list of results
@@ -932,6 +968,12 @@ class SpeakerRecognitionEngine:
 
         transcribed_with_speakers = []
 
+        # Decode/resample the conversation audio ONCE for the emotion pass
+        # (lazy: only if any segment actually needs emotion extraction).
+        # Previously every segment re-decoded the whole file.
+        preloaded_emotion_audio = None
+        emotion_preload_failed = False
+
         for trans_seg in transcription_segments:
             # Cheap text-only hallucination filter — applied BEFORE any embedding
             # or emotion extraction so Whisper's "thank you for watching" ghosts
@@ -1041,11 +1083,21 @@ class SpeakerRecognitionEngine:
                     speaker_name = f"Unknown_{unknown_counter:02d}"
                     unknown_counter += 1
 
+            if preloaded_emotion_audio is None and not emotion_preload_failed:
+                try:
+                    preloaded_emotion_audio = self.preload_emotion_audio(audio_file)
+                    if preloaded_emotion_audio is None:
+                        emotion_preload_failed = True
+                except Exception as e:  # noqa: BLE001 - decoder/model failures use per-segment fallback
+                    logger.info(f"Emotion preload failed ({e}); falling back to per-segment decode")
+                    emotion_preload_failed = True
+
             emotion_data = self.extract_emotion(
                 audio_file,
                 trans_seg["start"],
                 trans_seg["end"],
                 extract_embedding=enable_personalized_emotions,
+                preloaded_audio=preloaded_emotion_audio,
             )
 
             # NEW: If we matched via emotion voice profile, use that as primary signal
@@ -1281,10 +1333,18 @@ class SpeakerRecognitionEngine:
                 voice_best = profile.emotion_category
 
         detector2_result = {
-            "emotion": voice_best or "neutral",
+            "emotion": voice_best,
             "confidence": float(voice_best_confidence),
             "matches": voice_matches
         }
+        detector2_has_diagnostics = bool(voice_matches)
+        # detector2_available is True only when at least one voice profile had
+        # enough samples AND produced an above-threshold opinion. A missing
+        # detector-2 result must be treated as "no second opinion", not as a
+        # literal "neutral" prediction — otherwise the combiner neutralises
+        # every confident detector-1 label as soon as the speaker has fewer
+        # than MIN_VOICE_SAMPLES corrections.
+        detector2_available = voice_best is not None
 
         # COMBINE
         d1_emotion = detector1_result["emotion"]
@@ -1292,20 +1352,26 @@ class SpeakerRecognitionEngine:
         d2_emotion = detector2_result["emotion"]
         d2_conf = detector2_result["confidence"]
 
-        if d1_emotion == d2_emotion and d1_conf > DUAL_DETECTOR_AGREE_D1 and d2_conf > DUAL_DETECTOR_AGREE_D2:
+        if d1_emotion == "neutral" or d1_emotion == "<unk>":
+            final = {"emotion": "neutral", "confidence": float(d1_conf), "reason": "emotion2vec neutral", "voice_profile_available": detector2_available}
+        elif not detector2_available:
+            final = {"emotion": d1_emotion, "confidence": float(d1_conf), "reason": "emotion2vec only (no voice profile match)", "voice_profile_available": False}
+        elif d1_emotion == d2_emotion and d1_conf > DUAL_DETECTOR_AGREE_D1 and d2_conf > DUAL_DETECTOR_AGREE_D2:
             final = {"emotion": d1_emotion, "confidence": float((d1_conf + d2_conf) / 2), "reason": "Both agree", "voice_profile_available": True}
-        elif d1_emotion == "neutral" or d1_emotion == "<unk>":
-            final = {"emotion": "neutral", "confidence": float(d1_conf), "reason": "emotion2vec neutral", "voice_profile_available": len(voice_matches) > 0}
         elif d2_conf > VOICE_STRONG_THRESHOLD:
             final = {"emotion": d2_emotion, "confidence": float(d2_conf), "reason": f"Voice strong: {d2_emotion}", "voice_profile_available": True}
         elif d1_emotion != d2_emotion:
-            final = {"emotion": "neutral", "confidence": float(max(d1_conf, d2_conf)), "reason": f"Disagree: {d1_emotion} vs {d2_emotion}", "voice_profile_available": len(voice_matches) > 0}
+            final = {"emotion": "neutral", "confidence": float(max(d1_conf, d2_conf)), "reason": f"Disagree: {d1_emotion} vs {d2_emotion}", "voice_profile_available": True}
         else:
-            final = {"emotion": d1_emotion, "confidence": float(d1_conf), "reason": "Agree low conf", "voice_profile_available": len(voice_matches) > 0}
+            final = {"emotion": d1_emotion, "confidence": float(d1_conf), "reason": "Agree low conf", "voice_profile_available": True}
 
         return {
             "emotion2vec_detector": detector1_result,
-            "voice_profile_detector": detector2_result if len(voice_matches) > 0 else None,
+            # Keep below-threshold similarities visible for diagnostics while
+            # still treating them as no second opinion in decision logic.
+            "voice_profile_detector": (
+                detector2_result if detector2_has_diagnostics else None
+            ),
             "final_decision": final
         }
 

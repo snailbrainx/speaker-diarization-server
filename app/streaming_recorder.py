@@ -4,17 +4,40 @@ Streaming audio recorder with queue-based background processing.
 import logging
 import numpy as np
 import os
-import queue
 import threading
 import time
 import wave
 from concurrent.futures import ThreadPoolExecutor, wait as futures_wait
+from contextlib import ExitStack
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Literal, Optional
 
 from .services import data_path
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class ConcatenationResult:
+    """Unambiguous outcome for publication of the full recording."""
+
+    status: Literal["success", "empty", "partial", "failed"]
+    path: Optional[str] = None
+    error: Optional[str] = None
+
+
+def _max_stream_buffer_seconds() -> float:
+    raw = os.getenv("MAX_STREAM_BUFFER_SECONDS") or "120"
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning("Invalid MAX_STREAM_BUFFER_SECONDS=%r; using 120", raw)
+        return 120.0
+    if not np.isfinite(value) or value <= 0:
+        logger.warning("MAX_STREAM_BUFFER_SECONDS must be finite and > 0; using 120")
+        return 120.0
+    return value
 
 
 class StreamingRecorder:
@@ -53,6 +76,7 @@ class StreamingRecorder:
 
         # Audio buffering
         self.current_buffer: List[np.ndarray] = []
+        self._buffered_samples = 0
         self.last_speech_time = time.time()
         self.chunk_count = 0
         self.speech_detected = False
@@ -62,6 +86,11 @@ class StreamingRecorder:
         # Threading
         self.executor = ThreadPoolExecutor(max_workers=max_workers)
         self.processing_futures: List = []
+        # Hard cap on buffered audio: without it a client that streams without
+        # pausing grows this list without bound (RAM), and the buffer is only
+        # ever flushed on silence. At 48 kHz mono float32 this is ~23 MB/s, so
+        # cap at ~2 minutes of audio; a longer utterance flushes in pieces.
+        self.MAX_BUFFER_SECONDS = _max_stream_buffer_seconds()
         # Guards current_buffer, total_segments, segments_queued, segment_paths,
         # cumulative_offset, and last_speech_time against concurrent flushes
         # (process_audio_chunk from the WS thread vs. stop_recording's tail flush).
@@ -75,6 +104,7 @@ class StreamingRecorder:
         self.total_segments = 0
         self.segments_queued = 0
         self.segments_processed = 0
+        self.segments_failed = 0
 
         # Paths of flushed segments (for later concatenation)
         self.segment_paths: List[str] = []
@@ -91,10 +121,12 @@ class StreamingRecorder:
         self.is_recording = True
         self.conversation_id = conversation_id
         self.current_buffer = []
+        self._buffered_samples = 0
         self.last_speech_time = time.time()
         self.chunk_count = 0
         self.total_segments = 0
         self.segments_processed = 0
+        self.segments_failed = 0
         self.segments_queued = 0
         self.segment_paths = []
         self.cumulative_offset = 0.0
@@ -152,13 +184,41 @@ class StreamingRecorder:
         if audio_data.dtype != np.float32:
             audio_data = audio_data.astype(np.float32) / 32768.0
 
-        energy = float(np.sqrt(np.mean(audio_data ** 2)))
+        if audio_data.size == 0:
+            return {
+                "status": "recording",
+                "audio_level": 0.0,
+                "speech_detected": self.speech_detected,
+                "segments_queued": self.segments_queued,
+                "segments_processed": self.segments_processed,
+                "buffer_size": len(self.current_buffer),
+                "cumulative_offset": self.cumulative_offset,
+            }
+
+        # Reject non-finite frames: NaN propagates into the WAV segment, the
+        # GPU pipeline, and the JSON status messages (invalid JSON to clients).
+        if not np.isfinite(audio_data).all():
+            logger.info("Dropping audio chunk containing non-finite samples")
+            return {
+                "status": "recording",
+                "audio_level": 0.0,
+                "speech_detected": self.speech_detected,
+                "segments_queued": self.segments_queued,
+                "segments_processed": self.segments_processed,
+                "buffer_size": len(self.current_buffer),
+                "cumulative_offset": self.cumulative_offset,
+            }
+
+        # Accumulate in float64: finite float32 samples near dtype max overflow
+        # when squared in float32, producing Infinity in the WebSocket payload.
+        energy = float(np.sqrt(np.mean(np.square(audio_data, dtype=np.float64))))
 
         if self.on_audio_level:
             self.on_audio_level(energy)
 
         with self._lock:
             self.current_buffer.append(audio_data)
+            self._buffered_samples += len(audio_data)
             self.chunk_count += 1
 
             if energy > self.silence_threshold:
@@ -169,6 +229,13 @@ class StreamingRecorder:
                 silence_elapsed = time.time() - self.last_speech_time
                 if silence_elapsed >= self.silence_duration and len(self.current_buffer) > 10:
                     self._flush_locked()
+
+            # Bound RAM: force-flush if the unflushed buffer exceeds the cap
+            # (continuous speech with no silence pause).
+            buffered_seconds = self._buffered_samples / self.sample_rate
+            if buffered_seconds >= self.MAX_BUFFER_SECONDS:
+                logger.info(f"Buffer cap reached ({buffered_seconds:.0f}s) — flushing")
+                self._flush_locked()
 
             buffer_size = len(self.current_buffer)
             cumulative_offset = self.cumulative_offset
@@ -192,6 +259,7 @@ class StreamingRecorder:
         # Always clear the buffer and reset the silence clock — even if we
         # decide not to flush, so pure-silence clients don't spin.
         self.current_buffer = []
+        self._buffered_samples = 0
         self.last_speech_time = time.time()
 
         duration = len(segment_audio) / self.sample_rate
@@ -201,7 +269,9 @@ class StreamingRecorder:
         if duration > self.LONG_SEGMENT_WARN_SECONDS:
             logger.info(f"⚠️ Long segment detected: {duration:.1f}s - processing may take longer")
 
-        avg_energy = float(np.sqrt(np.mean(segment_audio ** 2)))
+        avg_energy = float(np.sqrt(
+            np.mean(np.square(segment_audio, dtype=np.float64))
+        ))
         if avg_energy < self.silence_threshold * 2:
             logger.info(f"⏭️ Skipping segment (mostly silence, energy: {avg_energy:.4f})")
             return
@@ -245,18 +315,21 @@ class StreamingRecorder:
         logger.info(f"📦 Queued segment {segment_id} ({duration:.1f}s, offset {start_offset:.1f}-{end_offset:.1f}s)")
 
     def _process_segment_worker(self, segment_info: Dict):
-        """Background worker for a single segment. Increments segments_processed
-        in finally so stop_recording can no longer deadlock on an exception."""
+        """Run one segment callback and record success/failure exactly once."""
+        failed = False
         try:
             if self.on_segment_processed:
                 self.on_segment_processed(segment_info)
         except Exception as e:
+            failed = True
             logger.error(f"Error processingsegment {segment_info['id']}: {e}")
             import traceback
             traceback.print_exc()
         finally:
             with self._lock:
                 self.segments_processed += 1
+                if failed:
+                    self.segments_failed += 1
                 done = self.segments_processed
                 total = self.segments_queued
             logger.info(f"✅ Processed segment {segment_info['id']} ({done}/{total})")
@@ -268,64 +341,129 @@ class StreamingRecorder:
                 "total_segments": self.total_segments,
                 "segments_queued": self.segments_queued,
                 "segments_processed": self.segments_processed,
+                "segments_failed": self.segments_failed,
                 "buffer_chunks": len(self.current_buffer),
+                "buffered_samples": self._buffered_samples,
             }
 
-    def concatenate_segments(self) -> Optional[str]:
+    def concatenate_segments(self) -> ConcatenationResult:
         """Stream all segment WAV files into a single conversation WAV.
 
         Streams frame-by-frame instead of loading the whole recording into
         memory — a 2-hour mono 48 kHz session is ~700 MB otherwise.
         """
         if not self.segment_paths or self.conversation_id is None:
-            return None
+            return ConcatenationResult(status="empty")
 
+        temp_output_path = None
         try:
             logger.info(f"🔗 Concatenating {len(self.segment_paths)} segments...")
 
             recordings_dir = os.path.join(data_path(), "recordings")
             os.makedirs(recordings_dir, exist_ok=True)
             output_path = os.path.join(recordings_dir, f"conv_{self.conversation_id}_full.wav")
+            import tempfile
+
+            fd, temp_output_path = tempfile.mkstemp(
+                prefix=f".conv_{self.conversation_id}_full.",
+                suffix=".tmp.wav",
+                dir=recordings_dir,
+            )
+            os.close(fd)
 
             out_wf = None
             total_frames = 0
-            try:
+            readable_segments = 0
+            input_errors = []
+            output_format = None
+            with ExitStack() as output_stack:
                 for seg_path in self.segment_paths:
                     if not os.path.exists(seg_path):
                         logger.info(f"⚠️ Segment not found: {seg_path}")
+                        input_errors.append(f"missing: {seg_path}")
                         continue
 
-                    with wave.open(seg_path, "rb") as in_wf:
-                        if out_wf is None:
-                            out_wf = wave.open(output_path, "wb")
-                            out_wf.setnchannels(in_wf.getnchannels())
-                            out_wf.setsampwidth(in_wf.getsampwidth())
-                            out_wf.setframerate(in_wf.getframerate())
-                            sample_rate = in_wf.getframerate()
+                    try:
+                        with wave.open(seg_path, "rb") as in_wf:
+                            frame_count = in_wf.getnframes()
+                            if frame_count <= 0:
+                                input_errors.append(f"empty: {seg_path}")
+                                continue
 
-                        frames = in_wf.readframes(in_wf.getnframes())
-                        out_wf.writeframes(frames)
-                        total_frames += in_wf.getnframes()
-            finally:
-                if out_wf is not None:
-                    out_wf.close()
+                            segment_format = (
+                                in_wf.getnchannels(),
+                                in_wf.getsampwidth(),
+                                in_wf.getframerate(),
+                            )
+                            frames = in_wf.readframes(frame_count)
+                            expected_bytes = (
+                                frame_count * segment_format[0] * segment_format[1]
+                            )
+                            if len(frames) != expected_bytes:
+                                input_errors.append(f"truncated: {seg_path}")
+                                continue
+
+                            if output_format is None:
+                                output_format = segment_format
+                                out_wf = output_stack.enter_context(
+                                    wave.open(temp_output_path, "wb")
+                                )
+                                out_wf.setnchannels(segment_format[0])
+                                out_wf.setsampwidth(segment_format[1])
+                                out_wf.setframerate(segment_format[2])
+                                sample_rate = segment_format[2]
+                            elif segment_format != output_format:
+                                input_errors.append(f"incompatible format: {seg_path}")
+                                continue
+
+                            if out_wf is None:
+                                raise RuntimeError("concatenation output was not initialised")
+                            out_wf.writeframes(frames)
+                            total_frames += frame_count
+                            readable_segments += 1
+                    except (OSError, EOFError, wave.Error) as exc:
+                        logger.error("Unreadable segment %s: %s", seg_path, exc)
+                        input_errors.append(f"unreadable: {seg_path}")
 
             if total_frames == 0:
-                logger.info("⚠️ No valid segments to concatenate")
-                # Remove empty file if one was created
-                if os.path.exists(output_path) and os.path.getsize(output_path) == 0:
-                    os.remove(output_path)
-                return None
+                # segment_paths was non-empty, so this is not an ordinary
+                # no-speech recording: every expected input was missing or
+                # unreadable and no full recording could be published.
+                logger.error("No readable segment audio was available to concatenate")
+                if temp_output_path and os.path.exists(temp_output_path):
+                    os.remove(temp_output_path)
+                return ConcatenationResult(
+                    status="failed",
+                    error="No readable segment audio was available",
+                )
 
             duration = total_frames / sample_rate
+            os.replace(temp_output_path, output_path)
+            temp_output_path = None
             logger.info(f"✅ Concatenated conversation saved: {output_path} ({duration:.1f}s)")
-            return output_path
+            if input_errors or readable_segments != len(self.segment_paths):
+                error = (
+                    f"Published {readable_segments} of {len(self.segment_paths)} "
+                    "expected segment files"
+                )
+                logger.error("Partial concatenation: %s", error)
+                return ConcatenationResult(
+                    status="partial",
+                    path=output_path,
+                    error=error,
+                )
+            return ConcatenationResult(status="success", path=output_path)
 
         except Exception as e:
-            logger.info(f"❌ Error concatenating segments: {e}")
+            logger.error(f"❌ Error concatenating segments: {e}")
             import traceback
             traceback.print_exc()
-            return None
+            if temp_output_path and os.path.exists(temp_output_path):
+                try:
+                    os.remove(temp_output_path)
+                except OSError:
+                    logger.warning("Could not remove failed concatenation temp file")
+            return ConcatenationResult(status="failed", error=str(e))
 
     def cleanup(self):
         """Release the thread pool."""

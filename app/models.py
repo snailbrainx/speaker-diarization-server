@@ -1,8 +1,36 @@
-from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey, LargeBinary, Text, Boolean, UniqueConstraint
-from sqlalchemy.orm import relationship
-from .database import Base, utc_now
 import json
+import uuid
+
 import numpy as np
+from sqlalchemy import (
+    Boolean,
+    Column,
+    DateTime,
+    Float,
+    ForeignKey,
+    Integer,
+    LargeBinary,
+    String,
+    Text,
+    UniqueConstraint,
+)
+from sqlalchemy.orm import relationship
+
+from .database import Base, utc_now
+
+
+def new_snapshot_uuid() -> str:
+    """Stable row identity for snapshots; unlike SQLite integer IDs, never reused."""
+    return str(uuid.uuid4())
+
+
+class AppMetadata(Base):
+    """Small persistent key/value metadata owned by this database."""
+
+    __tablename__ = "app_metadata"
+
+    key = Column(String, primary_key=True)
+    value = Column(Text, nullable=False)
 
 class Speaker(Base):
     __tablename__ = "speakers"
@@ -97,11 +125,18 @@ class Conversation(Base):
     __tablename__ = "conversations"
 
     id = Column(Integer, primary_key=True, index=True)
+    snapshot_uuid = Column(
+        String, unique=True, index=True, nullable=False, default=new_snapshot_uuid
+    )
     title = Column(String, nullable=True)  # Auto-generated or user-set
     start_time = Column(DateTime, nullable=False, default=utc_now)
     end_time = Column(DateTime, nullable=True)  # Null while recording
     duration = Column(Float, nullable=True)  # Duration in seconds
     status = Column(String, default="recording")  # recording, processing, completed, failed
+    # Internal operation lease. Public clients must never set this value.
+    # Streaming/upload/reprocess workers clear it only when no later write can
+    # legally land; DELETE uses it rather than trusting client-visible status.
+    processing_token = Column(String, nullable=True, index=True)
     audio_path = Column(String, nullable=True)  # Path to WAV or MP3 file
     audio_format = Column(String, default="wav")  # wav or mp3
     num_segments = Column(Integer, default=0)
@@ -119,6 +154,9 @@ class ConversationSegment(Base):
     __tablename__ = "conversation_segments"
 
     id = Column(Integer, primary_key=True, index=True)
+    snapshot_uuid = Column(
+        String, unique=True, index=True, nullable=False, default=new_snapshot_uuid
+    )
     conversation_id = Column(Integer, ForeignKey("conversations.id"), nullable=False, index=True)
     speaker_id = Column(Integer, ForeignKey("speakers.id", ondelete="SET NULL"), nullable=True, index=True)  # Null for unknown - auto-set to NULL when speaker deleted
     speaker_name = Column(String, nullable=True)  # Denormalized for quick access

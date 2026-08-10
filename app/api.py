@@ -20,6 +20,11 @@ from .schemas import (
 )
 from .diarization import SpeakerRecognitionEngine
 from .config import get_config
+from .conversation_lifecycle import (
+    fail_processing_lease,
+    finish_processing_lease,
+    new_processing_token,
+)
 from .services import (
     create_segment_from_result,
     data_path,
@@ -104,7 +109,10 @@ async def enroll_speaker(
     temp_dir = os.path.join(data_path(), "temp")
     os.makedirs(temp_dir, exist_ok=True)
     safe_filename = os.path.basename(audio_file.filename or "upload")
-    temp_path = os.path.join(temp_dir, safe_filename)
+    # Unique temp name: concurrent enrolls with the same client filename used
+    # to write to the same path and delete each other's file mid-stream.
+    import uuid as _uuid
+    temp_path = os.path.join(temp_dir, f"{_uuid.uuid4().hex[:12]}_{safe_filename}")
 
     def _stream_upload():
         with open(temp_path, "wb") as buffer:
@@ -137,6 +145,13 @@ async def enroll_speaker(
         db.add(speaker)
         db.commit()
         db.refresh(speaker)
+
+        # Make active streams aware of the new speaker immediately; their
+        # in-memory cache was loaded before this enrollment (OPUS-015).
+        try:
+            engine.add_speaker_to_cache(speaker.id, speaker.name, embedding)
+        except Exception:  # noqa: BLE001 - cache failures must fall back to a full reload
+            engine.clear_speaker_cache()
 
         # Clear GPU cache after embedding extraction
         engine.clear_gpu_cache()
@@ -202,10 +217,14 @@ async def delete_speaker(speaker_id: int, db: Session = Depends(get_db)):
     if not speaker:
         raise HTTPException(status_code=404, detail="Speaker not found")
 
-    # 1. Set speaker_id to NULL in segments (SQLite FK constraint is NO ACTION, not SET NULL)
+    # 1. Set speaker_id to NULL in segments (SQLite FK constraint is NO ACTION, not SET NULL).
+    # Preserve a non-active tombstone instead of erasing attribution history;
+    # it deliberately does not start with Unknown_ so retroactive relabelling
+    # cannot match it.
+    deleted_name = f"Deleted_{speaker.name}"
     db.query(ConversationSegment).filter(
         ConversationSegment.speaker_id == speaker_id
-    ).update({"speaker_id": None}, synchronize_session=False)
+    ).update({"speaker_id": None, "speaker_name": deleted_name}, synchronize_session=False)
 
     # 2. Delete emotion profiles
     db.query(SpeakerEmotionProfile).filter(
@@ -253,7 +272,10 @@ async def process_audio(
 
     # Save uploaded file with timestamp (basename strips any directory component)
     base_filename = os.path.basename(audio_file.filename or "upload")
-    temp_filename = f"uploaded_{timestamp}_{base_filename}"
+    # uuid suffix avoids collisions between uploads with the same name in the
+    # same second (they used to overwrite each other mid-stream).
+    import uuid as _uuid
+    temp_filename = f"uploaded_{timestamp}_{_uuid.uuid4().hex[:8]}_{base_filename}"
     temp_path = os.path.join(recordings_dir, temp_filename)
 
     def _stream_upload():
@@ -276,11 +298,13 @@ async def process_audio(
 
     # Create conversation entry
     start_time = utc_now()
+    processing_token = new_processing_token()
     conversation = Conversation(
         title=f"Uploaded: {audio_file.filename}",
         audio_path=file_path,
         start_time=start_time,
-        status="processing"
+        status="processing",
+        processing_token=processing_token,
     )
     db.add(conversation)
     db.commit()
@@ -313,14 +337,19 @@ async def process_audio(
             )
 
         # Update conversation metadata
-        conversation.status = "completed"
         conversation.num_segments = len(result["segments"])
         conversation.num_speakers = result["num_speakers"]
         if result["segments"]:
             conversation.duration = max(s["end"] for s in result["segments"])
             conversation.end_time = start_time + timedelta(seconds=conversation.duration)
 
-        db.commit()
+        if not finish_processing_lease(
+            db,
+            conversation.id,
+            processing_token,
+            status="completed",
+        ):
+            raise RuntimeError("Upload processing lease lost")
         db.refresh(conversation)
 
         # Clear GPU cache after processing
@@ -332,13 +361,8 @@ async def process_audio(
     except Exception:
         import traceback
         traceback.print_exc()
-        # Roll back any half-built segments from create_segment_from_result
-        # so the failed-status commit doesn't persist partial state.
-        db.rollback()
-        failed = db.query(Conversation).filter(Conversation.id == conversation.id).first()
-        if failed is not None:
-            failed.status = "failed"
-            db.commit()
+        # Roll back half-built segments and release only our own operation.
+        fail_processing_lease(db, conversation.id, processing_token)
         raise HTTPException(status_code=500, detail="Audio processing failed")
 
 

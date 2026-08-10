@@ -9,6 +9,7 @@ import numpy as np
 import json
 import asyncio
 import logging
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from datetime import datetime
 from typing import Optional
 
@@ -16,10 +17,20 @@ from .database import SessionLocal, get_db, utc_now
 from .models import Conversation, ConversationSegment
 from .streaming_recorder import StreamingRecorder
 from .config import get_config
+from .conversation_lifecycle import (
+    begin_finalization,
+    claim_segment_persistence,
+    fail_processing_lease,
+    new_processing_token,
+)
 from .services import create_segment_from_result, load_known_speakers
 import os
 
 logger = logging.getLogger(__name__)
+
+SEGMENT_HANDLER_TIMEOUT_SECONDS = float(os.getenv("SEGMENT_HANDLER_TIMEOUT_SECONDS") or "600")
+WS_SEND_TIMEOUT_SECONDS = float(os.getenv("WS_SEND_TIMEOUT_SECONDS") or "10")
+_FINALIZE_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="stream-finalize")
 
 
 def convert_numpy_to_native(obj):
@@ -52,29 +63,120 @@ def get_engine():
     return get_api_engine()
 
 
-async def send_message(websocket: WebSocket, message_type: str, data: dict):
-    """Send JSON message to WebSocket client"""
+async def send_message(websocket: WebSocket, message_type: str, data: dict) -> bool:
+    """Send one JSON message and report whether it reached the socket."""
     try:
-        # Check if WebSocket is still connected
-        if websocket.client_state == WebSocketState.CONNECTED:
-            message = {
-                "type": message_type,
-                "data": data,
-                "timestamp": utc_now().isoformat()
-            }
-            logger.info(f"🔌 Sending WebSocket message: type={message_type}, data_keys={list(data.keys()) if isinstance(data, dict) else 'not-dict'}")
-            await websocket.send_json(message)
-            logger.info(f"✅ Successfully sent {message_type} message")
-        else:
+        if websocket.client_state != WebSocketState.CONNECTED:
             logger.info(f"⚪ WebSocket not connected, skipping {message_type} message")
+            return False
+        message = {
+            "type": message_type,
+            "data": data,
+            "timestamp": utc_now().isoformat(),
+        }
+        logger.info(
+            "🔌 Sending WebSocket message: type=%s, data_keys=%s",
+            message_type,
+            list(data.keys()) if isinstance(data, dict) else "not-dict",
+        )
+        await websocket.send_json(message)
+        logger.info(f"✅ Successfully sent {message_type} message")
+        return True
     except WebSocketDisconnect:
-        # Expected during stop/cleanup - client disconnected before we could send
-        logger.info(f"⚪ Client disconnected, skipping {message_type} message (expected during shutdown)")
-    except Exception as e:
-        # Unexpected errors
-        logger.error(f"ERROR sending{message_type} message: {e}")
-        import traceback
-        traceback.print_exc()
+        logger.info(
+            f"⚪ Client disconnected, skipping {message_type} message "
+            "(expected during shutdown)"
+        )
+        return False
+    except Exception as exc:  # noqa: BLE001 - socket implementations vary
+        logger.error(f"Error sending {message_type} message: {exc}")
+        return False
+
+
+async def _close_websocket_bounded(websocket: WebSocket) -> None:
+    try:
+        if websocket.client_state == WebSocketState.CONNECTED:
+            await asyncio.wait_for(
+                websocket.close(code=1011),
+                timeout=WS_SEND_TIMEOUT_SECONDS,
+            )
+    except (asyncio.TimeoutError, RuntimeError, WebSocketDisconnect):
+        logger.info("WebSocket close did not complete cleanly")
+
+
+async def _send_message_bounded(
+    websocket: WebSocket,
+    message_type: str,
+    data: dict,
+) -> bool:
+    """Deliver with bounded backpressure; close a socket that stops reading."""
+    try:
+        sent = await asyncio.wait_for(
+            send_message(websocket, message_type, data),
+            timeout=WS_SEND_TIMEOUT_SECONDS,
+        )
+        if not sent:
+            await _close_websocket_bounded(websocket)
+        return sent
+    except asyncio.TimeoutError:
+        logger.warning("Timed out sending websocket %s message", message_type)
+        await _close_websocket_bounded(websocket)
+        return False
+
+
+def _make_segment_callback(
+    websocket: WebSocket,
+    conversation_id: int,
+    processing_token: str,
+    loop,
+):
+    """Bridge the recorder worker to the async handler with a hard deadline."""
+    def segment_callback(seg_info):
+        coroutine = _handle_segment_processed(
+            websocket,
+            conversation_id,
+            processing_token,
+            seg_info,
+            get_engine(),
+        )
+        try:
+            future = asyncio.run_coroutine_threadsafe(coroutine, loop)
+        except RuntimeError:
+            # Scheduling failed before ownership transferred to the event loop.
+            coroutine.close()
+            logger.info("Segment %s dropped: event loop closed", seg_info.get("id"))
+            raise RuntimeError("event loop closed before segment handler could be scheduled")
+
+        try:
+            future.result(timeout=SEGMENT_HANDLER_TIMEOUT_SECONDS)
+        except FutureTimeoutError as exc:
+            # A running asyncio.to_thread task cannot be safely killed. Leave
+            # the handler future alive so it owns its DB session to completion,
+            # but release recorder finalisation and record the timeout.
+            future.add_done_callback(
+                lambda done: done.exception() if not done.cancelled() else None
+            )
+            raise TimeoutError(
+                f"Segment {seg_info.get('id')} exceeded "
+                f"{SEGMENT_HANDLER_TIMEOUT_SECONDS}s processing deadline"
+            ) from exc
+        except Exception:
+            # Let StreamingRecorder count the failed segment and mark the
+            # conversation completed_with_errors during finalisation.
+            raise
+
+    return segment_callback
+
+
+async def _stop_and_concatenate(recorder: StreamingRecorder):
+    """Drain a recorder without consuming the loop's default executor."""
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(_FINALIZE_EXECUTOR, recorder.stop_recording)
+    stats = recorder.get_stats()
+    audio_path = await loop.run_in_executor(
+        _FINALIZE_EXECUTOR, recorder.concatenate_segments
+    )
+    return stats, audio_path
 
 
 @router.websocket("/ws")
@@ -91,28 +193,35 @@ async def websocket_endpoint(
     """
     await websocket.accept()
     conversation_id: Optional[int] = None
+    conversation: Optional[Conversation] = None
     recorder: Optional[StreamingRecorder] = None
+    processing_token: Optional[str] = None
 
     try:
         # Wait for initial "start" message
         init_message = await websocket.receive_json()
 
         if init_message.get("type") != "start":
-            await send_message(websocket, "error", {"message": "Expected 'start' message"})
-            await websocket.close()
+            await _send_message_bounded(
+                websocket, "error", {"message": "Expected 'start' message"}
+            )
+            await _close_websocket_bounded(websocket)
             return
 
         # Create conversation
+        processing_token = new_processing_token()
         conversation = Conversation(
             title=f"Live Recording {datetime.now().strftime('%Y-%m-%d %H:%M')}",
             start_time=utc_now(),
-            status="recording"
+            status="recording",
+            processing_token=processing_token,
         )
         db.add(conversation)
         db.commit()
         db.refresh(conversation)
 
         conversation_id = conversation.id
+        assert conversation_id is not None
 
         # Initialize recorder
         config = get_config()
@@ -127,17 +236,11 @@ async def websocket_endpoint(
         # Get event loop for scheduling async tasks from background threads
         loop = asyncio.get_running_loop()
 
-        # Set callback after initialization
-        # Use asyncio.run_coroutine_threadsafe to schedule from background thread.
-        # The coroutine creates its own DB session — the request-scoped `db` is not
-        # thread-safe and may conflict with the main handler's usage.
-        def segment_callback(seg_info):
-            asyncio.run_coroutine_threadsafe(
-                _handle_segment_processed(websocket, conversation_id, seg_info, get_engine()),
-                loop
-            )
-
-        recorder.on_segment_processed = segment_callback
+        # Block until persistence completes, but through a bounded bridge so a
+        # stalled client or engine cannot hang finalisation forever.
+        recorder.on_segment_processed = _make_segment_callback(
+            websocket, conversation_id, processing_token, loop
+        )
 
         recorder.start_recording(conversation_id)
 
@@ -147,11 +250,16 @@ async def websocket_endpoint(
         logger.info(f"🚀 Speaker cache loaded: {cache_size} profiles ready for streaming")
 
         # Send confirmation
-        await send_message(websocket, "started", {
+        started_sent = await _send_message_bounded(websocket, "started", {
             "conversation_id": conversation_id,
             "sample_rate": WS_SAMPLE_RATE,
             "message": "Recording started"
         })
+        if not started_sent:
+            await _finalize_recording(
+                conversation_id, processing_token, recorder, conversation, db, None
+            )
+            return
 
         # Main loop: receive and process audio chunks
         while True:
@@ -177,7 +285,7 @@ async def websocket_endpoint(
                     logger.info(f"📊 VAD: {result['speech_detected']}, Level: {result['audio_level']:.3f}")
 
                     # Send status update
-                    await send_message(websocket, "status", {
+                    status_sent = await _send_message_bounded(websocket, "status", {
                         "vad_active": result["speech_detected"],
                         "audio_level": float(result["audio_level"]),
                         "stats": {
@@ -186,6 +294,8 @@ async def websocket_endpoint(
                             "total_audio_seconds": float(result.get("cumulative_offset", 0.0)),
                         }
                     })
+                    if not status_sent:
+                        break
 
                 elif "text" in message:
                     # JSON message (e.g., stop command)
@@ -202,36 +312,44 @@ async def websocket_endpoint(
                 logger.error(f"Error processingaudio chunk: {e}")
                 import traceback
                 traceback.print_exc()
-                try:
-                    await send_message(websocket, "error", {"message": str(e)})
-                except Exception:
-                    pass  # Connection already closed
+                await _send_message_bounded(
+                    websocket, "error", {"message": str(e)}
+                )
                 break  # Exit loop on error
 
         # Cleanup: stop recording and finalize
-        await _finalize_recording(conversation_id, recorder, conversation, db, websocket)
+        await _finalize_recording(
+            conversation_id,
+            processing_token,
+            recorder,
+            conversation,
+            db,
+            websocket,
+        )
 
     except WebSocketDisconnect:
-        logger.info(f"WebSocket disconnected during initialization")
-        if conversation_id and recorder:
-            await _finalize_recording(conversation_id, recorder, conversation, db, None)
+        logger.info("WebSocket disconnected during initialization")
+        if conversation_id and processing_token and recorder and conversation:
+            await _finalize_recording(
+                conversation_id, processing_token, recorder, conversation, db, None
+            )
     except Exception as e:
         logger.info(f"WebSocket error: {e}")
         if websocket.client_state == WebSocketState.CONNECTED:
-            await send_message(websocket, "error", {"message": str(e)})
+            await _send_message_bounded(websocket, "error", {"message": str(e)})
+        if conversation_id and processing_token and recorder and conversation:
+            await _finalize_recording(
+                conversation_id, processing_token, recorder, conversation, db, None
+            )
     finally:
         # Close WebSocket if still open (ignore if already closed)
-        try:
-            if websocket.client_state == WebSocketState.CONNECTED:
-                await websocket.close()
-        except RuntimeError:
-            # WebSocket already closed, ignore
-            pass
+        await _close_websocket_bounded(websocket)
 
 
 async def _handle_segment_processed(
     websocket: WebSocket,
     conversation_id: int,
+    processing_token: str,
     segment_info: dict,
     engine
 ):
@@ -248,7 +366,9 @@ async def _handle_segment_processed(
     try:
         # Get conversation
         conversation = db.query(Conversation).filter(
-            Conversation.id == conversation_id
+            Conversation.id == conversation_id,
+            Conversation.processing_token == processing_token,
+            Conversation.status == "recording",
         ).first()
 
         if not conversation:
@@ -257,7 +377,6 @@ async def _handle_segment_processed(
         # Get segment file path
         segment_file = segment_info["segment_file"]
         start_offset = segment_info["start_offset"]
-        end_offset = segment_info["end_offset"]
 
         if not os.path.exists(segment_file):
             logger.info(f"Segment file not found: {segment_file}")
@@ -278,6 +397,18 @@ async def _handle_segment_processed(
             threshold=threshold,
             db_session=db,
         )
+
+        # Timeout only stops the recorder waiting; inference can still finish
+        # later. Acquire a conditional write lease before creating any rows.
+        # This succeeds before finalisation (which then waits for our commit),
+        # or fails after finalisation has revoked the generation token.
+        if not claim_segment_persistence(db, conversation_id, processing_token):
+            logger.warning(
+                "Discarding late segment %s after conversation %s finalized",
+                segment_info.get("id"),
+                conversation_id,
+            )
+            return
 
         # Save segments to database
         conv_start = conversation.start_time
@@ -317,16 +448,24 @@ async def _handle_segment_processed(
                 "avg_logprob": segment.avg_logprob
             })
 
-        # Update conversation stats (increment rather than re-count)
-        conversation.num_segments = (conversation.num_segments or 0) + len(result["segments"])
+        # Update conversation stats with an atomic SQL increment. A
+        # read-modify-write on the ORM object across independent sessions
+        # loses concurrent increments (two segment handlers → stored value 1).
+        db.query(Conversation).filter(
+            Conversation.id == conversation_id
+        ).update(
+            {"num_segments": Conversation.num_segments + len(result["segments"])},
+            synchronize_session=False,
+        )
 
         db.commit()
 
-        # Send segments to client
+        # Send segments to client with bounded backpressure. Persistence is
+        # already committed; a stuck browser must not pin recorder shutdown.
         logger.info(f"📤 Sending {len(segments_data)} segment(s) to client")
         for seg_data in segments_data:
             logger.info(f"   → Segment: {seg_data['speaker_name']}: {seg_data['text'][:50]}...")
-            await send_message(websocket, "segment", seg_data)
+            await _send_message_bounded(websocket, "segment", seg_data)
 
         # Queue async GPU cleanup (non-blocking)
         engine.clear_gpu_cache_async("segment_complete")
@@ -336,41 +475,62 @@ async def _handle_segment_processed(
         import traceback
         traceback.print_exc()
         db.rollback()
-        await send_message(websocket, "error", {"message": "Segment processing error"})
+        await _send_message_bounded(websocket, "error", {"message": "Segment processing error"})
+        raise
     finally:
         db.close()
 
 
 async def _finalize_recording(
     conversation_id: int,
+    processing_token: str,
     recorder: StreamingRecorder,
     conversation: Conversation,
     db: Session,
     websocket: Optional[WebSocket]
 ):
-    """
-    Finalize recording: stop recorder, concatenate segments, convert to MP3.
-    """
+    """Drain workers and publish final state under the streaming lease."""
     try:
         logger.info(f"Finalizing recording for conversation {conversation_id}")
 
-        # Both calls block for many seconds — run off the event loop so other
-        # clients aren't frozen while one user stops a recording.
-        await asyncio.to_thread(recorder.stop_recording)
-        full_audio_path = await asyncio.to_thread(recorder.concatenate_segments)
+        # Use a dedicated pool: holding a default-executor slot here while the
+        # segment coroutine itself awaits asyncio.to_thread creates a classic
+        # pool-saturation deadlock under concurrent stops.
+        recorder_stats, concatenation = await _stop_and_concatenate(recorder)
 
-        # Refresh BEFORE mutating: the per-segment callback owns its own Session
-        # and commits num_segments from a worker thread, so this handler's cached
-        # instance is stale. Refresh() overwrites every attribute, so any dirty
-        # change made before this line would be silently discarded.
-        db.refresh(conversation)
+        # Conditional UPDATE both revokes late writers and obtains SQLite's
+        # write lock.  A handler that acquired the lock first commits before
+        # this point; one that finishes inference later sees a revoked token and
+        # discards its result. Keep this transaction open through final status.
+        if not begin_finalization(db, conversation_id, processing_token):
+            logger.info(
+                "Conversation %s was already finalized or lost its processing lease",
+                conversation_id,
+            )
+            return
 
-        if full_audio_path and os.path.exists(full_audio_path):
-            # Keep WAV file (no MP3 conversion - WAV avoids pyannote 24ms boundary bug)
-            conversation.audio_path = full_audio_path
-            conversation.audio_format = "wav"
+        db.expire_all()
+        conversation = db.query(Conversation).filter(
+            Conversation.id == conversation_id
+        ).first()
+        if conversation is None:
+            db.rollback()
+            return
 
-        conversation.status = "completed"
+        concatenation_failed = concatenation.status in {"partial", "failed"}
+        if concatenation.status in {"success", "partial"}:
+            if concatenation.path and os.path.exists(concatenation.path):
+                # Keep WAV (avoids pyannote's MP3 boundary inaccuracies).
+                conversation.audio_path = concatenation.path
+                conversation.audio_format = "wav"
+            else:
+                concatenation_failed = True
+
+        segment_errors = recorder_stats.get("segments_failed", 0)
+        processing_errors = segment_errors + int(concatenation_failed)
+        conversation.status = (
+            "completed_with_errors" if processing_errors else "completed"
+        )
         conversation.end_time = utc_now()
 
         last_segment = db.query(ConversationSegment).filter(
@@ -379,33 +539,59 @@ async def _finalize_recording(
         if last_segment:
             conversation.duration = last_segment.end_offset
 
-        speaker_count = db.query(ConversationSegment.speaker_name).filter(
+        conversation.num_speakers = db.query(
+            ConversationSegment.speaker_name
+        ).filter(
             ConversationSegment.conversation_id == conversation_id
         ).distinct().count()
-        conversation.num_speakers = speaker_count
 
+        # Commits token revocation and all final metadata atomically.
         db.commit()
 
+        if concatenation.status == "partial":
+            completion_message = (
+                "Recording completed, but full audio contains only readable segments"
+            )
+        elif concatenation_failed:
+            completion_message = "Recording completed, but full audio publication failed"
+        elif segment_errors:
+            completion_message = "Recording completed with segment-processing errors"
+        elif concatenation.status == "empty":
+            completion_message = "Recording completed with no speech segments"
+        else:
+            completion_message = "Recording completed and saved"
+
         if websocket and websocket.client_state == WebSocketState.CONNECTED:
-            await send_message(websocket, "completed", {
+            await _send_message_bounded(websocket, "completed", {
                 "conversation_id": conversation_id,
+                "status": conversation.status,
                 "num_segments": conversation.num_segments,
                 "num_speakers": conversation.num_speakers,
+                "processing_errors": processing_errors,
+                "concatenation_status": concatenation.status,
                 "duration": conversation.duration,
-                "message": "Recording completed and saved"
+                "message": completion_message,
             })
 
-        logger.info(f"Recording finalized: {conversation.num_segments} segments, {conversation.num_speakers} speakers")
+        logger.info(
+            "Recording finalized: %s segments, %s speakers, %s errors",
+            conversation.num_segments,
+            conversation.num_speakers,
+            processing_errors,
+        )
 
-        engine = get_engine()
-        engine.clear_gpu_cache()
+        try:
+            get_engine().clear_gpu_cache()
+        except Exception as exc:  # noqa: BLE001 - cleanup cannot un-finalize data
+            logger.warning("Post-finalization GPU cleanup failed: %s", exc)
 
     except Exception as e:
-        logger.info(f"Error finalizing recording: {e}")
+        logger.error(f"Error finalizing recording: {e}")
         import traceback
         traceback.print_exc()
-        conversation.status = "failed"
-        db.commit()
+        fail_processing_lease(db, conversation_id, processing_token)
 
         if websocket and websocket.client_state == WebSocketState.CONNECTED:
-            await send_message(websocket, "error", {"message": "Finalization error"})
+            await _send_message_bounded(
+                websocket, "error", {"message": "Finalization error"}
+            )
