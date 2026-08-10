@@ -42,10 +42,11 @@ def test_conversation_list_does_not_eager_load_segments(tmp_path):
     this test pins the correct behaviour against regression)."""
     from datetime import datetime
 
-    from app.database import Base
-    from app.models import Conversation, ConversationSegment
     from sqlalchemy import event
     from sqlalchemy.orm import sessionmaker
+
+    from app.database import Base
+    from app.models import Conversation, ConversationSegment
 
     engine = create_engine(f"sqlite:///{tmp_path}/list.db")
     Base.metadata.create_all(engine)

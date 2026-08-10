@@ -76,3 +76,22 @@ def test_failed_validation_does_not_persist(config_file):
         cm.update_settings({"speaker_threshold": 99.0})  # out of range (le=0.9)
     # In-memory state unchanged and file not written with garbage
     assert cm.get_settings().speaker_threshold == 0.30
+
+
+def test_failed_disk_write_does_not_publish_candidate_in_memory(config_file, monkeypatch):
+    """A failed atomic save must leave both observed and persisted state old."""
+    from app.config import ConfigManager
+
+    cm = ConfigManager(config_file=config_file)
+    cm.update_settings({"speaker_threshold": 0.42})
+
+    def fail_save(_settings):
+        raise OSError("read-only filesystem")
+
+    monkeypatch.setattr(cm, "_save_settings", fail_save)
+    with pytest.raises(OSError, match="read-only"):
+        cm.update_settings({"speaker_threshold": 0.66})
+
+    assert cm.get_settings().speaker_threshold == 0.42
+    reloaded = ConfigManager(config_file=config_file)
+    assert reloaded.get_settings().speaker_threshold == 0.42

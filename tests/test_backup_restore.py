@@ -7,10 +7,11 @@ import json
 import os
 
 import pytest
-from app.database import Base
-from app.models import Speaker
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
+
+from app.database import Base
+from app.models import Speaker
 
 
 @pytest.fixture()
@@ -99,6 +100,7 @@ class TestRestoreAtomicity:
         monkeypatch.chdir(tmp_path)
 
         import asyncio
+
         from fastapi import HTTPException
         with pytest.raises(HTTPException):
             asyncio.run(backup_api.restore_from_file(filename="profile_broken.json", db=db_session))
@@ -107,8 +109,9 @@ class TestRestoreAtomicity:
         assert "Keeper" in names
 
     def test_duplicate_names_rejected_before_wipe(self, db_session, backup_dir, tmp_path, monkeypatch):
-        from app import backup_api
         from fastapi import HTTPException
+
+        from app import backup_api
         _make_speaker(db_session, "Keeper")
 
         bad = {
@@ -135,6 +138,7 @@ class TestCheckpointRestoreRoundTrip:
         """SOL-003: checkpoints used to omit emotion profiles, so restoring one
         silently deleted all learned emotion state. Round-trip must be lossless."""
         import numpy as np
+
         from app import backup_api
         from app.models import SpeakerEmotionProfile
 
@@ -150,10 +154,10 @@ class TestCheckpointRestoreRoundTrip:
 
         monkeypatch.chdir(backup_dir.parent)
         import asyncio
-        created = asyncio.run(backup_api.create_checkpoint(profile_name="rt", db=db_session))
-        ckpt_file = backup_dir / [
+        asyncio.run(backup_api.create_checkpoint(profile_name="rt", db=db_session))
+        ckpt_file = backup_dir / next(
             f for f in os.listdir(backup_dir) if f.startswith("checkpoint_rt_")
-        ][0]
+        )
         assert ckpt_file.exists()
 
         # Checkpoint must actually contain the emotion profile now.
@@ -174,9 +178,10 @@ class TestProfileOverwriteProtection:
     def test_create_refuses_existing_name(self, db_session, backup_dir, monkeypatch):
         import asyncio
 
+        from fastapi import HTTPException
+
         from app import backup_api
         from app.backup_api import CreateProfileRequest
-        from fastapi import HTTPException
 
         monkeypatch.chdir(backup_dir.parent)
         req = CreateProfileRequest(name="mine", description="first")
@@ -189,9 +194,10 @@ class TestProfileOverwriteProtection:
     def test_duplicate_refuses_existing_name(self, db_session, backup_dir, monkeypatch):
         import asyncio
 
+        from fastapi import HTTPException
+
         from app import backup_api
         from app.backup_api import CreateProfileRequest
-        from fastapi import HTTPException
 
         monkeypatch.chdir(backup_dir.parent)
         req = CreateProfileRequest(name="copy", description="x")
@@ -213,3 +219,157 @@ class TestProfileOverwriteProtection:
         result = asyncio.run(backup_api.update_profile(
             profile_name="upd", request=UpdateProfileRequest(description="v2"), db=db_session))
         assert result["message"]
+
+    def test_atomic_no_clobber_has_exactly_one_concurrent_winner(self, backup_dir):
+        """The publish primitive itself must close the exists/replace race."""
+        import threading
+
+        from fastapi import HTTPException
+
+        from app import backup_api
+
+        path = str(backup_dir / "profile_race.json")
+        barrier = threading.Barrier(2)
+        successes = []
+        errors = []
+
+        def writer(value):
+            barrier.wait()
+            try:
+                backup_api._dump_json(path, {"winner": value}, allow_overwrite=False)
+                successes.append(value)
+            except HTTPException as exc:
+                errors.append(exc.status_code)
+
+        threads = [threading.Thread(target=writer, args=(value,)) for value in (1, 2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        assert len(successes) == 1
+        assert errors == [409]
+        assert json.loads((backup_dir / "profile_race.json").read_text())["winner"] in {1, 2}
+
+
+class TestRestoreValidationAndMapping:
+    def test_invalid_settings_rejected_before_database_mutation(
+        self, db_session, backup_dir, tmp_path, monkeypatch
+    ):
+        import asyncio
+
+        from fastapi import HTTPException
+
+        from app import backup_api
+
+        _make_speaker(db_session, "Keeper")
+        payload = {
+            "name": "InvalidSettings",
+            "settings": {"speaker_threshold": 5.0},
+            "speakers": [{"id": 7, "name": "Replacement"}],
+            "segments": [],
+        }
+        (backup_dir / "profile_invalid_settings.json").write_text(json.dumps(payload))
+        monkeypatch.chdir(tmp_path)
+
+        with pytest.raises(HTTPException) as exc_info:
+            asyncio.run(backup_api.restore_from_file(
+                filename="profile_invalid_settings.json", db=db_session
+            ))
+        assert exc_info.value.status_code == 400
+        db_session.expire_all()
+        assert [speaker.name for speaker in db_session.query(Speaker).all()] == ["Keeper"]
+
+    def test_settings_io_failure_reports_partial_success_truthfully(
+        self, db_session, backup_dir, tmp_path, monkeypatch
+    ):
+        import asyncio
+
+        from app import backup_api
+        from app.config import VoiceSettings
+
+        class FailingConfig:
+            def get_settings(self):
+                return VoiceSettings()
+
+            def update_settings(self, _updates):
+                raise OSError("read-only filesystem")
+
+            def reload_settings(self):
+                raise AssertionError("reload must not run after failed save")
+
+        _make_speaker(db_session, "Old")
+        payload = {
+            "name": "GoodDBBadSettingsIO",
+            "settings": {"speaker_threshold": 0.44},
+            "speakers": [{"id": 7, "name": "Restored", "embedding": [1.0, 0.0]}],
+            "segments": [],
+        }
+        (backup_dir / "profile_settings_io.json").write_text(json.dumps(payload))
+        monkeypatch.setattr(backup_api, "get_config", lambda: FailingConfig())
+        monkeypatch.chdir(tmp_path)
+
+        result = asyncio.run(backup_api.restore_from_file(
+            filename="profile_settings_io.json", db=db_session
+        ))
+        assert result["settings_restored"] is False
+        assert "Database restored" in result["settings_warning"]
+        db_session.expire_all()
+        assert [speaker.name for speaker in db_session.query(Speaker).all()] == ["Restored"]
+
+    def test_cross_database_id_collision_remaps_by_backup_name(
+        self, db_session, backup_dir, tmp_path, monkeypatch
+    ):
+        import asyncio
+        from datetime import datetime, timezone
+
+        from app import backup_api
+        from app.models import Conversation, ConversationSegment
+
+        _make_speaker(db_session, "Alice")
+        bob = _make_speaker(db_session, "Bob")
+        conversation = Conversation(
+            title="mapping", start_time=datetime.now(timezone.utc), status="completed"
+        )
+        db_session.add(conversation)
+        db_session.flush()
+        segment = ConversationSegment(
+            conversation_id=conversation.id,
+            speaker_id=bob.id,
+            speaker_name="Bob",
+            text="hello",
+            start_time=datetime.now(timezone.utc),
+            end_time=datetime.now(timezone.utc),
+            start_offset=0.0,
+            end_offset=1.0,
+        )
+        db_session.add(segment)
+        db_session.commit()
+
+        payload = {
+            "name": "ForeignIds",
+            "speakers": [
+                {"id": 7, "name": "Alice", "embedding": [1.0, 0.0]},
+                {"id": 8, "name": "Bob", "embedding": [0.0, 1.0]},
+            ],
+            "segments": [{
+                "id": segment.id,
+                "conversation_id": conversation.id,
+                # Numeric 2 collides with target Bob, but the backup itself
+                # says this segment belongs to Alice.
+                "speaker_id": 2,
+                "speaker_name": "Alice",
+            }],
+        }
+        (backup_dir / "profile_foreign_ids.json").write_text(json.dumps(payload))
+        monkeypatch.chdir(tmp_path)
+
+        result = asyncio.run(backup_api.restore_from_file(
+            filename="profile_foreign_ids.json", db=db_session
+        ))
+        db_session.expire_all()
+        restored_segment = db_session.query(ConversationSegment).filter_by(id=segment.id).one()
+        restored_speaker = db_session.query(Speaker).filter_by(id=restored_segment.speaker_id).one()
+        assert restored_speaker.name == "Alice"
+        assert restored_segment.speaker_name == "Alice"
+        assert result["segments_remapped_by_name"] == 1

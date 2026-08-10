@@ -30,6 +30,7 @@ from .services import (
     recalculate_emotion_profile,
     recalculate_speaker_embedding,
     resolve_audio_path,
+    uses_segment_audio_fallback,
 )
 import logging
 import numpy as np
@@ -116,6 +117,12 @@ async def delete_conversation(conversation_id: int, db: Session = Depends(get_db
     if not conversation:
         raise HTTPException(status_code=404, detail="Conversation not found")
 
+    if conversation.status in {"recording", "processing"}:
+        raise HTTPException(
+            status_code=409,
+            detail="Cannot delete an active conversation; stop/finalize it first",
+        )
+
     # Delete audio file
     if conversation.audio_path and os.path.exists(conversation.audio_path):
         os.remove(conversation.audio_path)
@@ -129,7 +136,7 @@ async def delete_conversation(conversation_id: int, db: Session = Depends(get_db
         if os.path.isdir(seg_dir):
             import shutil as _shutil
             _shutil.rmtree(seg_dir, ignore_errors=True)
-    except Exception:
+    except (ImportError, OSError):
         logger.info(f"Could not remove stream segment dir for conversation {conversation_id}")
 
     db.delete(conversation)
@@ -345,26 +352,12 @@ async def identify_speaker_in_segment(
 
     conversation = segment.conversation
 
-    # Determine which audio file to use for embedding extraction
-    # CRITICAL: Database offsets (start_offset/end_offset) are ALWAYS conversation-relative!
-    # They represent seconds from the conversation start, NOT from individual segment files.
-    # Therefore, we MUST use the full conversation audio file where these offsets are valid.
+    # Database offsets are conversation-relative. Audio is only needed for an
+    # enrolment; identify-only attribution must keep working during a live
+    # recording without attempting extraction at all.
     start_time = segment.start_offset
     end_time = segment.end_offset
-
-    audio_file = resolve_audio_path(conversation, segment)
-    if not audio_file:
-        raise HTTPException(status_code=404, detail="Audio file not found (neither conversation audio nor segment audio exists)")
-    if audio_file == segment.segment_audio_path:
-        # Database offsets are conversation-relative; the per-segment file
-        # contains only the raw VAD chunk, so applying conversation offsets to
-        # it extracts the WRONG audio (clamped to the tail of the chunk).
-        # Refuse instead of silently embedding garbage audio.
-        raise HTTPException(
-            status_code=409,
-            detail="Full conversation audio is not available yet (recording still in progress). "
-                   "Re-run identification after the recording is finalised.",
-        )
+    audio_file = None
 
     # Store the old speaker name and ID for propagation and embedding recalculation
     old_speaker_name = segment.speaker_name
@@ -373,6 +366,23 @@ async def identify_speaker_in_segment(
     # Extract embedding FIRST if enrolling (needed for new speakers, off the event loop)
     embedding = None
     if enroll:
+        audio_file = resolve_audio_path(conversation, segment)
+        if not audio_file:
+            raise HTTPException(
+                status_code=404,
+                detail="Audio file not found (neither conversation audio nor segment audio exists)",
+            )
+        if uses_segment_audio_fallback(conversation, segment, audio_file):
+            reason = (
+                "recording is still in progress"
+                if conversation.status in {"recording", "processing"}
+                else "full conversation audio is missing"
+            )
+            raise HTTPException(
+                status_code=409,
+                detail=f"Cannot enroll from chunk audio because {reason}; "
+                       "conversation-relative offsets are unavailable.",
+            )
         try:
             embedding = await asyncio.to_thread(
                 engine.extract_segment_embedding,
@@ -520,7 +530,9 @@ async def identify_speaker_in_segment(
                 emotion_embedding = seg.get_emotion_embedding()
                 if emotion_embedding is None or np.isnan(emotion_embedding).any():
                     seg_audio = resolve_audio_path(seg.conversation, seg)
-                    if seg_audio:
+                    if seg_audio and not uses_segment_audio_fallback(
+                        seg.conversation, seg, seg_audio
+                    ):
                         try:
                             emotion_data = engine.extract_emotion(
                                 seg_audio, seg.start_offset, seg.end_offset, extract_embedding=True
@@ -530,6 +542,12 @@ async def identify_speaker_in_segment(
                         except Exception as e:
                             logger.info(f"  ⚠️ Could not extract emotion for segment {seg.id}: {e}")
                             continue
+                    elif seg_audio:
+                        logger.warning(
+                            "Skipping personalised emotion re-detection for segment %s: "
+                            "only chunk audio is available",
+                            seg.id,
+                        )
 
                 if emotion_embedding is not None and not np.isnan(emotion_embedding).any():
                     match = engine.match_emotion_to_profile(
@@ -743,7 +761,7 @@ async def get_segment_audio(
     # uuid suffix: second-resolution timestamps collide for concurrent
     # requests of the same segment (one 500s / truncated file served).
     import uuid as _uuid
-    temp_path = os.path.join(temp_dir, f"segment_{segment_id}_{int(datetime.now().timestamp())}_{_uuid.uuid4().hex[:8]}.wav")
+    temp_path = os.path.join(temp_dir, f"segment_{segment_id}_{int(utc_now().timestamp())}_{_uuid.uuid4().hex[:8]}.wav")
 
     try:
         # Use ffmpeg to extract the specific time range with small padding at end
@@ -853,11 +871,6 @@ async def correct_emotion_in_segment(
     old_emotion_corrected = segment.emotion_corrected
     conversation = segment.conversation
 
-    # Get audio file for embedding extraction
-    audio_file = resolve_audio_path(conversation, segment)
-    if not audio_file:
-        raise HTTPException(status_code=404, detail="Audio file not found for this segment")
-
     # Extract emotion embedding if learning
     emotion_embedding = None
     if learn:
@@ -865,7 +878,17 @@ async def correct_emotion_in_segment(
         emotion_embedding = segment.get_emotion_embedding()
 
         if emotion_embedding is None or np.isnan(emotion_embedding).any():
-            # Extract from audio if not cached (SLOW - fallback only, off the event loop)
+            # Extract from audio if not cached (SLOW - fallback only, off the event loop).
+            # Never apply conversation-relative offsets to a streaming chunk.
+            audio_file = resolve_audio_path(conversation, segment)
+            if not audio_file:
+                raise HTTPException(status_code=404, detail="Audio file not found for this segment")
+            if uses_segment_audio_fallback(conversation, segment, audio_file):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Cannot learn an emotion from chunk audio because its "
+                           "conversation-relative offsets are unavailable.",
+                )
             try:
                 logger.info(f"  ℹ️ Extracting emotion embedding from audio for segment {segment_id} (not cached)")
                 emotion_data = await asyncio.to_thread(

@@ -59,7 +59,7 @@ async def lifespan(app: FastAPI):
             reconcile_db.commit()
         finally:
             reconcile_db.close()
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - startup reconciliation is best effort
         logger.info(f"Conversation reconciliation skipped: {e}")
 
     # Create necessary directories (use relative paths for local dev, absolute for Docker)

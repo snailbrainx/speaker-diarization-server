@@ -53,6 +53,7 @@ class StreamingRecorder:
 
         # Audio buffering
         self.current_buffer: List[np.ndarray] = []
+        self._buffered_samples = 0
         self.last_speech_time = time.time()
         self.chunk_count = 0
         self.speech_detected = False
@@ -80,6 +81,7 @@ class StreamingRecorder:
         self.total_segments = 0
         self.segments_queued = 0
         self.segments_processed = 0
+        self.segments_failed = 0
 
         # Paths of flushed segments (for later concatenation)
         self.segment_paths: List[str] = []
@@ -96,10 +98,12 @@ class StreamingRecorder:
         self.is_recording = True
         self.conversation_id = conversation_id
         self.current_buffer = []
+        self._buffered_samples = 0
         self.last_speech_time = time.time()
         self.chunk_count = 0
         self.total_segments = 0
         self.segments_processed = 0
+        self.segments_failed = 0
         self.segments_queued = 0
         self.segment_paths = []
         self.cumulative_offset = 0.0
@@ -178,6 +182,7 @@ class StreamingRecorder:
 
         with self._lock:
             self.current_buffer.append(audio_data)
+            self._buffered_samples += len(audio_data)
             self.chunk_count += 1
 
             if energy > self.silence_threshold:
@@ -191,7 +196,7 @@ class StreamingRecorder:
 
             # Bound RAM: force-flush if the unflushed buffer exceeds the cap
             # (continuous speech with no silence pause).
-            buffered_seconds = sum(len(chunk) for chunk in self.current_buffer) / self.sample_rate
+            buffered_seconds = self._buffered_samples / self.sample_rate
             if buffered_seconds >= self.MAX_BUFFER_SECONDS:
                 logger.info(f"Buffer cap reached ({buffered_seconds:.0f}s) — flushing")
                 self._flush_locked()
@@ -218,6 +223,7 @@ class StreamingRecorder:
         # Always clear the buffer and reset the silence clock — even if we
         # decide not to flush, so pure-silence clients don't spin.
         self.current_buffer = []
+        self._buffered_samples = 0
         self.last_speech_time = time.time()
 
         duration = len(segment_audio) / self.sample_rate
@@ -271,18 +277,21 @@ class StreamingRecorder:
         logger.info(f"📦 Queued segment {segment_id} ({duration:.1f}s, offset {start_offset:.1f}-{end_offset:.1f}s)")
 
     def _process_segment_worker(self, segment_info: Dict):
-        """Background worker for a single segment. Increments segments_processed
-        in finally so stop_recording can no longer deadlock on an exception."""
+        """Run one segment callback and record success/failure exactly once."""
+        failed = False
         try:
             if self.on_segment_processed:
                 self.on_segment_processed(segment_info)
         except Exception as e:
+            failed = True
             logger.error(f"Error processingsegment {segment_info['id']}: {e}")
             import traceback
             traceback.print_exc()
         finally:
             with self._lock:
                 self.segments_processed += 1
+                if failed:
+                    self.segments_failed += 1
                 done = self.segments_processed
                 total = self.segments_queued
             logger.info(f"✅ Processed segment {segment_info['id']} ({done}/{total})")
@@ -294,7 +303,9 @@ class StreamingRecorder:
                 "total_segments": self.total_segments,
                 "segments_queued": self.segments_queued,
                 "segments_processed": self.segments_processed,
+                "segments_failed": self.segments_failed,
                 "buffer_chunks": len(self.current_buffer),
+                "buffered_samples": self._buffered_samples,
             }
 
     def concatenate_segments(self) -> Optional[str]:

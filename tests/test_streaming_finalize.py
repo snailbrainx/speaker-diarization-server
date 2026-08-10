@@ -7,10 +7,12 @@ num_segments increments are atomic SQL updates.
 """
 import asyncio
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 import numpy as np
 import pytest
+
 from app.streaming_recorder import StreamingRecorder
 
 
@@ -29,30 +31,26 @@ class TestStopRecordingWaitsForAsyncHandlers:
         recorder.process_audio_chunk((16000, loud))
         recorder.process_audio_chunk((16000, silence))
 
-    def test_stop_blocks_until_async_handler_finished(self):
-        """Exact production callback wiring: run_coroutine_threadsafe + wait."""
-        loop_holder = {}
+    def test_stop_blocks_until_async_handler_finished(self, monkeypatch):
+        """Exercise the production callback bridge, not a hand-copied sketch."""
         state = {"finished": 0}
 
         async def scenario():
+            from app import streaming_websocket
+
             loop = asyncio.get_running_loop()
-            loop_holder["loop"] = loop
             recorder = StreamingRecorder(max_workers=1, sample_rate=16000)
             recorder.silence_duration = 0.05
 
-            async def handler(_seg):
+            async def handler(_websocket, _conversation_id, _seg, _engine):
                 await asyncio.sleep(0.3)  # stand-in for GPU transcription
                 state["finished"] += 1
 
-            # The FIXED wiring from streaming_websocket.py: block on the future.
-            def segment_callback(seg_info):
-                future = asyncio.run_coroutine_threadsafe(handler(seg_info), loop)
-                try:
-                    future.result()
-                except RuntimeError:
-                    pass
-
-            recorder.on_segment_processed = segment_callback
+            monkeypatch.setattr(streaming_websocket, "_handle_segment_processed", handler)
+            monkeypatch.setattr(streaming_websocket, "get_engine", lambda: object())
+            recorder.on_segment_processed = streaming_websocket._make_segment_callback(
+                object(), 4242, loop
+            )
             recorder.start_recording(4242)
             await asyncio.to_thread(self._drive_one_segment, recorder)
             await asyncio.sleep(0.05)
@@ -66,12 +64,72 @@ class TestStopRecordingWaitsForAsyncHandlers:
             "async handlers finished — finalisation would use incomplete data"
         )
 
+    def test_handler_timeout_releases_stop_and_counts_failure(self, monkeypatch):
+        async def scenario():
+            from app import streaming_websocket
+
+            loop = asyncio.get_running_loop()
+            recorder = StreamingRecorder(max_workers=1, sample_rate=16000)
+            recorder.silence_duration = 0.05
+
+            async def stalled_handler(*_args):
+                await asyncio.sleep(60)
+
+            monkeypatch.setattr(streaming_websocket, "_handle_segment_processed", stalled_handler)
+            monkeypatch.setattr(streaming_websocket, "get_engine", lambda: object())
+            monkeypatch.setattr(streaming_websocket, "SEGMENT_HANDLER_TIMEOUT_SECONDS", 0.05)
+            recorder.on_segment_processed = streaming_websocket._make_segment_callback(
+                object(), 4242, loop
+            )
+            recorder.start_recording(4242)
+            await asyncio.to_thread(self._drive_one_segment, recorder)
+            await asyncio.wait_for(asyncio.to_thread(recorder.stop_recording), timeout=1.0)
+            stats = recorder.get_stats()
+            recorder.cleanup()
+            return stats
+
+        stats = asyncio.run(scenario())
+        assert stats["segments_processed"] == 1
+        assert stats["segments_failed"] == 1
+
+    def test_dedicated_finalize_pool_breaks_default_pool_cycle(self):
+        """Two stops may each need inner default-executor work without deadlock."""
+        async def scenario():
+            from app.streaming_websocket import _stop_and_concatenate
+
+            loop = asyncio.get_running_loop()
+            loop.set_default_executor(ThreadPoolExecutor(max_workers=2))
+
+            class NestedRecorder:
+                def stop_recording(self):
+                    inner = asyncio.run_coroutine_threadsafe(
+                        asyncio.to_thread(lambda: None), loop
+                    )
+                    inner.result(timeout=1.0)
+
+                def get_stats(self):
+                    return {"segments_failed": 0}
+
+                def concatenate_segments(self):
+                    return None
+
+            await asyncio.wait_for(
+                asyncio.gather(
+                    _stop_and_concatenate(NestedRecorder()),
+                    _stop_and_concatenate(NestedRecorder()),
+                ),
+                timeout=2.0,
+            )
+
+        asyncio.run(scenario())
+
     def test_num_segments_atomic_increment(self, tmp_path):
         """Concurrent segment handlers must not lose increments (was RMW race)."""
-        from app.database import Base
-        from app.models import Conversation
         from sqlalchemy import create_engine
         from sqlalchemy.orm import sessionmaker
+
+        from app.database import Base
+        from app.models import Conversation
 
         engine = create_engine(f"sqlite:///{tmp_path}/conv.db")
         Base.metadata.create_all(engine)
@@ -127,4 +185,7 @@ class TestRecorderHardening:
         recorder.process_audio_chunk((16000, loud))
         # Second 1 s chunk pushed buffer past the 0.5 s cap -> forced flush
         assert recorder.segments_queued >= 1, "buffer cap must force a flush"
+        stats = recorder.get_stats()
+        assert stats["buffered_samples"] == sum(len(chunk) for chunk in recorder.current_buffer)
+        assert stats["buffered_samples"] == 0
         recorder.cleanup()

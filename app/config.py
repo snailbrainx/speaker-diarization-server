@@ -89,17 +89,18 @@ class ConfigManager:
         Returns updated settings.
         """
         with self._lock:
-            # Update settings object
+            # Validate and persist the candidate BEFORE publishing it in
+            # memory. If the disk write fails (full/read-only filesystem),
+            # callers must continue to observe the previous settings rather
+            # than a value that the endpoint reported as failed.
             current = self._settings.model_dump()
             current.update(updates)
-            self._settings = VoiceSettings(**current)
-
-            # Persist to file
-            self._save_settings()
-
+            candidate = VoiceSettings(**current)
+            self._save_settings(candidate)
+            self._settings = candidate
             return self._settings
 
-    def _save_settings(self):
+    def _save_settings(self, settings: VoiceSettings):
         """Save settings to config file atomically (unique tempfile + os.replace)."""
         target_dir = os.path.dirname(self.config_file) or "."
         os.makedirs(target_dir, exist_ok=True)
@@ -112,7 +113,9 @@ class ConfigManager:
         )
         try:
             with os.fdopen(fd, "w") as f:
-                json.dump(self._settings.model_dump(), f, indent=2)
+                json.dump(settings.model_dump(), f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
             os.replace(tmp_path, self.config_file)
         except BaseException:
             if os.path.exists(tmp_path):

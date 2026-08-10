@@ -14,8 +14,8 @@ import os
 import re
 import traceback
 import zipfile
-from datetime import datetime
-from typing import Any, Dict, Optional, Tuple
+from datetime import datetime, timezone
+from typing import Any, Optional
 
 import numpy as np
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
@@ -73,7 +73,7 @@ def _checkpoint_path(safe_name: str, timestamp: str) -> str:
     return _safe_backup_path(f"checkpoint_{safe_name}_{timestamp}.json")
 
 
-def _tunable_settings(source) -> Dict[str, Any]:
+def _tunable_settings(source) -> dict[str, Any]:
     """Extract every VoiceSettings field from `source` as a dict.
 
     Driving the schema off `VoiceSettings.model_fields` keeps save / create /
@@ -126,7 +126,14 @@ def _serialize_segments(db: Session) -> list:
     ]
 
 
-def _dump_json(path: str, payload: dict) -> None:
+def _dump_json(path: str, payload: dict, *, allow_overwrite: bool = True) -> None:
+    """Publish JSON atomically, optionally refusing an existing destination.
+
+    For create/duplicate operations ``allow_overwrite=False`` hard-links a
+    fully written sibling tempfile into place. ``os.link`` is atomic and fails
+    if the destination already exists, closing the check-then-replace race that
+    let two concurrent creates both report success.
+    """
     import tempfile as _tempfile
     target_dir = os.path.dirname(path) or "."
     fd, tmp = _tempfile.mkstemp(
@@ -135,7 +142,19 @@ def _dump_json(path: str, payload: dict) -> None:
     try:
         with os.fdopen(fd, "w") as f:
             json.dump(payload, f, indent=2)
-        os.replace(tmp, path)
+            f.flush()
+            os.fsync(f.fileno())
+        if allow_overwrite:
+            os.replace(tmp, path)
+        else:
+            try:
+                os.link(tmp, path)
+            except FileExistsError:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Profile already exists; use the update endpoint or choose a different name",
+                )
+            os.unlink(tmp)
     except BaseException:
         if os.path.exists(tmp):
             os.unlink(tmp)
@@ -151,11 +170,11 @@ def _read_json(path: str) -> dict:
 # on each request just to count speakers/segments. Cache the parsed summary per
 # (path, mtime_ns, size) — backups are immutable once written, so the stat
 # tuple is a sound cache key.
-_SUMMARY_CACHE: Dict[str, Tuple[tuple, dict]] = {}
+_SUMMARY_CACHE: dict[str, tuple[tuple, dict]] = {}
 _SUMMARY_CACHE_MAX = 512
 
 
-def _backup_summary(filepath: str) -> Optional[dict]:
+def _backup_summary(filepath: str) -> dict | None:
     """Parsed summary of a backup file, cached by stat signature."""
     try:
         st = os.stat(filepath)
@@ -176,7 +195,7 @@ def _backup_summary(filepath: str) -> Optional[dict]:
         "timestamp": data.get("timestamp", ""),
         "speakers_count": len(data.get("speakers", [])),
         "segments_count": len(data.get("segments", [])),
-        "created_at": datetime.fromtimestamp(st.st_ctime).isoformat(),
+        "created_at": datetime.fromtimestamp(st.st_ctime, tz=timezone.utc).isoformat(),
     }
     if len(_SUMMARY_CACHE) >= _SUMMARY_CACHE_MAX:
         _SUMMARY_CACHE.clear()
@@ -216,7 +235,7 @@ def save_current_state(profile_name: str, description: str, db: Session, allow_o
         "speakers": speakers,
         "segments": segments,
     }
-    _dump_json(profile_file, profile_data)
+    _dump_json(profile_file, profile_data, allow_overwrite=allow_overwrite)
 
     return {
         "filename": os.path.basename(profile_file),
@@ -249,7 +268,7 @@ async def create_profile(request: CreateProfileRequest, db: Session = Depends(ge
             "speakers": [],
             "segments": [],
         }
-        _dump_json(profile_file, profile_data)
+        _dump_json(profile_file, profile_data, allow_overwrite=False)
         return {
             "message": f"Empty profile '{request.name}' created successfully",
             "name": request.name,
@@ -488,11 +507,24 @@ async def restore_from_file(filename: str, db: Session = Depends(get_db)):
                 detail="Profile contains duplicate speaker names; restore aborted before any data was modified",
             )
 
-        # Stable-key fallback map captured before the wipe: if the backup's
-        # speaker IDs do not match this database's IDs (restore onto a
-        # different DB), remap segments via speaker NAME instead of silently
-        # dropping every assignment.
-        current_name_by_id = {s.id: s.name for s in db.query(Speaker).all()}
+        # Validate the settings block before touching the database. Invalid
+        # settings used to raise only after the DB commit, returning a
+        # misleading 500 even though the destructive restore had succeeded.
+        validated_settings = None
+        if "settings" in data:
+            if not isinstance(data["settings"], dict):
+                raise HTTPException(status_code=400, detail="Profile settings must be an object")
+            config = get_config()
+            candidate = _tunable_settings(config.get_settings())
+            candidate.update({
+                key: value
+                for key, value in data["settings"].items()
+                if key in VoiceSettings.model_fields
+            })
+            try:
+                validated_settings = VoiceSettings(**candidate)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=f"Invalid profile settings: {exc}")
 
         # Everything below is ONE transaction: wipe, rebuild speakers and
         # emotion profiles, and segment remap commit together. Any failure
@@ -502,8 +534,11 @@ async def restore_from_file(filename: str, db: Session = Depends(get_db)):
         db.query(SpeakerEmotionProfile).delete()
         db.query(ConversationSegment).update({"speaker_id": None})
         db.query(Speaker).delete()
+        # Bulk deletes bypass ORM identity bookkeeping. Clear stale objects
+        # before SQLite reuses low integer IDs for restored speakers.
+        db.expunge_all()
 
-        speaker_id_map: Dict[int, int] = {}
+        speaker_id_map: dict[int, int] = {}
         for speaker_data in speakers_in:
             old_id = speaker_data["id"]
             speaker = Speaker(name=speaker_data["name"])
@@ -531,27 +566,49 @@ async def restore_from_file(filename: str, db: Session = Depends(get_db)):
 
         db.flush()
         new_id_by_name = {s.name: s.id for s in db.query(Speaker).all()}
+        new_name_by_id = {speaker_id: name for name, speaker_id in new_id_by_name.items()}
 
         segments_updated = 0
         segments_unmapped = 0
+        segments_remapped_by_name = 0
+        segments_not_found = 0
         for seg_data in data.get("segments", []):
-            segment = db.query(ConversationSegment).filter(
+            segment_query = db.query(ConversationSegment).filter(
                 ConversationSegment.id == seg_data["id"]
-            ).first()
-            if segment:
-                old_speaker_id = seg_data.get("speaker_id")
-                new_speaker_id = None
-                if old_speaker_id and old_speaker_id in speaker_id_map:
-                    new_speaker_id = speaker_id_map[old_speaker_id]
-                elif old_speaker_id and old_speaker_id in current_name_by_id:
-                    new_speaker_id = new_id_by_name.get(current_name_by_id[old_speaker_id])
+            )
+            if seg_data.get("conversation_id") is not None:
+                segment_query = segment_query.filter(
+                    ConversationSegment.conversation_id == seg_data["conversation_id"]
+                )
+            segment = segment_query.first()
+            if not segment:
+                segments_not_found += 1
+                continue
+
+            old_speaker_id = seg_data.get("speaker_id")
+            new_speaker_id = None
+            if old_speaker_id and old_speaker_id in speaker_id_map:
+                new_speaker_id = speaker_id_map[old_speaker_id]
+            elif old_speaker_id and seg_data.get("speaker_name"):
+                # Never interpret a backup ID in the target database's
+                # unrelated ID namespace. The backup's denormalised name is
+                # the only stable fallback available.
+                new_speaker_id = new_id_by_name.get(seg_data["speaker_name"])
                 if new_speaker_id is not None:
-                    segment.speaker_id = new_speaker_id
-                elif old_speaker_id:
-                    segments_unmapped += 1
+                    segments_remapped_by_name += 1
+
+            if new_speaker_id is not None:
+                segment.speaker_id = new_speaker_id
+                # Keep denormalised name consistent with the restored FK,
+                # even if a malformed backup segment carries a stale name.
+                segment.speaker_name = new_name_by_id[new_speaker_id]
+            else:
+                segment.speaker_id = None
                 segment.speaker_name = seg_data.get("speaker_name")
-                segment.is_misidentified = seg_data.get("is_misidentified", False)
-                segments_updated += 1
+                if old_speaker_id:
+                    segments_unmapped += 1
+            segment.is_misidentified = seg_data.get("is_misidentified", False)
+            segments_updated += 1
 
         db.commit()
 
@@ -561,20 +618,22 @@ async def restore_from_file(filename: str, db: Session = Depends(get_db)):
         try:
             from .api import get_engine
             get_engine().clear_speaker_cache()
-        except Exception:
+        except Exception:  # noqa: BLE001 - model/cache availability must not undo a committed restore
             logger.info("Speaker cache invalidation skipped after restore")
 
-        # Apply persisted settings only after the database restore succeeded,
-        # so a failed restore never also mutates runtime settings.
-        if "settings" in data:
-            config = get_config()
-            current = _tunable_settings(config.get_settings())
-            current.update({
-                k: v for k, v in data["settings"].items()
-                if k in VoiceSettings.model_fields
-            })
-            config.update_settings(current)
-            config.reload_settings()
+        # A JSON settings file and SQLite cannot share one transaction. The DB
+        # restore is already committed, so a later settings I/O failure must be
+        # reported as explicit partial success rather than a false 500.
+        settings_restored = True
+        settings_warning = None
+        if validated_settings is not None:
+            try:
+                get_config().update_settings(validated_settings.model_dump())
+                get_config().reload_settings()
+            except Exception as exc:
+                settings_restored = False
+                settings_warning = f"Database restored, but settings could not be persisted: {exc}"
+                logger.exception("Profile database restored but settings persistence failed")
 
         profile_name = data.get("name") or data.get("profile_name", "Unknown")
         return {
@@ -582,6 +641,10 @@ async def restore_from_file(filename: str, db: Session = Depends(get_db)):
             "speakers_restored": len(speaker_id_map),
             "segments_updated": segments_updated,
             "segments_unmapped": segments_unmapped,
+            "segments_remapped_by_name": segments_remapped_by_name,
+            "segments_not_found": segments_not_found,
+            "settings_restored": settings_restored,
+            "settings_warning": settings_warning,
         }
 
     try:
@@ -651,7 +714,7 @@ async def import_profile(file: UploadFile = File(...)):
         safe_name = sanitize_filename(profile_name)
         profile_file = _profile_path(safe_name)
         os.makedirs(_BACKUPS_DIR, exist_ok=True)
-        _dump_json(profile_file, data)
+        _dump_json(profile_file, data, allow_overwrite=False)
         return {
             "message": f"Profile '{profile_name}' imported successfully",
             "name": profile_name,
@@ -662,6 +725,8 @@ async def import_profile(file: UploadFile = File(...)):
 
     try:
         return await asyncio.to_thread(_work)
+    except HTTPException:
+        raise
     except Exception:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail="Import failed")

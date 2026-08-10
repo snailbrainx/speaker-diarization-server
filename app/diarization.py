@@ -189,8 +189,10 @@ class SpeakerRecognitionEngine:
         self.hf_token = hf_token or os.getenv("HF_TOKEN")
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        # Load configuration from environment
-        self.context_padding = float(os.getenv("CONTEXT_PADDING", "0.15"))
+        # ConfigManager already handles persisted values plus non-empty env
+        # overrides. Reading the raw Compose env here made CONTEXT_PADDING=""
+        # crash startup and ignored later Settings API updates.
+        self.context_padding = get_config().get_settings().context_padding
 
         # Initialize models (lazy loading). `_EMOTION_MODEL_FAILED` is a sentinel
         # so a one-time load failure (e.g. transient HF outage) doesn't cause every
@@ -274,7 +276,7 @@ class SpeakerRecognitionEngine:
             return
 
         # Get VRAM threshold from env (default: 12GB)
-        threshold_gb = float(os.getenv("CLEANUP_VRAM_THRESHOLD_GB", "12"))
+        threshold_gb = float(os.getenv("CLEANUP_VRAM_THRESHOLD_GB") or "12")
 
         # Check current VRAM usage (reserved = what nvidia-smi shows)
         vram_used_gb = torch.cuda.memory_reserved() / (1024**3)
@@ -649,7 +651,10 @@ class SpeakerRecognitionEngine:
             Segment embedding as numpy array
         """
         if context_padding is None:
-            context_padding = self.context_padding
+            # Read at use time so a Settings API update applies without
+            # reconstructing the heavyweight engine.
+            context_padding = get_config().get_settings().context_padding
+            self.context_padding = context_padding
 
         # Get actual audio duration to prevent out-of-bounds
         try:
@@ -709,6 +714,15 @@ class SpeakerRecognitionEngine:
                 logger.info(f"Could not extract embedding from {os.path.basename(seg['audio_file'])}: {e}")
                 embeddings.append(None)
         return embeddings
+
+    def _preload_emotion_audio(self, audio_file: str) -> Optional["AudioSegment"]:
+        """Decode/resample once only when emotion inference is available."""
+        if self.emotion_model is None:
+            return None
+        full_audio = AudioSegment.from_file(audio_file)
+        if full_audio.frame_rate != 16000:
+            full_audio = full_audio.set_frame_rate(16000)
+        return full_audio
 
     def extract_emotion(
         self,
@@ -1057,11 +1071,10 @@ class SpeakerRecognitionEngine:
 
             if preloaded_emotion_audio is None and not emotion_preload_failed:
                 try:
-                    _full = AudioSegment.from_file(audio_file)
-                    if _full.frame_rate != 16000:
-                        _full = _full.set_frame_rate(16000)
-                    preloaded_emotion_audio = _full
-                except Exception as e:
+                    preloaded_emotion_audio = self._preload_emotion_audio(audio_file)
+                    if preloaded_emotion_audio is None:
+                        emotion_preload_failed = True
+                except Exception as e:  # noqa: BLE001 - decoder/model failures use per-segment fallback
                     logger.info(f"Emotion preload failed ({e}); falling back to per-segment decode")
                     emotion_preload_failed = True
 

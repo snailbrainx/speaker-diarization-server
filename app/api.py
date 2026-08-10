@@ -145,7 +145,7 @@ async def enroll_speaker(
         # in-memory cache was loaded before this enrollment (OPUS-015).
         try:
             engine.add_speaker_to_cache(speaker.id, speaker.name, embedding)
-        except Exception:
+        except Exception:  # noqa: BLE001 - cache failures must fall back to a full reload
             engine.clear_speaker_cache()
 
         # Clear GPU cache after embedding extraction
@@ -212,13 +212,14 @@ async def delete_speaker(speaker_id: int, db: Session = Depends(get_db)):
     if not speaker:
         raise HTTPException(status_code=404, detail="Speaker not found")
 
-    # 1. Set speaker_id to NULL in segments (SQLite FK constraint is NO ACTION, not SET NULL)
-    # Also replace the now-dead speaker name: segments must not keep displaying
-    # a deleted speaker (GLM-012). Use "Unknown" (not "Unknown_XX") so the
-    # retroactive Unknown_* relabel logic can never re-match these segments.
+    # 1. Set speaker_id to NULL in segments (SQLite FK constraint is NO ACTION, not SET NULL).
+    # Preserve a non-active tombstone instead of erasing attribution history;
+    # it deliberately does not start with Unknown_ so retroactive relabelling
+    # cannot match it.
+    deleted_name = f"Deleted_{speaker.name}"
     db.query(ConversationSegment).filter(
         ConversationSegment.speaker_id == speaker_id
-    ).update({"speaker_id": None, "speaker_name": "Unknown"}, synchronize_session=False)
+    ).update({"speaker_id": None, "speaker_name": deleted_name}, synchronize_session=False)
 
     # 2. Delete emotion profiles
     db.query(SpeakerEmotionProfile).filter(

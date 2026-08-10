@@ -28,7 +28,7 @@ def load_known_speakers(db: Session) -> List[Tuple[int, str, Any]]:
     return [(s.id, s.name, s.get_embedding()) for s in speakers]
 
 
-def resolve_audio_path(conversation, segment=None) -> Optional[str]:
+def resolve_audio_path(conversation, segment=None) -> str | None:
     """
     Resolve the best audio file path for a segment.
     Prefers full conversation audio (where offsets are valid),
@@ -42,6 +42,18 @@ def resolve_audio_path(conversation, segment=None) -> Optional[str]:
     if segment and segment.segment_audio_path and os.path.exists(segment.segment_audio_path):
         return segment.segment_audio_path
     return None
+
+
+def uses_segment_audio_fallback(conversation, segment, audio_path: str | None) -> bool:
+    """Return whether ``audio_path`` is the per-chunk streaming WAV.
+
+    Segment offsets are conversation-relative. They are safe only with the full
+    conversation recording; using them against a VAD chunk silently extracts
+    the wrong tail of that file.
+    """
+    if not audio_path or not segment or not segment.segment_audio_path:
+        return False
+    return os.path.realpath(audio_path) == os.path.realpath(segment.segment_audio_path)
 
 
 def create_segment_from_result(
@@ -178,12 +190,18 @@ def recalculate_speaker_embedding(
             embeddings.append(stored)
         else:
             audio_path = resolve_audio_path(seg.conversation, seg)
-            if audio_path:
+            if audio_path and not uses_segment_audio_fallback(seg.conversation, seg, audio_path):
                 batch_segments.append({
                     'audio_file': audio_path,
                     'start_time': seg.start_offset,
                     'end_time': seg.end_offset
                 })
+            elif audio_path:
+                logger.warning(
+                    "Skipping speaker embedding re-extraction for segment %s: "
+                    "only chunk audio is available for conversation-relative offsets",
+                    seg.id,
+                )
 
     if batch_segments:
         extracted = engine.extract_segment_embeddings_batch(batch_segments)
@@ -231,13 +249,19 @@ def recalculate_emotion_profile(
             emotion_embeddings.append(stored_emb)
         else:
             audio_path = resolve_audio_path(seg.conversation, seg)
-            if audio_path:
+            if audio_path and not uses_segment_audio_fallback(seg.conversation, seg, audio_path):
                 try:
                     data = engine.extract_emotion(audio_path, seg.start_offset, seg.end_offset, extract_embedding=True)
                     if data and 'embedding' in data and not np.isnan(data['embedding']).any():
                         emotion_embeddings.append(data['embedding'])
                 except Exception as e:
                     logger.warning(f"Could not extract emotion embedding for segment {seg.id}: {e}")
+            elif audio_path:
+                logger.warning(
+                    "Skipping emotion re-extraction for segment %s: only chunk "
+                    "audio is available for conversation-relative offsets",
+                    seg.id,
+                )
 
         # Voice embedding
         voice_emb = seg.get_speaker_embedding()

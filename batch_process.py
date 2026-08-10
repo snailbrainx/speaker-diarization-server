@@ -18,15 +18,36 @@ import glob
 import signal
 import argparse
 import sqlite3
+import tempfile
 import multiprocessing as mp
 from multiprocessing import Process, Queue, Manager
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 
 # ---------------------------------------------------------------------------
 # Worker function - runs in a spawned child process
 # ---------------------------------------------------------------------------
+
+def _atomic_write(path, writer, *, encoding=None):
+    """Write a complete sibling tempfile, then atomically publish it."""
+    target_dir = os.path.dirname(path) or "."
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=os.path.basename(path) + ".",
+        suffix=".tmp",
+        dir=target_dir,
+        text=True,
+    )
+    try:
+        with os.fdopen(fd, "w", encoding=encoding) as stream:
+            writer(stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp_path, path)
+    except BaseException:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        raise
 
 def worker_main(gpu_id, file_queue, result_queue, known_speakers_raw,
                 input_dir, output_dir, threshold, script_dir):
@@ -85,7 +106,6 @@ def worker_main(gpu_id, file_queue, result_queue, known_speakers_raw,
     import numpy as np
     import traceback
     from pydub import AudioSegment as PydubSegment
-    import tempfile
 
     gpu_name = "CPU"
     total_vram_gb = 0
@@ -241,18 +261,30 @@ def worker_main(gpu_id, file_queue, result_queue, known_speakers_raw,
                     ]
                 json_result["segments"].append(seg_data)
 
-            with open(json_path + ".tmp", "w") as f:
-                json.dump(json_result, f, indent=2, default=str)
-            os.replace(json_path + ".tmp", json_path)
+            # Publish the human-readable transcript first. JSON is the resume
+            # completion marker and therefore MUST be published last; a crash
+            # before JSON causes the next run to regenerate both artifacts.
+            def _write_transcript(
+                stream,
+                *,
+                source_path=file_path,
+                source_duration=duration_sec,
+                source_result=result,
+                source_gpu=gpu_id,
+            ):
+                stream.write(f"# Transcript: {os.path.basename(source_path)}\n")
+                stream.write(
+                    f"# Duration: {source_duration:.1f}s | "
+                    f"Speakers: {source_result['num_speakers']} | "
+                    f"Segments: {len(source_result['segments'])}\n"
+                )
+                stream.write(
+                    f"# Processed: {datetime.now(timezone.utc).isoformat()} | "
+                    f"GPU: {source_gpu}\n"
+                )
+                stream.write(f"# Source: {source_path}\n\n")
 
-            # Write human-readable transcript
-            with open(txt_path, "w", encoding="utf-8") as f:
-                f.write(f"# Transcript: {os.path.basename(file_path)}\n")
-                f.write(f"# Duration: {duration_sec:.1f}s | Speakers: {result['num_speakers']} | Segments: {len(result['segments'])}\n")
-                f.write(f"# Processed: {datetime.now().isoformat()} | GPU: {gpu_id}\n")
-                f.write(f"# Source: {file_path}\n\n")
-
-                for seg in result["segments"]:
+                for seg in source_result["segments"]:
                     start = seg["start"]
                     end = seg["end"]
                     speaker = seg.get("speaker", "Unknown")
@@ -261,7 +293,18 @@ def worker_main(gpu_id, file_queue, result_queue, known_speakers_raw,
 
                     ts = f"[{int(start//60):02d}:{start%60:05.2f} -> {int(end//60):02d}:{end%60:05.2f}]"
                     emotion_tag = f" ({emotion})" if emotion else ""
-                    f.write(f"{ts} {speaker}{emotion_tag}: {text}\n")
+                    stream.write(f"{ts} {speaker}{emotion_tag}: {text}\n")
+
+            _atomic_write(txt_path, _write_transcript, encoding="utf-8")
+
+            def _write_json(stream, payload=json_result):
+                json.dump(payload, stream, indent=2, default=str)
+
+            _atomic_write(
+                json_path,
+                _write_json,
+                encoding="utf-8",
+            )
 
             files_processed += 1
 
