@@ -6,7 +6,9 @@ concurrency. After the fix: stop_recording blocks until handlers complete, and
 num_segments increments are atomic SQL updates.
 """
 import asyncio
+import os
 import threading
+import wave
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
@@ -285,8 +287,12 @@ class TestStopRecordingWaitsForAsyncHandlers:
         db.close()
         engine_db.dispose()
 
-    def test_concatenation_failure_is_not_reported_as_success(
-        self, tmp_path, monkeypatch
+    @pytest.mark.parametrize(
+        ("concat_status", "expect_audio"),
+        [("failed", False), ("partial", True)],
+    )
+    def test_concatenation_error_is_not_reported_as_success(
+        self, tmp_path, monkeypatch, concat_status, expect_audio
     ):
         from sqlalchemy import create_engine
         from sqlalchemy.orm import sessionmaker
@@ -311,7 +317,11 @@ class TestStopRecordingWaitsForAsyncHandlers:
         db.commit()
         conversation_id = conversation.id
 
-        class FailedRecorder:
+        published_path = tmp_path / "partial.wav"
+        if expect_audio:
+            published_path.write_bytes(b"partial audio")
+
+        class ResultRecorder:
             def stop_recording(self):
                 return None
 
@@ -319,7 +329,11 @@ class TestStopRecordingWaitsForAsyncHandlers:
                 return {"segments_failed": 0}
 
             def concatenate_segments(self):
-                return ConcatenationResult(status="failed", error="disk full")
+                return ConcatenationResult(
+                    status=concat_status,
+                    path=str(published_path) if expect_audio else None,
+                    error="one or more segment inputs were unavailable",
+                )
 
         class Socket:
             client_state = streaming_websocket.WebSocketState.CONNECTED
@@ -339,7 +353,7 @@ class TestStopRecordingWaitsForAsyncHandlers:
         asyncio.run(streaming_websocket._finalize_recording(
             conversation_id,
             token,
-            FailedRecorder(),
+            ResultRecorder(),  # type: ignore[arg-type]
             conversation,
             db,
             socket,
@@ -347,11 +361,14 @@ class TestStopRecordingWaitsForAsyncHandlers:
         db.expire_all()
         stored = db.query(Conversation).filter_by(id=conversation_id).one()
         assert stored.status == "completed_with_errors"
-        assert stored.audio_path is None
+        assert (stored.audio_path is not None) is expect_audio
         assert stored.processing_token is None
         completed = [m for m in socket.messages if m["type"] == "completed"]
-        assert completed[0]["data"]["concatenation_status"] == "failed"
-        assert "failed" in completed[0]["data"]["message"]
+        assert completed[0]["data"]["concatenation_status"] == concat_status
+        if concat_status == "failed":
+            assert "failed" in completed[0]["data"]["message"]
+        else:
+            assert "readable segments" in completed[0]["data"]["message"]
         db.close()
         engine_db.dispose()
 
@@ -403,6 +420,108 @@ class TestRecorderHardening:
         stats = recorder.get_stats()
         assert stats["buffered_samples"] == sum(len(chunk) for chunk in recorder.current_buffer)
         assert stats["buffered_samples"] == 0
+        recorder.cleanup()
+
+    @staticmethod
+    def _write_wav(
+        path,
+        *,
+        channels=1,
+        sample_width=2,
+        sample_rate=16000,
+        frames=1600,
+    ):
+        with wave.open(str(path), "wb") as wav_file:
+            wav_file.setnchannels(channels)
+            wav_file.setsampwidth(sample_width)
+            wav_file.setframerate(sample_rate)
+            wav_file.writeframes(b"\x00" * frames * channels * sample_width)
+
+    def test_no_expected_inputs_is_empty(self):
+        recorder = StreamingRecorder(max_workers=1, sample_rate=16000)
+        recorder.conversation_id = 22
+        result = recorder.concatenate_segments()
+        assert result.status == "empty"
+        assert result.path is None
+        recorder.cleanup()
+
+    def test_all_valid_inputs_publish_success(self, tmp_path):
+        first = tmp_path / "first.wav"
+        second = tmp_path / "second.wav"
+        self._write_wav(first, frames=800)
+        self._write_wav(second, frames=1200)
+
+        recorder = StreamingRecorder(max_workers=1, sample_rate=16000)
+        recorder.conversation_id = 23
+        recorder.segment_paths = [str(first), str(second)]
+        result = recorder.concatenate_segments()
+
+        assert result.status == "success"
+        assert result.path is not None
+        with wave.open(result.path, "rb") as published:
+            assert published.getnframes() == 2000
+        recorder.cleanup()
+
+    @pytest.mark.parametrize("bad_kind", ["missing", "corrupt", "empty", "incompatible"])
+    def test_bad_input_publishes_partial_not_success(self, tmp_path, bad_kind):
+        valid = tmp_path / "valid.wav"
+        bad = tmp_path / f"{bad_kind}.wav"
+        self._write_wav(valid)
+        if bad_kind == "corrupt":
+            bad.write_bytes(b"not a WAV file")
+        elif bad_kind == "empty":
+            self._write_wav(bad, frames=0)
+        elif bad_kind == "incompatible":
+            self._write_wav(bad, channels=2)
+
+        recorder = StreamingRecorder(max_workers=1, sample_rate=16000)
+        recorder.conversation_id = 24
+        recorder.segment_paths = [str(valid), str(bad)]
+        result = recorder.concatenate_segments()
+
+        assert result.status == "partial"
+        assert result.path is not None
+        assert os.path.exists(result.path)
+        assert "1 of 2" in (result.error or "")
+        recorder.cleanup()
+
+    def test_no_readable_inputs_fails_without_publication(self, tmp_path):
+        corrupt = tmp_path / "corrupt.wav"
+        corrupt.write_bytes(b"not a WAV file")
+
+        recorder = StreamingRecorder(max_workers=1, sample_rate=16000)
+        recorder.conversation_id = 25
+        recorder.segment_paths = [str(tmp_path / "missing.wav"), str(corrupt)]
+        result = recorder.concatenate_segments()
+
+        assert result.status == "failed"
+        assert result.path is None
+        assert not (tmp_path / "recordings" / "conv_25_full.wav").exists()
+        recorder.cleanup()
+
+    def test_publication_failure_preserves_previous_output(
+        self, tmp_path, monkeypatch
+    ):
+        valid = tmp_path / "valid.wav"
+        self._write_wav(valid)
+        output = tmp_path / "recordings" / "conv_26_full.wav"
+        output.parent.mkdir(parents=True)
+        output.write_bytes(b"previous complete output")
+
+        recorder = StreamingRecorder(max_workers=1, sample_rate=16000)
+        recorder.conversation_id = 26
+        recorder.segment_paths = [str(valid)]
+
+        def fail_replace(_source, _destination):
+            raise OSError("injected publication failure")
+
+        monkeypatch.setattr(os, "replace", fail_replace)
+        result = recorder.concatenate_segments()
+
+        assert result.status == "failed"
+        assert result.path is None
+        assert output.read_bytes() == b"previous complete output"
+        assert list(output.parent.glob(".conv_26_full.*.tmp.wav")) == []
         recorder.cleanup()
 
     def test_configured_buffer_cap_reaches_runtime(self, monkeypatch):

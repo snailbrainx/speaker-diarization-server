@@ -8,6 +8,7 @@ import threading
 import time
 import wave
 from concurrent.futures import ThreadPoolExecutor, wait as futures_wait
+from contextlib import ExitStack
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Callable, Dict, List, Literal, Optional
@@ -21,7 +22,7 @@ logger = logging.getLogger(__name__)
 class ConcatenationResult:
     """Unambiguous outcome for publication of the full recording."""
 
-    status: Literal["success", "empty", "failed"]
+    status: Literal["success", "empty", "partial", "failed"]
     path: Optional[str] = None
     error: Optional[str] = None
 
@@ -372,26 +373,57 @@ class StreamingRecorder:
 
             out_wf = None
             total_frames = 0
-            try:
+            readable_segments = 0
+            input_errors = []
+            output_format = None
+            with ExitStack() as output_stack:
                 for seg_path in self.segment_paths:
                     if not os.path.exists(seg_path):
                         logger.info(f"⚠️ Segment not found: {seg_path}")
+                        input_errors.append(f"missing: {seg_path}")
                         continue
 
-                    with wave.open(seg_path, "rb") as in_wf:
-                        if out_wf is None:
-                            out_wf = wave.open(temp_output_path, "wb")
-                            out_wf.setnchannels(in_wf.getnchannels())
-                            out_wf.setsampwidth(in_wf.getsampwidth())
-                            out_wf.setframerate(in_wf.getframerate())
-                            sample_rate = in_wf.getframerate()
+                    try:
+                        with wave.open(seg_path, "rb") as in_wf:
+                            frame_count = in_wf.getnframes()
+                            if frame_count <= 0:
+                                input_errors.append(f"empty: {seg_path}")
+                                continue
 
-                        frames = in_wf.readframes(in_wf.getnframes())
-                        out_wf.writeframes(frames)
-                        total_frames += in_wf.getnframes()
-            finally:
-                if out_wf is not None:
-                    out_wf.close()
+                            segment_format = (
+                                in_wf.getnchannels(),
+                                in_wf.getsampwidth(),
+                                in_wf.getframerate(),
+                            )
+                            frames = in_wf.readframes(frame_count)
+                            expected_bytes = (
+                                frame_count * segment_format[0] * segment_format[1]
+                            )
+                            if len(frames) != expected_bytes:
+                                input_errors.append(f"truncated: {seg_path}")
+                                continue
+
+                            if output_format is None:
+                                output_format = segment_format
+                                out_wf = output_stack.enter_context(
+                                    wave.open(temp_output_path, "wb")
+                                )
+                                out_wf.setnchannels(segment_format[0])
+                                out_wf.setsampwidth(segment_format[1])
+                                out_wf.setframerate(segment_format[2])
+                                sample_rate = segment_format[2]
+                            elif segment_format != output_format:
+                                input_errors.append(f"incompatible format: {seg_path}")
+                                continue
+
+                            if out_wf is None:
+                                raise RuntimeError("concatenation output was not initialised")
+                            out_wf.writeframes(frames)
+                            total_frames += frame_count
+                            readable_segments += 1
+                    except (OSError, EOFError, wave.Error) as exc:
+                        logger.error("Unreadable segment %s: %s", seg_path, exc)
+                        input_errors.append(f"unreadable: {seg_path}")
 
             if total_frames == 0:
                 # segment_paths was non-empty, so this is not an ordinary
@@ -409,6 +441,17 @@ class StreamingRecorder:
             os.replace(temp_output_path, output_path)
             temp_output_path = None
             logger.info(f"✅ Concatenated conversation saved: {output_path} ({duration:.1f}s)")
+            if input_errors or readable_segments != len(self.segment_paths):
+                error = (
+                    f"Published {readable_segments} of {len(self.segment_paths)} "
+                    "expected segment files"
+                )
+                logger.error("Partial concatenation: %s", error)
+                return ConcatenationResult(
+                    status="partial",
+                    path=output_path,
+                    error=error,
+                )
             return ConcatenationResult(status="success", path=output_path)
 
         except Exception as e:

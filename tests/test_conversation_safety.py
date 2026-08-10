@@ -101,6 +101,7 @@ def test_completed_conversation_delete_removes_segment_directory(
     )
     conversation_id = conversation.id
     monkeypatch.setattr(services, "data_path", lambda: str(tmp_path))
+    monkeypatch.setattr(conversation_api, "data_path", lambda: str(tmp_path))
     seg_dir = tmp_path / "stream_segments" / f"conv_{conversation_id}"
     seg_dir.mkdir(parents=True)
     (seg_dir / "seg_0001.wav").write_bytes(b"audio")
@@ -109,6 +110,75 @@ def test_completed_conversation_delete_removes_segment_directory(
     assert "deleted" in result["message"]
     assert not seg_dir.exists()
     assert db_session.query(Conversation).filter_by(id=conversation_id).first() is None
+
+
+def test_delete_cleans_before_numeric_id_can_be_reused(
+    db_session, tmp_path, monkeypatch
+):
+    from sqlalchemy.exc import IntegrityError
+    from sqlalchemy.orm import sessionmaker
+
+    from app import conversation_api
+
+    shared_audio = tmp_path / "recordings" / "conv_reused_full.wav"
+    shared_audio.parent.mkdir(parents=True)
+    shared_audio.write_bytes(b"old conversation audio")
+    conversation = Conversation(
+        title="old conversation",
+        start_time=datetime.now(timezone.utc),
+        status="completed",
+        audio_path=str(shared_audio),
+    )
+    db_session.add(conversation)
+    db_session.commit()
+    conversation_id = conversation.id
+
+    Session = sessionmaker(bind=db_session.get_bind())
+    original_remove = conversation_api.os.remove
+    inserted_during_cleanup = []
+
+    def remove_with_id_reuse_probe(path):
+        if str(path) == str(shared_audio) and not inserted_during_cleanup:
+            probe_db = Session()
+            try:
+                replacement = Conversation(
+                    id=conversation_id,
+                    title="replacement conversation",
+                    start_time=datetime.now(timezone.utc),
+                    status="completed",
+                    audio_path=str(shared_audio),
+                )
+                probe_db.add(replacement)
+                try:
+                    probe_db.commit()
+                except IntegrityError:
+                    probe_db.rollback()
+                    inserted_during_cleanup.append(False)
+                else:
+                    inserted_during_cleanup.append(True)
+                    shared_audio.write_bytes(b"new conversation audio")
+            finally:
+                probe_db.close()
+        original_remove(path)
+
+    monkeypatch.setattr(conversation_api.os, "remove", remove_with_id_reuse_probe)
+    monkeypatch.setattr(conversation_api, "data_path", lambda: str(tmp_path))
+
+    asyncio.run(conversation_api.delete_conversation(conversation_id, db_session))
+    assert inserted_during_cleanup == [False]
+
+    replacement = Conversation(
+        id=conversation_id,
+        title="replacement after cleanup",
+        start_time=datetime.now(timezone.utc),
+        status="completed",
+        audio_path=str(shared_audio),
+    )
+    db_session.add(replacement)
+    db_session.commit()
+    shared_audio.write_bytes(b"replacement survives")
+    assert shared_audio.exists()
+    assert db_session.query(Conversation).filter_by(id=conversation_id).one().id == conversation_id
 
 
 def test_public_status_mutation_is_forbidden_and_token_still_blocks_delete(

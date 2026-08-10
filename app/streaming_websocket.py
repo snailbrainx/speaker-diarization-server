@@ -517,8 +517,8 @@ async def _finalize_recording(
             db.rollback()
             return
 
-        concatenation_failed = concatenation.status == "failed"
-        if concatenation.status == "success":
+        concatenation_failed = concatenation.status in {"partial", "failed"}
+        if concatenation.status in {"success", "partial"}:
             if concatenation.path and os.path.exists(concatenation.path):
                 # Keep WAV (avoids pyannote's MP3 boundary inaccuracies).
                 conversation.audio_path = concatenation.path
@@ -548,7 +548,11 @@ async def _finalize_recording(
         # Commits token revocation and all final metadata atomically.
         db.commit()
 
-        if concatenation_failed:
+        if concatenation.status == "partial":
+            completion_message = (
+                "Recording completed, but full audio contains only readable segments"
+            )
+        elif concatenation_failed:
             completion_message = "Recording completed, but full audio publication failed"
         elif segment_errors:
             completion_message = "Recording completed with segment-processing errors"

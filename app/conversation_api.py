@@ -46,6 +46,36 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/conversations", tags=["Conversations"])
 
 
+def _cleanup_conversation_files(
+    conversation_id: int,
+    audio_path: str | None,
+) -> list[str]:
+    """Best-effort cleanup while the database row still owns its numeric ID."""
+    cleanup_warnings = []
+    if audio_path and os.path.exists(audio_path):
+        try:
+            os.remove(audio_path)
+        except OSError as exc:
+            cleanup_warnings.append(f"audio cleanup failed: {exc}")
+
+    try:
+        seg_dir = os.path.join(
+            data_path(), "stream_segments", f"conv_{conversation_id}"
+        )
+        if os.path.isdir(seg_dir):
+            import shutil as _shutil
+
+            _shutil.rmtree(seg_dir)
+    except OSError as exc:
+        logger.info(
+            "Could not remove stream segment dir for conversation %s",
+            conversation_id,
+        )
+        cleanup_warnings.append(f"segment cleanup failed: {exc}")
+
+    return cleanup_warnings
+
+
 @router.get("", response_model=ConversationsListResponse)
 async def list_conversations(
     skip: int = 0,
@@ -150,39 +180,40 @@ async def delete_conversation(conversation_id: int, db: Session = Depends(get_db
         raise HTTPException(status_code=409, detail="Conversation became active")
     db.commit()
 
+    # Clean while the leased row still exists. SQLite can reuse an integer
+    # primary key immediately after DELETE; post-commit cleanup could otherwise
+    # delete files created by a new conversation that inherited the same ID.
+    cleanup_warnings = _cleanup_conversation_files(conversation_id, audio_path)
+
     # Bulk DELETE bypasses ORM relationship cascades, so remove child rows in
     # the same deletion-lease transaction before the conversation itself.
-    db.query(ConversationSegment).filter(
-        ConversationSegment.conversation_id == conversation_id
-    ).delete(synchronize_session=False)
-    deleted = db.query(Conversation).filter(
-        Conversation.id == conversation_id,
-        Conversation.processing_token == delete_token,
-    ).delete(synchronize_session=False)
-    if deleted != 1:
-        db.rollback()
-        raise HTTPException(status_code=409, detail="Conversation deletion lease lost")
-    db.commit()
-
-    cleanup_warnings = []
-    if audio_path and os.path.exists(audio_path):
-        try:
-            os.remove(audio_path)
-        except OSError as exc:
-            cleanup_warnings.append(f"audio cleanup failed: {exc}")
-
-    # Delete streaming segment WAVs (OPUS-013/QWEN-012): these are never
-    # removed otherwise and accumulate unboundedly under
-    # data/stream_segments/conv_<id>/.
     try:
-        from .services import data_path as _data_path
-        seg_dir = os.path.join(_data_path(), "stream_segments", f"conv_{conversation_id}")
-        if os.path.isdir(seg_dir):
-            import shutil as _shutil
-            _shutil.rmtree(seg_dir)
-    except (ImportError, OSError) as exc:
-        logger.info(f"Could not remove stream segment dir for conversation {conversation_id}")
-        cleanup_warnings.append(f"segment cleanup failed: {exc}")
+        db.query(ConversationSegment).filter(
+            ConversationSegment.conversation_id == conversation_id
+        ).delete(synchronize_session=False)
+        deleted = db.query(Conversation).filter(
+            Conversation.id == conversation_id,
+            Conversation.processing_token == delete_token,
+        ).delete(synchronize_session=False)
+        if deleted != 1:
+            raise HTTPException(
+                status_code=409,
+                detail="Conversation deletion lease lost",
+            )
+        db.commit()
+    except Exception:
+        db.rollback()
+        # Cleanup may already have removed files, so leave an explicit failed
+        # tombstone rather than reviving the row as apparently completed.
+        db.query(Conversation).filter(
+            Conversation.id == conversation_id,
+            Conversation.processing_token == delete_token,
+        ).update(
+            {"processing_token": None, "status": "failed"},
+            synchronize_session=False,
+        )
+        db.commit()
+        raise
 
     return {
         "message": f"Conversation {conversation_id} deleted",
