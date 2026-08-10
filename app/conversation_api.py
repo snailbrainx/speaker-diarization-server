@@ -5,7 +5,6 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 from typing import Optional
-from datetime import datetime
 import asyncio
 import json
 import os
@@ -22,6 +21,13 @@ from .schemas import (
 from .diarization import SpeakerRecognitionEngine
 from .api import get_engine
 from .config import get_config
+from .conversation_lifecycle import (
+    ACTIVE_CONVERSATION_STATUSES,
+    acquire_processing_lease,
+    fail_processing_lease,
+    finish_processing_lease,
+    new_processing_token,
+)
 from .services import (
     cleanup_orphaned_unknowns,
     create_segment_from_result,
@@ -99,8 +105,6 @@ async def update_conversation(
 
     if update_data.title is not None:
         conversation.title = update_data.title
-    if update_data.status is not None:
-        conversation.status = update_data.status
 
     db.commit()
     db.refresh(conversation)
@@ -109,7 +113,7 @@ async def update_conversation(
 
 @router.delete("/{conversation_id}")
 async def delete_conversation(conversation_id: int, db: Session = Depends(get_db)):
-    """Delete conversation and associated audio"""
+    """Delete an idle conversation under an authoritative internal lease."""
     conversation = db.query(Conversation).filter(
         Conversation.id == conversation_id
     ).first()
@@ -117,15 +121,55 @@ async def delete_conversation(conversation_id: int, db: Session = Depends(get_db
     if not conversation:
         raise HTTPException(status_code=404, detail="Conversation not found")
 
-    if conversation.status in {"recording", "processing"}:
+    if (
+        conversation.processing_token is not None
+        or conversation.status in ACTIVE_CONVERSATION_STATUSES
+    ):
         raise HTTPException(
             status_code=409,
             detail="Cannot delete an active conversation; stop/finalize it first",
         )
 
-    # Delete audio file
-    if conversation.audio_path and os.path.exists(conversation.audio_path):
-        os.remove(conversation.audio_path)
+    previous_status = conversation.status
+    audio_path = conversation.audio_path
+    delete_token = new_processing_token()
+
+    # Close the query/delete race: once this conditional UPDATE commits, no
+    # worker can acquire the row and DELETE no longer trusts presentation text.
+    db.rollback()
+    claimed = db.query(Conversation).filter(
+        Conversation.id == conversation_id,
+        Conversation.processing_token.is_(None),
+        Conversation.status == previous_status,
+    ).update(
+        {"processing_token": delete_token, "status": "deleting"},
+        synchronize_session=False,
+    )
+    if claimed != 1:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Conversation became active")
+    db.commit()
+
+    # Bulk DELETE bypasses ORM relationship cascades, so remove child rows in
+    # the same deletion-lease transaction before the conversation itself.
+    db.query(ConversationSegment).filter(
+        ConversationSegment.conversation_id == conversation_id
+    ).delete(synchronize_session=False)
+    deleted = db.query(Conversation).filter(
+        Conversation.id == conversation_id,
+        Conversation.processing_token == delete_token,
+    ).delete(synchronize_session=False)
+    if deleted != 1:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Conversation deletion lease lost")
+    db.commit()
+
+    cleanup_warnings = []
+    if audio_path and os.path.exists(audio_path):
+        try:
+            os.remove(audio_path)
+        except OSError as exc:
+            cleanup_warnings.append(f"audio cleanup failed: {exc}")
 
     # Delete streaming segment WAVs (OPUS-013/QWEN-012): these are never
     # removed otherwise and accumulate unboundedly under
@@ -135,14 +179,15 @@ async def delete_conversation(conversation_id: int, db: Session = Depends(get_db
         seg_dir = os.path.join(_data_path(), "stream_segments", f"conv_{conversation_id}")
         if os.path.isdir(seg_dir):
             import shutil as _shutil
-            _shutil.rmtree(seg_dir, ignore_errors=True)
-    except (ImportError, OSError):
+            _shutil.rmtree(seg_dir)
+    except (ImportError, OSError) as exc:
         logger.info(f"Could not remove stream segment dir for conversation {conversation_id}")
+        cleanup_warnings.append(f"segment cleanup failed: {exc}")
 
-    db.delete(conversation)
-    db.commit()
-
-    return {"message": f"Conversation {conversation_id} deleted"}
+    return {
+        "message": f"Conversation {conversation_id} deleted",
+        "cleanup_warnings": cleanup_warnings,
+    }
 
 
 @router.post("/{conversation_id}/reprocess")
@@ -151,65 +196,84 @@ async def reprocess_conversation(
     db: Session = Depends(get_db),
     engine: SpeakerRecognitionEngine = Depends(get_engine)
 ):
-    """Re-process conversation with current speaker profiles (works with MP3)"""
+    """Re-process an idle conversation under an internal operation lease."""
     conversation = db.query(Conversation).filter(
         Conversation.id == conversation_id
     ).first()
 
     if not conversation:
         raise HTTPException(status_code=404, detail="Conversation not found")
-
     if not conversation.audio_path or not os.path.exists(conversation.audio_path):
         raise HTTPException(status_code=404, detail="Audio file not found")
+    if (
+        conversation.processing_token is not None
+        or conversation.status in ACTIVE_CONVERSATION_STATUSES
+    ):
+        raise HTTPException(status_code=409, detail="Conversation is already active")
 
-    known_speakers = load_known_speakers(db)
-
-    # Get threshold from config (consistent with all other endpoints)
-    config = get_config()
-    settings = config.get_settings()
-    threshold = settings.speaker_threshold
-    result = await asyncio.to_thread(
-        engine.transcribe_with_diarization,
-        conversation.audio_path,
-        known_speakers,
-        threshold=threshold,
-        db_session=db  # Enable personalized emotion matching
+    previous_status = conversation.status
+    processing_token = acquire_processing_lease(
+        db,
+        conversation_id,
+        allowed_statuses={previous_status},
     )
+    if processing_token is None:
+        raise HTTPException(status_code=409, detail="Conversation became active")
 
-    # Delete old segments (synchronize_session=False avoids FK constraint issues)
-    db.query(ConversationSegment).filter(
-        ConversationSegment.conversation_id == conversation_id
-    ).delete(synchronize_session=False)
-
-    # Create new segments
-    conv_start = conversation.start_time
-
-    for seg in result["segments"]:
-        create_segment_from_result(
-            seg, conversation_id, conv_start, db, threshold
+    try:
+        conversation = db.query(Conversation).filter(
+            Conversation.id == conversation_id
+        ).one()
+        audio_path = conversation.audio_path
+        conv_start = conversation.start_time
+        known_speakers = load_known_speakers(db)
+        threshold = get_config().get_settings().speaker_threshold
+        result = await asyncio.to_thread(
+            engine.transcribe_with_diarization,
+            audio_path,
+            known_speakers,
+            threshold=threshold,
+            db_session=db,
         )
 
-    # Update conversation stats
-    conversation.status = "completed"
-    conversation.num_segments = len(result["segments"])
-    conversation.num_speakers = result["num_speakers"]
+        db.query(ConversationSegment).filter(
+            ConversationSegment.conversation_id == conversation_id
+        ).delete(synchronize_session=False)
 
-    db.commit()
+        for seg in result["segments"]:
+            create_segment_from_result(
+                seg, conversation_id, conv_start, db, threshold
+            )
 
-    # Clean up Unknown_* speakers that lost all their segments during
-    # reprocessing (the old segments were deleted above). The initial
-    # processing path does this via the identify flow; reprocess did not.
-    deleted_unknowns = cleanup_orphaned_unknowns(db, engine=engine)
-    if deleted_unknowns:
-        logger.info(f"🗑️ Auto-deleted orphaned speakers after reprocess: {deleted_unknowns}")
-        db.commit()
+        conversation.num_segments = len(result["segments"])
+        conversation.num_speakers = result["num_speakers"]
 
-    db.commit()
+        deleted_unknowns = cleanup_orphaned_unknowns(db, engine=engine)
+        if deleted_unknowns:
+            logger.info(
+                f"🗑️ Auto-deleted orphaned speakers after reprocess: {deleted_unknowns}"
+            )
 
-    # Clear GPU cache after reprocessing
-    engine.clear_gpu_cache()
+        if not finish_processing_lease(
+            db,
+            conversation_id,
+            processing_token,
+            status="completed",
+        ):
+            raise HTTPException(status_code=409, detail="Reprocessing lease lost")
 
-    return {"message": "Conversation reprocessed", "segments": len(result["segments"])}
+        try:
+            engine.clear_gpu_cache()
+        except Exception as exc:  # noqa: BLE001 - cleanup is non-authoritative
+            logger.warning("GPU cleanup after reprocessing failed: %s", exc)
+
+        return {
+            "message": "Conversation reprocessed",
+            "segments": len(result["segments"]),
+        }
+    except Exception:
+        fail_processing_lease(db, conversation_id, processing_token)
+        raise
 
 
 @router.post("/{conversation_id}/recalculate-emotions")
@@ -218,111 +282,146 @@ async def recalculate_emotions(
     db: Session = Depends(get_db),
     engine: SpeakerRecognitionEngine = Depends(get_engine)
 ):
-    """
-    Recalculate emotions for all segments using current emotion profiles
-    WITHOUT re-running diarization or transcription (preserves manual work)
-    """
+    """Recalculate emotions with one decode and an internal operation lease."""
     conversation = db.query(Conversation).filter(
         Conversation.id == conversation_id
     ).first()
-
     if not conversation:
         raise HTTPException(status_code=404, detail="Conversation not found")
-
     if not conversation.audio_path or not os.path.exists(conversation.audio_path):
         raise HTTPException(status_code=404, detail="Audio file not found")
+    if (
+        conversation.processing_token is not None
+        or conversation.status in ACTIVE_CONVERSATION_STATUSES
+    ):
+        raise HTTPException(status_code=409, detail="Conversation is already active")
 
-    # Get all segments for this conversation
-    segments = db.query(ConversationSegment).filter(
-        ConversationSegment.conversation_id == conversation_id
-    ).all()
-
-    # Preload speakers referenced by these segments (avoids a per-segment query)
-    speaker_ids = {s.speaker_id for s in segments if s.speaker_id}
-    speakers_by_id = (
-        {sp.id: sp for sp in db.query(Speaker).filter(Speaker.id.in_(speaker_ids)).all()}
-        if speaker_ids else {}
+    previous_status = conversation.status
+    processing_token = acquire_processing_lease(
+        db,
+        conversation_id,
+        allowed_statuses={previous_status},
     )
+    if processing_token is None:
+        raise HTTPException(status_code=409, detail="Conversation became active")
 
-    updated_count = 0
-    skipped_count = 0
-    audio_file = conversation.audio_path
+    try:
+        conversation = db.query(Conversation).filter(
+            Conversation.id == conversation_id
+        ).one()
+        audio_file = conversation.audio_path
+        segments = db.query(ConversationSegment).filter(
+            ConversationSegment.conversation_id == conversation_id
+        ).all()
 
-    for segment in segments:
-        # Skip if no speaker or manually corrected (respect user corrections)
-        if not segment.speaker_id or segment.emotion_corrected:
-            skipped_count += 1
-            continue
+        speaker_ids = {segment.speaker_id for segment in segments if segment.speaker_id}
+        speakers_by_id = (
+            {
+                speaker.id: speaker
+                for speaker in db.query(Speaker).filter(
+                    Speaker.id.in_(speaker_ids)
+                ).all()
+            }
+            if speaker_ids else {}
+        )
 
-        try:
-            # Re-extract emotion with personalized matching (off the event loop)
-            emotion_data = await asyncio.to_thread(
-                engine.extract_emotion,
+        # Decode and resample the conversation exactly once, but only when at
+        # least one segment is eligible for emotion work. Every eligible
+        # segment slices this shared AudioSegment rather than reopening the
+        # full file.
+        needs_emotion_audio = any(
+            segment.speaker_id and not segment.emotion_corrected
+            for segment in segments
+        )
+        preloaded_audio = None
+        if needs_emotion_audio:
+            preloaded_audio = await asyncio.to_thread(
+                engine.preload_emotion_audio,
                 audio_file,
-                segment.start_offset,
-                segment.end_offset,
-                extract_embedding=True,
             )
 
-            if not emotion_data:
+        updated_count = 0
+        skipped_count = 0
+        for segment in segments:
+            if not segment.speaker_id or segment.emotion_corrected:
                 skipped_count += 1
                 continue
 
-            speaker = speakers_by_id.get(segment.speaker_id)
+            try:
+                emotion_data = await asyncio.to_thread(
+                    engine.extract_emotion,
+                    audio_file,
+                    segment.start_offset,
+                    segment.end_offset,
+                    extract_embedding=True,
+                    preloaded_audio=preloaded_audio,
+                )
+                if not emotion_data:
+                    skipped_count += 1
+                    continue
 
-            if speaker and speaker.emotion_profiles:
-                # Use dual-detector matching if profiles exist
-                voice_emb = segment.get_speaker_embedding()
-                emotion_emb = emotion_data.get('embedding')
-
-                if voice_emb is not None and emotion_emb is not None:
-                
-                    global_threshold = get_config().get_settings().emotion_threshold
-
-                    dual_result = engine.match_emotion_dual_detector(
-                        emotion_embedding=emotion_emb,
-                        voice_embedding=voice_emb,
-                        speaker_emotion_profiles=speaker.emotion_profiles,
-                        global_threshold=global_threshold,
-                        speaker_threshold=speaker.emotion_threshold,
-                        generic_emotion=emotion_data['emotion_category'],
-                        generic_confidence=emotion_data['emotion_confidence']
-                    )
-
-                    # Update segment with final decision
-                    final = dual_result['final_decision']
-                    segment.emotion_category = final['emotion']
-                    segment.emotion_confidence = final['confidence']
-                    segment.detector_breakdown = json.dumps(dual_result)  # Store breakdown for clients
-                    updated_count += 1
+                speaker = speakers_by_id.get(segment.speaker_id)
+                if speaker and speaker.emotion_profiles:
+                    voice_emb = segment.get_speaker_embedding()
+                    emotion_emb = emotion_data.get("embedding")
+                    if voice_emb is not None and emotion_emb is not None:
+                        dual_result = engine.match_emotion_dual_detector(
+                            emotion_embedding=emotion_emb,
+                            voice_embedding=voice_emb,
+                            speaker_emotion_profiles=speaker.emotion_profiles,
+                            global_threshold=get_config().get_settings().emotion_threshold,
+                            speaker_threshold=speaker.emotion_threshold,
+                            generic_emotion=emotion_data["emotion_category"],
+                            generic_confidence=emotion_data["emotion_confidence"],
+                        )
+                        final = dual_result["final_decision"]
+                        segment.emotion_category = final["emotion"]
+                        segment.emotion_confidence = final["confidence"]
+                        segment.detector_breakdown = json.dumps(dual_result)
+                    else:
+                        segment.emotion_category = emotion_data["emotion_category"]
+                        segment.emotion_confidence = emotion_data["emotion_confidence"]
+                        segment.detector_breakdown = None
                 else:
-                    # Fall back to generic emotion2vec result
-                    segment.emotion_category = emotion_data['emotion_category']
-                    segment.emotion_confidence = emotion_data['emotion_confidence']
-                    segment.detector_breakdown = None  # No dual-detector used
-                    updated_count += 1
-            else:
-                # No profiles, use generic emotion2vec result
-                segment.emotion_category = emotion_data['emotion_category']
-                segment.emotion_confidence = emotion_data['emotion_confidence']
-                segment.detector_breakdown = None  # No dual-detector used
+                    segment.emotion_category = emotion_data["emotion_category"]
+                    segment.emotion_confidence = emotion_data["emotion_confidence"]
+                    segment.detector_breakdown = None
                 updated_count += 1
+            except Exception as exc:  # one bad segment must not discard all good updates
+                logger.warning(
+                    "Failed to recalculate emotion for segment %s: %s",
+                    segment.id,
+                    exc,
+                )
+                skipped_count += 1
 
-        except Exception as e:
-            logger.warning(f"Failed to recalculate emotion for segment {segment.id}: {e}")
-            skipped_count += 1
+        if not finish_processing_lease(
+            db,
+            conversation_id,
+            processing_token,
+            status=previous_status,
+        ):
+            raise HTTPException(status_code=409, detail="Recalculation lease lost")
 
-    db.commit()
+        try:
+            engine.clear_gpu_cache()
+        except Exception as exc:  # noqa: BLE001 - cleanup cannot undo results
+            logger.warning("GPU cleanup after emotion recalculation failed: %s", exc)
 
-    # Clear GPU cache
-    engine.clear_gpu_cache()
-
-    return {
-        "message": "Emotions recalculated",
-        "updated": updated_count,
-        "skipped": skipped_count,
-        "total": len(segments)
-    }
+        return {
+            "message": "Emotions recalculated",
+            "updated": updated_count,
+            "skipped": skipped_count,
+            "total": len(segments),
+        }
+    except Exception:
+        fail_processing_lease(
+            db,
+            conversation_id,
+            processing_token,
+            status=previous_status,
+        )
+        raise
 
 
 @router.post("/{conversation_id}/segments/{segment_id}/identify")

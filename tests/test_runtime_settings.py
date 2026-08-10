@@ -100,3 +100,44 @@ def test_gpu_environment_documentation_matches_compose_variables():
     ):
         assert f"{variable}=${{{variable}:-" in compose
         assert f"{variable}=" in example
+
+
+def test_whole_file_emotion_path_passes_only_capped_audio_to_model(tmp_path):
+    from pydub import AudioSegment
+
+    from app import diarization
+
+    source = tmp_path / "long-16khz.wav"
+    AudioSegment.silent(duration=60_000, frame_rate=16_000).set_channels(1).export(
+        source, format="wav"
+    )
+    observed = {}
+
+    class Model:
+        def generate(self, path, **_kwargs):
+            observed["path"] = path
+            observed["duration_ms"] = len(AudioSegment.from_file(path))
+            return [{"labels": ["neutral"], "scores": [1.0]}]
+
+    engine = diarization.SpeakerRecognitionEngine.__new__(
+        diarization.SpeakerRecognitionEngine
+    )
+    engine._emotion_model = Model()
+    engine._emotion_model_failed = False
+    engine._model_lock = threading.Lock()
+    engine.clear_gpu_cache_async = lambda _reason: None
+
+    result = engine.extract_emotion(str(source))
+    assert result["emotion_category"] == "neutral"
+    assert observed["path"] != str(source)
+    assert observed["duration_ms"] <= int(
+        diarization.MAX_EMOTION_DURATION_SEC * 1000
+    )
+
+    short = tmp_path / "short-16khz.wav"
+    AudioSegment.silent(duration=1_000, frame_rate=16_000).set_channels(1).export(
+        short, format="wav"
+    )
+    observed.clear()
+    engine.extract_emotion(str(short))
+    assert observed["path"] == str(short)

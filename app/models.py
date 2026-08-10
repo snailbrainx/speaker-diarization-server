@@ -4,6 +4,15 @@ from .database import Base, utc_now
 import json
 import numpy as np
 
+
+class AppMetadata(Base):
+    """Small persistent key/value metadata owned by this database."""
+
+    __tablename__ = "app_metadata"
+
+    key = Column(String, primary_key=True)
+    value = Column(Text, nullable=False)
+
 class Speaker(Base):
     __tablename__ = "speakers"
 
@@ -102,6 +111,10 @@ class Conversation(Base):
     end_time = Column(DateTime, nullable=True)  # Null while recording
     duration = Column(Float, nullable=True)  # Duration in seconds
     status = Column(String, default="recording")  # recording, processing, completed, failed
+    # Internal operation lease. Public clients must never set this value.
+    # Streaming/upload/reprocess workers clear it only when no later write can
+    # legally land; DELETE uses it rather than trusting client-visible status.
+    processing_token = Column(String, nullable=True, index=True)
     audio_path = Column(String, nullable=True)  # Path to WAV or MP3 file
     audio_format = Column(String, default="wav")  # wav or mp3
     num_segments = Column(Integer, default=0)

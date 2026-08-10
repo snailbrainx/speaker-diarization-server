@@ -20,6 +20,11 @@ from .schemas import (
 )
 from .diarization import SpeakerRecognitionEngine
 from .config import get_config
+from .conversation_lifecycle import (
+    fail_processing_lease,
+    finish_processing_lease,
+    new_processing_token,
+)
 from .services import (
     create_segment_from_result,
     data_path,
@@ -293,11 +298,13 @@ async def process_audio(
 
     # Create conversation entry
     start_time = utc_now()
+    processing_token = new_processing_token()
     conversation = Conversation(
         title=f"Uploaded: {audio_file.filename}",
         audio_path=file_path,
         start_time=start_time,
-        status="processing"
+        status="processing",
+        processing_token=processing_token,
     )
     db.add(conversation)
     db.commit()
@@ -330,14 +337,19 @@ async def process_audio(
             )
 
         # Update conversation metadata
-        conversation.status = "completed"
         conversation.num_segments = len(result["segments"])
         conversation.num_speakers = result["num_speakers"]
         if result["segments"]:
             conversation.duration = max(s["end"] for s in result["segments"])
             conversation.end_time = start_time + timedelta(seconds=conversation.duration)
 
-        db.commit()
+        if not finish_processing_lease(
+            db,
+            conversation.id,
+            processing_token,
+            status="completed",
+        ):
+            raise RuntimeError("Upload processing lease lost")
         db.refresh(conversation)
 
         # Clear GPU cache after processing
@@ -349,13 +361,8 @@ async def process_audio(
     except Exception:
         import traceback
         traceback.print_exc()
-        # Roll back any half-built segments from create_segment_from_result
-        # so the failed-status commit doesn't persist partial state.
-        db.rollback()
-        failed = db.query(Conversation).filter(Conversation.id == conversation.id).first()
-        if failed is not None:
-            failed.status = "failed"
-            db.commit()
+        # Roll back half-built segments and release only our own operation.
+        fail_processing_lease(db, conversation.id, processing_token)
         raise HTTPException(status_code=500, detail="Audio processing failed")
 
 

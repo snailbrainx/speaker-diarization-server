@@ -724,6 +724,10 @@ class SpeakerRecognitionEngine:
             full_audio = full_audio.set_frame_rate(16000)
         return full_audio
 
+    def preload_emotion_audio(self, audio_file: str) -> Optional["AudioSegment"]:
+        """Public decode-once contract for recalculation/profile callers."""
+        return self._preload_emotion_audio(audio_file)
+
     def extract_emotion(
         self,
         audio_file: str,
@@ -795,20 +799,31 @@ class SpeakerRecognitionEngine:
                     if os.path.exists(temp_path):
                         os.unlink(temp_path)
             else:
-                # Process entire file - need to check/resample first
+                # Process a bounded, normalized copy. Passing the original
+                # filename when it was already 16 kHz bypassed the duration
+                # slice above and sent the entire recording to emotion2vec.
                 audio = AudioSegment.from_file(audio_file)
 
                 # Cap duration to avoid OOM in emotion2vec attention (O(n^2) memory)
                 max_emotion_duration_ms = int(MAX_EMOTION_DURATION_SEC * 1000)
+                needs_temp_input = (
+                    len(audio) > max_emotion_duration_ms
+                    or audio.frame_rate != 16000
+                )
                 if len(audio) > max_emotion_duration_ms:
                     audio = audio[:max_emotion_duration_ms]
 
                 # Resample to 16kHz if needed
                 if audio.frame_rate != 16000:
                     audio = audio.set_frame_rate(16000)
-                    # Create temp file with resampled audio
-                    with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_file:
-                        audio.export(temp_file.name, format='wav')
+
+                if needs_temp_input:
+                    # Long already-16 kHz sources must still use the processed
+                    # object or the in-memory duration cap is silently bypassed.
+                    with tempfile.NamedTemporaryFile(
+                        suffix=".wav", delete=False
+                    ) as temp_file:
+                        audio.export(temp_file.name, format="wav")
                         temp_path = temp_file.name
 
                     try:
@@ -821,11 +836,10 @@ class SpeakerRecognitionEngine:
                         if os.path.exists(temp_path):
                             os.unlink(temp_path)
                 else:
-                    # Already 16kHz, use directly
                     result = self.emotion_model.generate(
                         audio_file,
                         granularity="utterance",
-                        extract_embedding=extract_embedding
+                        extract_embedding=extract_embedding,
                     )
 
             # FunASR emotion2vec returns list of results
@@ -1071,7 +1085,7 @@ class SpeakerRecognitionEngine:
 
             if preloaded_emotion_audio is None and not emotion_preload_failed:
                 try:
-                    preloaded_emotion_audio = self._preload_emotion_audio(audio_file)
+                    preloaded_emotion_audio = self.preload_emotion_audio(audio_file)
                     if preloaded_emotion_audio is None:
                         emotion_preload_failed = True
                 except Exception as e:  # noqa: BLE001 - decoder/model failures use per-segment fallback
@@ -1323,8 +1337,9 @@ class SpeakerRecognitionEngine:
             "confidence": float(voice_best_confidence),
             "matches": voice_matches
         }
+        detector2_has_diagnostics = bool(voice_matches)
         # detector2_available is True only when at least one voice profile had
-        # enough samples AND produced an above-threshold match. A missing
+        # enough samples AND produced an above-threshold opinion. A missing
         # detector-2 result must be treated as "no second opinion", not as a
         # literal "neutral" prediction — otherwise the combiner neutralises
         # every confident detector-1 label as soon as the speaker has fewer
@@ -1352,7 +1367,11 @@ class SpeakerRecognitionEngine:
 
         return {
             "emotion2vec_detector": detector1_result,
-            "voice_profile_detector": detector2_result if detector2_available else None,
+            # Keep below-threshold similarities visible for diagnostics while
+            # still treating them as no second opinion in decision logic.
+            "voice_profile_detector": (
+                detector2_result if detector2_has_diagnostics else None
+            ),
             "final_decision": final
         }
 

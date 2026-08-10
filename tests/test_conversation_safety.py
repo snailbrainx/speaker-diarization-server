@@ -99,15 +99,231 @@ def test_completed_conversation_delete_removes_segment_directory(
     conversation, _segment, _chunk = _conversation_with_segment(
         db_session, tmp_path, status="completed"
     )
+    conversation_id = conversation.id
     monkeypatch.setattr(services, "data_path", lambda: str(tmp_path))
-    seg_dir = tmp_path / "stream_segments" / f"conv_{conversation.id}"
+    seg_dir = tmp_path / "stream_segments" / f"conv_{conversation_id}"
     seg_dir.mkdir(parents=True)
     (seg_dir / "seg_0001.wav").write_bytes(b"audio")
 
-    result = asyncio.run(conversation_api.delete_conversation(conversation.id, db_session))
+    result = asyncio.run(conversation_api.delete_conversation(conversation_id, db_session))
     assert "deleted" in result["message"]
     assert not seg_dir.exists()
-    assert db_session.query(Conversation).filter_by(id=conversation.id).first() is None
+    assert db_session.query(Conversation).filter_by(id=conversation_id).first() is None
+
+
+def test_public_status_mutation_is_forbidden_and_token_still_blocks_delete(
+    db_session, tmp_path
+):
+    from pydantic import ValidationError
+
+    from app import conversation_api
+    from app.schemas import ConversationUpdate
+
+    with pytest.raises(ValidationError):
+        ConversationUpdate.model_validate({"status": "completed"})
+
+    conversation, _segment, _chunk = _conversation_with_segment(
+        db_session, tmp_path, status="completed"
+    )
+    conversation.processing_token = "authoritative-live-worker"
+    db_session.commit()
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(conversation_api.delete_conversation(conversation.id, db_session))
+    assert exc_info.value.status_code == 409
+
+
+def test_reprocess_lease_blocks_concurrent_delete(db_session, tmp_path):
+    import threading
+
+    from sqlalchemy.orm import sessionmaker
+
+    from app import conversation_api
+
+    audio_path = tmp_path / "reprocess.wav"
+    audio_path.write_bytes(b"fake-audio-for-stub-engine")
+    conversation = Conversation(
+        title="reprocess lease",
+        start_time=datetime.now(timezone.utc),
+        status="completed",
+        audio_path=str(audio_path),
+    )
+    db_session.add(conversation)
+    db_session.commit()
+    conversation_id = conversation.id
+
+    class BlockingEngine:
+        def __init__(self):
+            self.entered = threading.Event()
+            self.release = threading.Event()
+
+        def transcribe_with_diarization(self, *_args, **_kwargs):
+            self.entered.set()
+            assert self.release.wait(timeout=3)
+            return {"segments": [], "num_speakers": 0}
+
+        def clear_gpu_cache(self):
+            return None
+
+        def clear_speaker_cache(self):
+            return None
+
+    engine = BlockingEngine()
+    Session = sessionmaker(bind=db_session.get_bind())
+
+    async def scenario():
+        task = asyncio.create_task(conversation_api.reprocess_conversation(
+            conversation_id, db_session, engine
+        ))
+        assert await asyncio.to_thread(engine.entered.wait, 2)
+
+        delete_db = Session()
+        try:
+            active = delete_db.query(Conversation).filter_by(id=conversation_id).one()
+            assert active.status == "processing"
+            assert active.processing_token is not None
+            with pytest.raises(HTTPException) as exc_info:
+                await conversation_api.delete_conversation(conversation_id, delete_db)
+            assert exc_info.value.status_code == 409
+        finally:
+            delete_db.close()
+
+        engine.release.set()
+        return await task
+
+    result = asyncio.run(scenario())
+    assert result["segments"] == 0
+    db_session.expire_all()
+    stored = db_session.query(Conversation).filter_by(id=conversation_id).one()
+    assert stored.status == "completed"
+    assert stored.processing_token is None
+
+
+def test_recalculate_emotions_decodes_conversation_once(db_session, tmp_path):
+    from app import conversation_api
+
+    audio_path = tmp_path / "conversation.wav"
+    audio_path.write_bytes(b"fake-audio-for-stub-engine")
+    speaker = Speaker(name="DecodeOnce")
+    speaker.set_embedding(np.ones(4, dtype=np.float32))
+    db_session.add(speaker)
+    db_session.flush()
+    conversation = Conversation(
+        title="decode once",
+        start_time=datetime.now(timezone.utc),
+        status="completed",
+        audio_path=str(audio_path),
+    )
+    db_session.add(conversation)
+    db_session.flush()
+    for index in range(3):
+        db_session.add(ConversationSegment(
+            conversation_id=conversation.id,
+            speaker_id=speaker.id,
+            speaker_name=speaker.name,
+            text=f"segment {index}",
+            start_time=datetime.now(timezone.utc),
+            end_time=datetime.now(timezone.utc),
+            start_offset=float(index),
+            end_offset=float(index + 1),
+        ))
+    db_session.commit()
+    conversation_id = conversation.id
+
+    marker = object()
+
+    class CountingEngine:
+        preload_calls = 0
+        extract_calls = 0
+
+        def preload_emotion_audio(self, path):
+            assert path == str(audio_path)
+            self.preload_calls += 1
+            return marker
+
+        def extract_emotion(
+            self, _path, _start, _end, *, extract_embedding, preloaded_audio
+        ):
+            assert extract_embedding is True
+            assert preloaded_audio is marker
+            self.extract_calls += 1
+            return {"emotion_category": "happy", "emotion_confidence": 0.8}
+
+        def clear_gpu_cache(self):
+            return None
+
+    engine = CountingEngine()
+    result = asyncio.run(conversation_api.recalculate_emotions(
+        conversation_id, db_session, engine
+    ))
+    assert result["updated"] == 3
+    assert engine.preload_calls == 1
+    assert engine.extract_calls == 3
+    db_session.expire_all()
+    stored = db_session.query(Conversation).filter_by(id=conversation_id).one()
+    assert stored.status == "completed"
+    assert stored.processing_token is None
+
+
+def test_emotion_profile_rebuild_preloads_once_per_audio_path(db_session, tmp_path):
+    from app.services import recalculate_emotion_profile
+
+    audio_path = tmp_path / "profile-source.wav"
+    audio_path.write_bytes(b"fake-audio-for-stub-engine")
+    speaker = Speaker(name="ProfileDecodeOnce")
+    speaker.set_embedding(np.ones(4, dtype=np.float32))
+    db_session.add(speaker)
+    db_session.flush()
+    conversation = Conversation(
+        title="profile decode once",
+        start_time=datetime.now(timezone.utc),
+        status="completed",
+        audio_path=str(audio_path),
+    )
+    db_session.add(conversation)
+    db_session.flush()
+    for index in range(2):
+        db_session.add(ConversationSegment(
+            conversation_id=conversation.id,
+            speaker_id=speaker.id,
+            speaker_name=speaker.name,
+            text=f"corrected {index}",
+            start_time=datetime.now(timezone.utc),
+            end_time=datetime.now(timezone.utc),
+            start_offset=float(index),
+            end_offset=float(index + 1),
+            emotion_category="happy",
+            emotion_corrected=True,
+            emotion_misidentified=False,
+        ))
+    db_session.commit()
+    speaker_id = speaker.id
+
+    marker = object()
+
+    class CountingEngine:
+        preload_calls = 0
+        extract_calls = 0
+
+        def clear_speaker_cache(self):
+            return None
+
+        def preload_emotion_audio(self, path):
+            assert path == str(audio_path)
+            self.preload_calls += 1
+            return marker
+
+        def extract_emotion(self, _path, _start, _end, **kwargs):
+            assert kwargs["preloaded_audio"] is marker
+            self.extract_calls += 1
+            return {"embedding": np.ones(4, dtype=np.float32)}
+
+    engine = CountingEngine()
+    assert recalculate_emotion_profile(
+        speaker_id, "happy", db_session, engine
+    ) == "created"
+    assert engine.preload_calls == 1
+    assert engine.extract_calls == 2
 
 
 def test_identify_only_works_with_chunk_audio_without_extraction(db_session, tmp_path):

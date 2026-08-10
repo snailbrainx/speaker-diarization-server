@@ -11,7 +11,7 @@ from typing import Any, Optional, Tuple, List
 from sqlalchemy import exists
 from sqlalchemy.orm import Session, joinedload
 
-from .models import Speaker, Conversation, ConversationSegment, SpeakerEmotionProfile
+from .models import Speaker, ConversationSegment, SpeakerEmotionProfile
 from .diarization import auto_enroll_unknown_speaker
 
 logger = logging.getLogger(__name__)
@@ -241,6 +241,9 @@ def recalculate_emotion_profile(
 
     emotion_embeddings = []
     voice_embeddings = []
+    preloaded_audio_by_path = {}
+    preload_failures = set()
+    preloader = getattr(engine, "preload_emotion_audio", None)
 
     for seg in segments:
         # Emotion embedding
@@ -251,7 +254,38 @@ def recalculate_emotion_profile(
             audio_path = resolve_audio_path(seg.conversation, seg)
             if audio_path and not uses_segment_audio_fallback(seg.conversation, seg, audio_path):
                 try:
-                    data = engine.extract_emotion(audio_path, seg.start_offset, seg.end_offset, extract_embedding=True)
+                    kwargs = {"extract_embedding": True}
+                    if preloader is not None:
+                        if (
+                            audio_path not in preloaded_audio_by_path
+                            and audio_path not in preload_failures
+                        ):
+                            try:
+                                preloaded_audio_by_path[audio_path] = preloader(audio_path)
+                            except Exception as exc:  # one failed decode, not N
+                                preload_failures.add(audio_path)
+                                logger.warning(
+                                    "Could not preload emotion audio %s: %s",
+                                    audio_path,
+                                    exc,
+                                )
+                        if audio_path in preload_failures:
+                            data = None
+                        else:
+                            kwargs["preloaded_audio"] = preloaded_audio_by_path[audio_path]
+                            data = engine.extract_emotion(
+                                audio_path,
+                                seg.start_offset,
+                                seg.end_offset,
+                                **kwargs,
+                            )
+                    else:
+                        data = engine.extract_emotion(
+                            audio_path,
+                            seg.start_offset,
+                            seg.end_offset,
+                            **kwargs,
+                        )
                     if data and 'embedding' in data and not np.isnan(data['embedding']).any():
                         emotion_embeddings.append(data['embedding'])
                 except Exception as e:

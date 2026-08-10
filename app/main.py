@@ -24,6 +24,7 @@ import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
+from sqlalchemy import or_
 import torch
 
 from .database import init_db
@@ -52,8 +53,16 @@ async def lifespan(app: FastAPI):
         reconcile_db = SessionLocal()
         try:
             stuck = reconcile_db.query(_Conversation).filter(
-                _Conversation.status.in_(["recording", "processing"])
-            ).update({"status": "failed"}, synchronize_session=False)
+                or_(
+                    _Conversation.processing_token.isnot(None),
+                    _Conversation.status.in_([
+                        "recording", "processing", "finalizing", "deleting"
+                    ]),
+                )
+            ).update(
+                {"status": "failed", "processing_token": None},
+                synchronize_session=False,
+            )
             if stuck:
                 logger.info(f"Reconciled {stuck} conversation(s) stuck in recording/processing after restart")
             reconcile_db.commit()

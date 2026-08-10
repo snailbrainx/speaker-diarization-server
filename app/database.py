@@ -61,6 +61,7 @@ _MIGRATIONS = (
     ("conversation_segments", "speaker_embedding", "BLOB"),
     ("conversation_segments", "emotion_embedding", "BLOB"),
     ("speakers", "emotion_threshold", "REAL"),
+    ("conversations", "processing_token", "TEXT"),
 )
 
 

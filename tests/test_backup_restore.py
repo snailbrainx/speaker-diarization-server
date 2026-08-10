@@ -132,6 +132,40 @@ class TestRestoreAtomicity:
         names = [s.name for s in db_session.query(Speaker).all()]
         assert names == ["Keeper"]
 
+    def test_failure_after_destructive_sql_rolls_back_original_state(
+        self, db_session, backup_dir, tmp_path, monkeypatch
+    ):
+        """A rebuild failure after DELETE has begun must restore old rows."""
+        import asyncio
+
+        from fastapi import HTTPException
+
+        from app import backup_api
+
+        _make_speaker(db_session, "Original")
+        payload = {
+            "name": "FailsMidRebuild",
+            "speakers": [{
+                "id": 7,
+                "name": "Replacement",
+                "embedding": [1.0, 0.0],
+                # Missing emotion_category raises after the speaker wipe and
+                # replacement INSERT have already executed.
+                "emotion_profiles": [{"embedding": [0.2, 0.3]}],
+            }],
+            "segments": [],
+        }
+        (backup_dir / "profile_mid_rebuild.json").write_text(json.dumps(payload))
+        monkeypatch.chdir(tmp_path)
+
+        with pytest.raises(HTTPException) as exc_info:
+            asyncio.run(backup_api.restore_from_file(
+                filename="profile_mid_rebuild.json", db=db_session
+            ))
+        assert exc_info.value.status_code == 500
+        db_session.expire_all()
+        assert [speaker.name for speaker in db_session.query(Speaker).all()] == ["Original"]
+
 
 class TestCheckpointRestoreRoundTrip:
     def test_checkpoint_restore_preserves_emotion_profiles(self, db_session, backup_dir, monkeypatch):
@@ -172,6 +206,56 @@ class TestCheckpointRestoreRoundTrip:
         assert len(profiles) == 1, f"emotion profiles lost after checkpoint restore: {len(profiles)}"
         assert profiles[0].emotion_category == "happy"
         assert profiles[0].sample_count == 4
+
+    def test_concurrent_checkpoint_requests_publish_distinct_files(
+        self, backup_dir, monkeypatch
+    ):
+        """Same-profile requests in one clock tick must never overwrite."""
+        import asyncio
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+        from datetime import datetime as RealDateTime
+        from datetime import timezone
+
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+
+        from app import backup_api
+        from app.database import Base
+
+        engine = create_engine(
+            f"sqlite:///{backup_dir.parent / 'checkpoint-race.db'}",
+            connect_args={"check_same_thread": False},
+        )
+        Base.metadata.create_all(engine)
+        Session = sessionmaker(bind=engine)
+
+        class FrozenDateTime:
+            @classmethod
+            def now(cls, tz=None):
+                return RealDateTime(
+                    2026, 8, 10, 12, 34, 56, 123456, tzinfo=tz or timezone.utc
+                )
+
+        monkeypatch.setattr(backup_api, "datetime", FrozenDateTime)
+        barrier = threading.Barrier(2)
+
+        def create_one():
+            db = Session()
+            try:
+                barrier.wait()
+                return asyncio.run(backup_api.create_checkpoint("race", db))
+            finally:
+                db.close()
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [executor.submit(create_one) for _ in range(2)]
+            results = [future.result() for future in futures]
+        engine.dispose()
+
+        filenames = {result["filename"] for result in results}
+        assert len(filenames) == 2
+        assert all((backup_dir / filename).exists() for filename in filenames)
 
 
 class TestProfileOverwriteProtection:
@@ -317,7 +401,7 @@ class TestRestoreValidationAndMapping:
         db_session.expire_all()
         assert [speaker.name for speaker in db_session.query(Speaker).all()] == ["Restored"]
 
-    def test_cross_database_id_collision_remaps_by_backup_name(
+    def test_foreign_database_id_collision_cannot_touch_local_segment_state(
         self, db_session, backup_dir, tmp_path, monkeypatch
     ):
         import asyncio
@@ -348,6 +432,7 @@ class TestRestoreValidationAndMapping:
 
         payload = {
             "name": "ForeignIds",
+            "database_namespace": "00000000-0000-0000-0000-foreign000000",
             "speakers": [
                 {"id": 7, "name": "Alice", "embedding": [1.0, 0.0]},
                 {"id": 8, "name": "Bob", "embedding": [0.0, 1.0]},
@@ -370,6 +455,69 @@ class TestRestoreValidationAndMapping:
         db_session.expire_all()
         restored_segment = db_session.query(ConversationSegment).filter_by(id=segment.id).one()
         restored_speaker = db_session.query(Speaker).filter_by(id=restored_segment.speaker_id).one()
-        assert restored_speaker.name == "Alice"
-        assert restored_segment.speaker_name == "Alice"
+        # The foreign payload says Alice, but the target row's own local name
+        # remains Bob and is safely reconnected to restored Bob by name.
+        assert restored_speaker.name == "Bob"
+        assert restored_segment.speaker_name == "Bob"
+        assert result["segment_namespace_match"] is False
+        assert result["segments_skipped_namespace"] == 1
+        assert result["segments_remapped_from_local_names"] == 1
         assert result["segments_remapped_by_name"] == 1
+
+    def test_same_database_snapshot_can_replay_segment_state(
+        self, db_session, backup_dir, tmp_path, monkeypatch
+    ):
+        import asyncio
+        from datetime import datetime, timezone
+
+        from app import backup_api
+        from app.models import Conversation, ConversationSegment
+
+        alice = _make_speaker(db_session, "Alice")
+        bob = _make_speaker(db_session, "Bob")
+        conversation = Conversation(
+            title="same namespace", start_time=datetime.now(timezone.utc), status="completed"
+        )
+        db_session.add(conversation)
+        db_session.flush()
+        segment = ConversationSegment(
+            conversation_id=conversation.id,
+            speaker_id=bob.id,
+            speaker_name="Bob",
+            text="hello",
+            start_time=datetime.now(timezone.utc),
+            end_time=datetime.now(timezone.utc),
+            start_offset=0.0,
+            end_offset=1.0,
+        )
+        db_session.add(segment)
+        db_session.commit()
+        namespace = backup_api._get_database_namespace(db_session)
+
+        payload = {
+            "name": "LocalSnapshot",
+            "database_namespace": namespace,
+            "speakers": [
+                {"id": alice.id, "name": "Alice", "embedding": [1.0, 0.0]},
+                {"id": bob.id, "name": "Bob", "embedding": [0.0, 1.0]},
+            ],
+            "segments": [{
+                "id": segment.id,
+                "conversation_id": conversation.id,
+                "speaker_id": alice.id,
+                "speaker_name": "Alice",
+                "is_misidentified": True,
+            }],
+        }
+        (backup_dir / "profile_local_snapshot.json").write_text(json.dumps(payload))
+        monkeypatch.chdir(tmp_path)
+
+        result = asyncio.run(backup_api.restore_from_file(
+            filename="profile_local_snapshot.json", db=db_session
+        ))
+        db_session.expire_all()
+        restored = db_session.query(ConversationSegment).filter_by(id=segment.id).one()
+        assert restored.speaker_name == "Alice"
+        assert restored.is_misidentified is True
+        assert result["segment_namespace_match"] is True
+        assert result["segments_skipped_namespace"] == 0

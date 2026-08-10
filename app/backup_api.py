@@ -13,6 +13,7 @@ import logging
 import os
 import re
 import traceback
+import uuid
 import zipfile
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -21,10 +22,12 @@ import numpy as np
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
+from sqlalchemy import insert, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .database import get_db
-from .models import Speaker, ConversationSegment, SpeakerEmotionProfile
+from .models import AppMetadata, ConversationSegment, Speaker, SpeakerEmotionProfile
 from .config import VoiceSettings, get_config
 
 router = APIRouter(prefix="/profiles", tags=["Voice Profiles"])
@@ -32,7 +35,41 @@ router = APIRouter(prefix="/profiles", tags=["Voice Profiles"])
 logger = logging.getLogger(__name__)
 
 _BACKUPS_DIR = "backups"
-_TIMESTAMP_RE = re.compile(r"^\d{8}_\d{6}$")
+_TIMESTAMP_RE = re.compile(r"^\d{8}_\d{6}(?:_\d{6}_[0-9a-f]{8})?$")
+_DATABASE_NAMESPACE_KEY = "database_namespace_uuid"
+
+
+def _get_database_namespace(db: Session) -> str:
+    """Return this database's persistent UUID without committing caller state."""
+    bind = db.get_bind()
+    candidate = str(uuid.uuid4())
+    try:
+        # Use an independent transaction: snapshot creation must not commit
+        # unrelated request-session changes, while the namespace itself must
+        # survive a later restore rollback. A unique PK arbitrates concurrent
+        # first-use requests.
+        with bind.begin() as conn:
+            existing = conn.execute(
+                select(AppMetadata.value).where(
+                    AppMetadata.key == _DATABASE_NAMESPACE_KEY
+                )
+            ).scalar_one_or_none()
+            if existing is not None:
+                return existing
+            conn.execute(insert(AppMetadata).values(
+                key=_DATABASE_NAMESPACE_KEY,
+                value=candidate,
+            ))
+            return candidate
+    except IntegrityError:
+        # Another concurrent request committed the singleton first.
+        with bind.connect() as conn:
+            existing = conn.execute(
+                select(AppMetadata.value).where(
+                    AppMetadata.key == _DATABASE_NAMESPACE_KEY
+                )
+            ).scalar_one()
+        return existing
 
 
 class CreateProfileRequest(BaseModel):
@@ -223,11 +260,13 @@ def save_current_state(profile_name: str, description: str, db: Session, allow_o
         )
 
     settings = get_config().get_settings()
+    database_namespace = _get_database_namespace(db)
     speakers = _serialize_speakers(db, include_emotion_profiles=True)
     segments = _serialize_segments(db)
 
     profile_data = {
         "timestamp": timestamp,
+        "database_namespace": database_namespace,
         "name": profile_name,
         "description": description,
         "type": "profile",
@@ -261,6 +300,7 @@ async def create_profile(request: CreateProfileRequest, db: Session = Depends(ge
         defaults = VoiceSettings()
         profile_data = {
             "timestamp": timestamp,
+            "database_namespace": _get_database_namespace(db),
             "name": request.name,
             "description": request.description or "",
             "type": "profile",
@@ -391,7 +431,10 @@ async def create_checkpoint(profile_name: str, db: Session = Depends(get_db)):
     """Create a checkpoint (snapshot) of current profile state."""
     def _work() -> dict:
         safe_name = sanitize_filename(profile_name)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        timestamp = (
+            f"{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S_%f')}_"
+            f"{uuid.uuid4().hex[:8]}"
+        )
         os.makedirs(_BACKUPS_DIR, exist_ok=True)
         checkpoint_file = _checkpoint_path(safe_name, timestamp)
 
@@ -413,6 +456,7 @@ async def create_checkpoint(profile_name: str, db: Session = Depends(get_db)):
 
         checkpoint_data = {
             "timestamp": timestamp,
+            "database_namespace": _get_database_namespace(db),
             "profile_name": profile_name,
             "description": description,
             "type": "checkpoint",
@@ -420,7 +464,7 @@ async def create_checkpoint(profile_name: str, db: Session = Depends(get_db)):
             "speakers": speakers,
             "segments": segments,
         }
-        _dump_json(checkpoint_file, checkpoint_data)
+        _dump_json(checkpoint_file, checkpoint_data, allow_overwrite=False)
         return {
             "message": f"Checkpoint created for profile '{profile_name}'",
             "filename": os.path.basename(checkpoint_file),
@@ -431,6 +475,8 @@ async def create_checkpoint(profile_name: str, db: Session = Depends(get_db)):
 
     try:
         return await asyncio.to_thread(_work)
+    except HTTPException:
+        raise
     except Exception:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail="Failed to create checkpoint")
@@ -507,6 +553,14 @@ async def restore_from_file(filename: str, db: Session = Depends(get_db)):
                 detail="Profile contains duplicate speaker names; restore aborted before any data was modified",
             )
 
+        local_namespace = _get_database_namespace(db)
+        source_namespace = data.get("database_namespace")
+        segment_namespace_match = (
+            isinstance(source_namespace, str)
+            and source_namespace == local_namespace
+        )
+        segments_in = data.get("segments", [])
+
         # Validate the settings block before touching the database. Invalid
         # settings used to raise only after the DB commit, returning a
         # misleading 500 even though the destructive restore had succeeded.
@@ -571,8 +625,13 @@ async def restore_from_file(filename: str, db: Session = Depends(get_db)):
         segments_updated = 0
         segments_unmapped = 0
         segments_remapped_by_name = 0
+        segments_remapped_from_local_names = 0
         segments_not_found = 0
-        for seg_data in data.get("segments", []):
+        segments_skipped_namespace = 0 if segment_namespace_match else len(segments_in)
+        # Integer conversation/segment IDs are only meaningful inside the DB
+        # that created them. Foreign and legacy profiles remain portable for
+        # speakers/settings, but must never replay those IDs into this DB.
+        for seg_data in segments_in if segment_namespace_match else []:
             segment_query = db.query(ConversationSegment).filter(
                 ConversationSegment.id == seg_data["id"]
             )
@@ -610,6 +669,19 @@ async def restore_from_file(filename: str, db: Session = Depends(get_db)):
             segment.is_misidentified = seg_data.get("is_misidentified", False)
             segments_updated += 1
 
+        if not segment_namespace_match:
+            # The target rows' own denormalised names are local evidence. They
+            # can safely reconnect to newly restored speakers by name without
+            # consulting any foreign conversation/segment integer IDs.
+            for segment in db.query(ConversationSegment).all():
+                new_speaker_id = new_id_by_name.get(segment.speaker_name)
+                if new_speaker_id is None:
+                    continue
+                segment.speaker_id = new_speaker_id
+                segments_remapped_by_name += 1
+                segments_remapped_from_local_names += 1
+                segments_updated += 1
+
         db.commit()
 
         # Active streams keep an in-memory speaker cache keyed by the OLD
@@ -642,7 +714,10 @@ async def restore_from_file(filename: str, db: Session = Depends(get_db)):
             "segments_updated": segments_updated,
             "segments_unmapped": segments_unmapped,
             "segments_remapped_by_name": segments_remapped_by_name,
+            "segments_remapped_from_local_names": segments_remapped_from_local_names,
             "segments_not_found": segments_not_found,
+            "segments_skipped_namespace": segments_skipped_namespace,
+            "segment_namespace_match": segment_namespace_match,
             "settings_restored": settings_restored,
             "settings_warning": settings_warning,
         }

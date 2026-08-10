@@ -1,4 +1,4 @@
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, ConfigDict, field_validator
 from typing import List, Optional
 from datetime import datetime
 import json
@@ -127,8 +127,9 @@ class ConversationResponse(BaseModel):
 
 
 class ConversationUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     title: Optional[str] = None
-    status: Optional[str] = None
 
 
 class IdentifySpeakerRequest(BaseModel):

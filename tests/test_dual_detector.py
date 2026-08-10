@@ -75,6 +75,37 @@ def test_voice_detector_below_min_samples_is_not_a_second_opinion(engine):
     assert result["final_decision"]["emotion"] == "happy"
 
 
+def test_below_threshold_voice_match_remains_visible_for_diagnostics(engine):
+    emotion_emb = _unit_vec(1.0, 1024)
+    voice_emb = np.zeros(512, dtype=np.float32)
+    voice_emb[0] = 1.0
+    profile_voice_emb = np.zeros(512, dtype=np.float32)
+    profile_voice_emb[1] = 1.0
+    profiles = [FakeProfile(
+        "happy",
+        embedding=emotion_emb,
+        confidence_threshold=0.6,
+        voice_embedding=profile_voice_emb,
+        voice_sample_count=5,
+        voice_threshold=0.3,
+    )]
+
+    result = engine.match_emotion_dual_detector(
+        emotion_emb,
+        voice_emb,
+        profiles,
+        global_threshold=0.6,
+        speaker_threshold=0.3,
+    )
+    assert result["final_decision"]["emotion"] == "happy"
+    assert result["final_decision"]["voice_profile_available"] is False
+    diagnostics = result["voice_profile_detector"]
+    assert diagnostics is not None
+    assert diagnostics["emotion"] is None
+    assert diagnostics["matches"][0]["emotion"] == "happy"
+    assert diagnostics["matches"][0]["similarity"] == pytest.approx(0.0)
+
+
 def test_both_detectors_agree_high_confidence(engine):
     emotion_emb = _unit_vec(1.0, 1024)
     voice_emb = _unit_vec(0.5, 512)
