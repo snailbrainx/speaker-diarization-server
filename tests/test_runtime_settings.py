@@ -46,8 +46,10 @@ def test_embedding_uses_latest_runtime_context_padding(monkeypatch):
 
     class FakeEmbeddingModel:
         def crop(self, _audio_file, segment):
-            start = getattr(segment, "start", segment[0])
-            end = getattr(segment, "end", segment[1])
+            # getattr's default arg evaluates eagerly; pyannote's Segment is
+            # not subscriptable, so segment[0] must stay behind the hasattr.
+            start = segment.start if hasattr(segment, "start") else segment[0]
+            end = segment.end if hasattr(segment, "end") else segment[1]
             captured.append((start, end))
             return np.ones(4, dtype=np.float32)
 
@@ -84,15 +86,33 @@ def test_emotion_preload_skips_decode_when_model_unavailable(monkeypatch):
     assert engine._preload_emotion_audio("unused.wav") is None
 
 
+def test_streaming_timeouts_survive_malformed_env(monkeypatch):
+    """A typo'd timeout env var must fall back to the default instead of
+    crashing startup; non-positive values must not disable waits."""
+    from app.streaming_websocket import _timeout_from_env
+
+    monkeypatch.setenv("SEGMENT_HANDLER_TIMEOUT_SECONDS", "ten minutes")
+    assert _timeout_from_env("SEGMENT_HANDLER_TIMEOUT_SECONDS", 600.0, 1.0) == 600.0
+
+    monkeypatch.setenv("WS_SEND_TIMEOUT_SECONDS", "-5")
+    assert _timeout_from_env("WS_SEND_TIMEOUT_SECONDS", 10.0, 0.1) == 10.0
+
+    monkeypatch.setenv("WS_SEND_TIMEOUT_SECONDS", "inf")
+    assert _timeout_from_env("WS_SEND_TIMEOUT_SECONDS", 10.0, 0.1) == 10.0
+
+    monkeypatch.setenv("WS_SEND_TIMEOUT_SECONDS", "2.5")
+    assert _timeout_from_env("WS_SEND_TIMEOUT_SECONDS", 10.0, 0.1) == 2.5
+
+
 def test_gpu_environment_documentation_matches_compose_variables():
     root = Path(__file__).resolve().parents[1]
     compose = (root / "docker-compose.yml").read_text()
     example = (root / ".env.example").read_text()
 
-    assert "${GPU_COUNT:-all}" in compose
-    assert "GPU_COUNT=1" in example
-    assert "NVIDIA_VISIBLE_DEVICES=GPU-" in example
-    assert "GPU_DEVICE_ID=" not in example
+    # GPU pinning is by UUID via device_ids; the NVIDIA runtime accepts "all"
+    # as a device id, so the unset fallback stays valid on a fresh clone.
+    assert "device_ids: ['${GPU_DEVICE_ID:-all}']" in compose
+    assert "GPU_DEVICE_ID=GPU-" in example
     for variable in (
         "MAX_STREAM_BUFFER_SECONDS",
         "SEGMENT_HANDLER_TIMEOUT_SECONDS",

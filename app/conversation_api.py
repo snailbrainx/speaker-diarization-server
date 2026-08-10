@@ -574,17 +574,30 @@ async def identify_speaker_in_segment(
     # identification!).
     # SAFETY 1: Only do retroactive updates for Unknown speakers!
     # If old speaker is already identified (Tommy, Diamond, etc.), only update THIS segment.
-    # SAFETY 2: Scoped to THIS conversation. Unknown_XX labels are assigned
-    # independently per conversation (the counter resets per recording), so a
-    # global match would relabel a DIFFERENT conversation's unrelated
-    # "Unknown_01" — including live-streaming chunks of other sessions.
+    # SAFETY 2: Scope depends on which kind of Unknown this is.
+    # - Auto-enrolled speakers (Unknown_{timestamp}) own a globally unique
+    #   Speaker row that fallback matching deliberately reuses across
+    #   recordings, so identification must follow that row into every
+    #   conversation it appears in.
+    # - Embedding-less Unknown_XX labels have no Speaker row and their counter
+    #   restarts at 01 in every recording, so a global name match would relabel
+    #   a DIFFERENT conversation's unrelated "Unknown_01" — including
+    #   live-streaming chunks of other sessions. Stay inside this conversation.
     updated_count = 0
     if old_speaker_name and old_speaker_name != speaker.name and old_speaker_name.startswith("Unknown_"):
-        updated_count = db.query(ConversationSegment).filter(
-            ConversationSegment.conversation_id == conversation_id,
+        retroactive = db.query(ConversationSegment).filter(
             ConversationSegment.speaker_name == old_speaker_name,
             ConversationSegment.id != segment_id  # Don't update the one we just did
-        ).update({
+        )
+        if old_speaker_id is not None:
+            retroactive = retroactive.filter(
+                ConversationSegment.speaker_id == old_speaker_id
+            )
+        else:
+            retroactive = retroactive.filter(
+                ConversationSegment.conversation_id == conversation_id
+            )
+        updated_count = retroactive.update({
             "speaker_id": speaker.id,
             "speaker_name": speaker.name
         })

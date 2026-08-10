@@ -9,6 +9,7 @@ import numpy as np
 import json
 import asyncio
 import logging
+import math
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from datetime import datetime
 from typing import Optional
@@ -28,8 +29,26 @@ import os
 
 logger = logging.getLogger(__name__)
 
-SEGMENT_HANDLER_TIMEOUT_SECONDS = float(os.getenv("SEGMENT_HANDLER_TIMEOUT_SECONDS") or "600")
-WS_SEND_TIMEOUT_SECONDS = float(os.getenv("WS_SEND_TIMEOUT_SECONDS") or "10")
+
+def _timeout_from_env(name: str, default: float, minimum: float) -> float:
+    """Parse a timeout env var; a malformed or non-positive value must degrade
+    to the default rather than crash startup or disable streaming waits."""
+    raw = os.getenv(name)
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning("Invalid %s=%r; using %s", name, raw, default)
+        return default
+    if not math.isfinite(value) or value < minimum:
+        logger.warning("%s must be finite and >= %s; using %s", name, minimum, default)
+        return default
+    return value
+
+
+SEGMENT_HANDLER_TIMEOUT_SECONDS = _timeout_from_env("SEGMENT_HANDLER_TIMEOUT_SECONDS", 600.0, 1.0)
+WS_SEND_TIMEOUT_SECONDS = _timeout_from_env("WS_SEND_TIMEOUT_SECONDS", 10.0, 0.1)
 _FINALIZE_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="stream-finalize")
 
 

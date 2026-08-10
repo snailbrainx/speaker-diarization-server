@@ -19,6 +19,7 @@ services:
       - CONTEXT_PADDING=${CONTEXT_PADDING:-}
       - SILENCE_DURATION=${SILENCE_DURATION:-}
       - FILTER_HALLUCINATIONS=${FILTER_HALLUCINATIONS:-}
+      - EMOTION_THRESHOLD=${EMOTION_THRESHOLD:-}
       # Hard resource/deadline bounds for live streaming.
       - MAX_STREAM_BUFFER_SECONDS=${MAX_STREAM_BUFFER_SECONDS:-300}
       - SEGMENT_HANDLER_TIMEOUT_SECONDS=${SEGMENT_HANDLER_TIMEOUT_SECONDS:-600}
@@ -51,15 +52,11 @@ services:
         reservations:
           devices:
             - driver: nvidia
-              # `device_ids` only accepts concrete device IDs/UUIDs — the
-              # previous default `['${GPU_DEVICE_ID:-all}']` rendered to
-              # `['all']`, which is not a valid device_ids value. Reserve all
-              # GPUs here; the effective card is still selected by
-              # CUDA_VISIBLE_DEVICES above (and NVIDIA_VISIBLE_DEVICES), which
-              # is what the container runtime actually honours. To restrict
-              # the reservation to one card, set GPU_COUNT=1 in .env and swap
-              # `count` for `device_ids: ['<uuid>']` (nvidia-smi -L).
-              count: ${GPU_COUNT:-all}
+              # Pin a specific card by UUID (`nvidia-smi -L`) via GPU_DEVICE_ID in
+              # .env — e.g. GPU_DEVICE_ID=GPU-5e5ed3af-... . Unset means "all GPUs",
+              # which is the portable default for a fresh clone. The NVIDIA
+              # runtime accepts "all" as a device id, so the fallback is valid.
+              device_ids: ['${GPU_DEVICE_ID:-all}']
               capabilities: [gpu]
     restart: unless-stopped
 

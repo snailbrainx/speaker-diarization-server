@@ -112,3 +112,11 @@ def init_db():
                 f"CREATE UNIQUE INDEX IF NOT EXISTS ix_{table}_snapshot_uuid "
                 f"ON {table} (snapshot_uuid)"
             ))
+
+        # models.py declares this index (index=True), so fresh databases get it
+        # from create_all; converge databases migrated via ALTER TABLE above.
+        if "conversations" in existing_tables:
+            conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS ix_conversations_processing_token "
+                "ON conversations (processing_token)"
+            ))

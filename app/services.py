@@ -236,6 +236,9 @@ def recalculate_emotion_profile(
             ConversationSegment.emotion_misidentified == False,
             ConversationSegment.emotion_category == emotion_category,
         )
+        # Group segments by recording so the decoded-audio cache below only
+        # ever needs to hold one file at a time.
+        .order_by(ConversationSegment.conversation_id, ConversationSegment.start_offset)
         .all()
     )
 
@@ -260,6 +263,11 @@ def recalculate_emotion_profile(
                             audio_path not in preloaded_audio_by_path
                             and audio_path not in preload_failures
                         ):
+                            # Segments arrive ordered by conversation, so a new
+                            # path means the previous recording is done with —
+                            # release it instead of holding every decoded file
+                            # (~115 MB per mono hour) until the call returns.
+                            preloaded_audio_by_path.clear()
                             try:
                                 preloaded_audio_by_path[audio_path] = preloader(audio_path)
                             except Exception as exc:  # one failed decode, not N

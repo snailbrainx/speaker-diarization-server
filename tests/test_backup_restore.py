@@ -683,3 +683,200 @@ class TestRestoreValidationAndMapping:
         assert restored_segment.speaker_name == "Bob"
         assert restored_segment.is_misidentified is False
         assert result["segments_skipped_identity"] == 1
+
+    def test_pre_namespace_legacy_file_replays_verified_segment_state(
+        self, db_session, backup_dir, tmp_path, monkeypatch
+    ):
+        """Files written before database namespaces existed must still be able
+        to revert segment assignments — via id verified against conversation
+        and offsets — instead of silently reducing restore to a no-op."""
+        import asyncio
+        from datetime import datetime, timezone
+
+        from app import backup_api
+        from app.models import Conversation, ConversationSegment
+
+        alice = _make_speaker(db_session, "Alice")
+        bob = _make_speaker(db_session, "Bob")
+        conversation = Conversation(
+            title="legacy", start_time=datetime.now(timezone.utc), status="completed"
+        )
+        db_session.add(conversation)
+        db_session.flush()
+        segment = ConversationSegment(
+            conversation_id=conversation.id,
+            speaker_id=bob.id,
+            speaker_name="Bob",
+            text="reassigned after the backup was taken",
+            start_time=datetime.now(timezone.utc),
+            end_time=datetime.now(timezone.utc),
+            start_offset=3.25,
+            end_offset=7.5,
+        )
+        db_session.add(segment)
+        db_session.commit()
+
+        # Exactly what pre-namespace backup_api serialized: no
+        # database_namespace, no snapshot UUIDs, only integer identities.
+        payload = {
+            "name": "PreNamespaceCheckpoint",
+            "speakers": [
+                {"id": alice.id, "name": "Alice", "embedding": [1.0, 0.0]},
+                {"id": bob.id, "name": "Bob", "embedding": [0.0, 1.0]},
+            ],
+            "segments": [{
+                "id": segment.id,
+                "conversation_id": conversation.id,
+                "speaker_id": alice.id,
+                "speaker_name": "Alice",
+                "is_misidentified": True,
+                "start_offset": 3.25,
+                "end_offset": 7.5,
+            }],
+        }
+        (backup_dir / "checkpoint_pre_namespace.json").write_text(json.dumps(payload))
+        monkeypatch.chdir(tmp_path)
+        result = asyncio.run(backup_api.restore_from_file(
+            filename="checkpoint_pre_namespace.json", db=db_session
+        ))
+
+        db_session.expire_all()
+        restored_segment = db_session.query(ConversationSegment).filter_by(id=segment.id).one()
+        restored_speaker = db_session.query(Speaker).filter_by(
+            id=restored_segment.speaker_id
+        ).one()
+        assert restored_speaker.name == "Alice"
+        assert restored_segment.speaker_name == "Alice"
+        assert restored_segment.is_misidentified is True
+        assert result["segments_replayed_by_legacy_identity"] == 1
+        assert result["legacy_restore_warning"] is not None
+
+    def test_legacy_record_failing_offset_verification_is_not_replayed(
+        self, db_session, backup_dir, tmp_path, monkeypatch
+    ):
+        """A legacy integer id whose row no longer matches the record's
+        conversation/offsets (id reuse) must not be trusted; the live row is
+        reconnected from its own current name instead."""
+        import asyncio
+        from datetime import datetime, timezone
+
+        from app import backup_api
+        from app.models import Conversation, ConversationSegment
+
+        alice = _make_speaker(db_session, "Alice")
+        bob = _make_speaker(db_session, "Bob")
+        conversation = Conversation(
+            title="legacy-reused", start_time=datetime.now(timezone.utc), status="completed"
+        )
+        db_session.add(conversation)
+        db_session.flush()
+        segment = ConversationSegment(
+            conversation_id=conversation.id,
+            speaker_id=bob.id,
+            speaker_name="Bob",
+            text="different row now occupying that id",
+            start_time=datetime.now(timezone.utc),
+            end_time=datetime.now(timezone.utc),
+            start_offset=100.0,
+            end_offset=104.0,
+        )
+        db_session.add(segment)
+        db_session.commit()
+
+        payload = {
+            "name": "PreNamespaceStale",
+            "speakers": [
+                {"id": alice.id, "name": "Alice", "embedding": [1.0, 0.0]},
+                {"id": bob.id, "name": "Bob", "embedding": [0.0, 1.0]},
+            ],
+            "segments": [{
+                "id": segment.id,
+                "conversation_id": conversation.id,
+                "speaker_id": alice.id,
+                "speaker_name": "Alice",
+                "is_misidentified": True,
+                # Offsets from the (deleted) row that originally held this id.
+                "start_offset": 3.25,
+                "end_offset": 7.5,
+            }],
+        }
+        (backup_dir / "checkpoint_pre_namespace_stale.json").write_text(json.dumps(payload))
+        monkeypatch.chdir(tmp_path)
+        result = asyncio.run(backup_api.restore_from_file(
+            filename="checkpoint_pre_namespace_stale.json", db=db_session
+        ))
+
+        db_session.expire_all()
+        restored_segment = db_session.query(ConversationSegment).filter_by(id=segment.id).one()
+        restored_speaker = db_session.query(Speaker).filter_by(
+            id=restored_segment.speaker_id
+        ).one()
+        assert restored_speaker.name == "Bob"
+        assert restored_segment.speaker_name == "Bob"
+        assert restored_segment.is_misidentified is False
+        assert result["segments_replayed_by_legacy_identity"] == 0
+        assert result["segments_not_found"] == 1
+
+    def test_mixed_era_same_namespace_records_without_uuids_still_replay(
+        self, db_session, backup_dir, tmp_path, monkeypatch
+    ):
+        """A file that names THIS database but whose records predate snapshot
+        UUIDs (mid-upgrade builds) is strictly safer than a pure-legacy file;
+        it must replay through the same verified integer identity instead of
+        silently skipping every record."""
+        import asyncio
+        from datetime import datetime, timezone
+
+        from app import backup_api
+        from app.models import Conversation, ConversationSegment
+
+        alice = _make_speaker(db_session, "Alice")
+        bob = _make_speaker(db_session, "Bob")
+        conversation = Conversation(
+            title="mixed-era", start_time=datetime.now(timezone.utc), status="completed"
+        )
+        db_session.add(conversation)
+        db_session.flush()
+        segment = ConversationSegment(
+            conversation_id=conversation.id,
+            speaker_id=bob.id,
+            speaker_name="Bob",
+            text="reassigned after the checkpoint",
+            start_time=datetime.now(timezone.utc),
+            end_time=datetime.now(timezone.utc),
+            start_offset=12.0,
+            end_offset=15.5,
+        )
+        db_session.add(segment)
+        db_session.commit()
+
+        payload = {
+            "name": "MixedEraCheckpoint",
+            "database_namespace": backup_api._get_database_namespace(db_session),
+            "speakers": [
+                {"id": alice.id, "name": "Alice", "embedding": [1.0, 0.0]},
+                {"id": bob.id, "name": "Bob", "embedding": [0.0, 1.0]},
+            ],
+            "segments": [{
+                "id": segment.id,
+                "conversation_id": conversation.id,
+                "speaker_id": alice.id,
+                "speaker_name": "Alice",
+                "is_misidentified": True,
+                "start_offset": 12.0,
+                "end_offset": 15.5,
+            }],
+        }
+        (backup_dir / "checkpoint_mixed_era.json").write_text(json.dumps(payload))
+        monkeypatch.chdir(tmp_path)
+        result = asyncio.run(backup_api.restore_from_file(
+            filename="checkpoint_mixed_era.json", db=db_session
+        ))
+
+        db_session.expire_all()
+        restored_segment = db_session.query(ConversationSegment).filter_by(id=segment.id).one()
+        assert restored_segment.speaker_name == "Alice"
+        assert restored_segment.is_misidentified is True
+        assert result["segments_replayed_by_legacy_identity"] == 1
+        assert result["segment_namespace_match"] is True
+        assert result["legacy_restore_warning"] is not None

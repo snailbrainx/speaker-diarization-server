@@ -10,6 +10,7 @@ import asyncio
 import io
 import json
 import logging
+import math
 import os
 import re
 import traceback
@@ -635,46 +636,28 @@ async def restore_from_file(filename: str, db: Session = Depends(get_db)):
         new_id_by_name = {s.name: s.id for s in db.query(Speaker).all()}
         new_name_by_id = {speaker_id: name for name, speaker_id in new_id_by_name.items()}
 
+        # Legacy files predate database namespaces entirely; only a file that
+        # explicitly names a DIFFERENT database is known-foreign and must never
+        # have its row identities trusted at all.
+        is_foreign_snapshot = (
+            source_namespace is not None and not segment_namespace_match
+        )
+        is_legacy_snapshot = source_namespace is None
+
         segments_updated = 0
         segments_unmapped = 0
         segments_remapped_by_name = 0
         segments_remapped_from_local_names = 0
         segments_not_found = 0
-        segments_skipped_namespace = 0 if segment_namespace_match else len(segments_in)
+        segments_skipped_namespace = len(segments_in) if is_foreign_snapshot else 0
         segments_skipped_identity = 0
+        segments_replayed_by_legacy_identity = 0
+        legacy_records_seen = 0
         directly_restored_segment_ids: set[int] = set()
-        # Even in the same database, SQLite integer IDs may be reused after a
-        # row is deleted. Replay historical state only through persistent row
-        # UUIDs. Foreign and legacy snapshots remain portable for speakers and
-        # settings, but their integer IDs are never used to identify live rows.
-        for seg_data in segments_in if segment_namespace_match else []:
-            segment_snapshot_uuid = seg_data.get("snapshot_uuid")
-            conversation_snapshot_uuid = seg_data.get("conversation_snapshot_uuid")
-            if not (
-                isinstance(segment_snapshot_uuid, str)
-                and segment_snapshot_uuid
-                and isinstance(conversation_snapshot_uuid, str)
-                and conversation_snapshot_uuid
-            ):
-                segments_skipped_identity += 1
-                continue
-            segment = (
-                db.query(ConversationSegment)
-                .join(
-                    Conversation,
-                    Conversation.id == ConversationSegment.conversation_id,
-                )
-                .filter(
-                    ConversationSegment.snapshot_uuid == segment_snapshot_uuid,
-                    Conversation.snapshot_uuid == conversation_snapshot_uuid,
-                )
-                .first()
-            )
-            if not segment:
-                segments_not_found += 1
-                continue
-            directly_restored_segment_ids.add(segment.id)
 
+        def _apply_backup_segment_state(segment, seg_data) -> None:
+            """Replay one backup record onto a positively identified live row."""
+            nonlocal segments_updated, segments_unmapped, segments_remapped_by_name
             old_speaker_id = seg_data.get("speaker_id")
             new_speaker_id = None
             if old_speaker_id and old_speaker_id in speaker_id_map:
@@ -699,6 +682,95 @@ async def restore_from_file(filename: str, db: Session = Depends(get_db)):
                     segments_unmapped += 1
             segment.is_misidentified = seg_data.get("is_misidentified", False)
             segments_updated += 1
+
+        def _int_field(value) -> Optional[int]:
+            # bool is an int subclass; a JSON `true` must not pass as an id.
+            return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+        def _offset_field(value) -> Optional[float]:
+            if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
+                return float(value)
+            return None
+
+        def _verified_legacy_replay(seg_data) -> None:
+            """Replay a record that has no snapshot UUIDs — acceptable only
+            under verification: the live row found by integer id must also
+            match the record's conversation FK and exact offsets, which a
+            reused SQLite id practically never satisfies. NaN/inf offsets are
+            rejected up front (every NaN comparison is False, which would
+            otherwise wave the record through the epsilon guards)."""
+            nonlocal legacy_records_seen, segments_skipped_identity, \
+                segments_not_found, segments_replayed_by_legacy_identity
+            legacy_records_seen += 1
+            seg_id = _int_field(seg_data.get("id"))
+            conv_id = _int_field(seg_data.get("conversation_id"))
+            start = _offset_field(seg_data.get("start_offset"))
+            end = _offset_field(seg_data.get("end_offset"))
+            if seg_id is None or conv_id is None or start is None or end is None:
+                segments_skipped_identity += 1
+                return
+            segment = db.get(ConversationSegment, seg_id)
+            if segment is not None and segment.id in directly_restored_segment_ids:
+                # Duplicate record for a row already replayed; first one wins.
+                segments_skipped_identity += 1
+                return
+            if (
+                segment is None
+                or segment.conversation_id != conv_id
+                or segment.start_offset is None
+                or segment.end_offset is None
+                or abs(segment.start_offset - start) > 1e-3
+                or abs(segment.end_offset - end) > 1e-3
+            ):
+                segments_not_found += 1
+                return
+            directly_restored_segment_ids.add(segment.id)
+            segments_replayed_by_legacy_identity += 1
+            _apply_backup_segment_state(segment, seg_data)
+
+        # Even in the same database, SQLite integer IDs may be reused after a
+        # row is deleted. Replay historical state only through persistent row
+        # UUIDs. Foreign snapshots remain portable for speakers and settings,
+        # but their integer IDs are never used to identify live rows.
+        for seg_data in segments_in if segment_namespace_match else []:
+            segment_snapshot_uuid = seg_data.get("snapshot_uuid")
+            conversation_snapshot_uuid = seg_data.get("conversation_snapshot_uuid")
+            if not (
+                isinstance(segment_snapshot_uuid, str)
+                and segment_snapshot_uuid
+                and isinstance(conversation_snapshot_uuid, str)
+                and conversation_snapshot_uuid
+            ):
+                # Mixed-era record: the file names THIS database but the row
+                # was serialized before snapshot UUIDs existed. Same-DB is
+                # verified, so verified integer identity is safe here too.
+                _verified_legacy_replay(seg_data)
+                continue
+            segment = (
+                db.query(ConversationSegment)
+                .join(
+                    Conversation,
+                    Conversation.id == ConversationSegment.conversation_id,
+                )
+                .filter(
+                    ConversationSegment.snapshot_uuid == segment_snapshot_uuid,
+                    Conversation.snapshot_uuid == conversation_snapshot_uuid,
+                )
+                .first()
+            )
+            if not segment:
+                segments_not_found += 1
+                continue
+            directly_restored_segment_ids.add(segment.id)
+            _apply_backup_segment_state(segment, seg_data)
+
+        # Legacy files (written before database namespaces existed) would
+        # otherwise lose ALL segment replay — silently reducing a checkpoint
+        # restore to a no-op for exactly the assignments the operator wants
+        # reverted. A truly foreign legacy file fails per-row verification and
+        # degrades to the name-based reconnect below.
+        for seg_data in segments_in if is_legacy_snapshot else []:
+            _verified_legacy_replay(seg_data)
 
         # The target rows' own denormalised names are local evidence. Reconnect
         # every row not authoritatively replayed above; this safely covers
@@ -740,6 +812,15 @@ async def restore_from_file(filename: str, db: Session = Depends(get_db)):
                 settings_warning = f"Database restored, but settings could not be persisted: {exc}"
                 logger.exception("Profile database restored but settings persistence failed")
 
+        legacy_warning = None
+        if legacy_records_seen:
+            legacy_warning = (
+                f"{legacy_records_seen} segment record(s) predate snapshot "
+                "UUIDs; replay used verified integer identity (id + "
+                f"conversation + offsets). {segments_replayed_by_legacy_identity} "
+                f"of {legacy_records_seen} passed verification."
+            )
+
         profile_name = data.get("name") or data.get("profile_name", "Unknown")
         return {
             "message": f"Restored profile '{profile_name}'",
@@ -752,7 +833,9 @@ async def restore_from_file(filename: str, db: Session = Depends(get_db)):
             "segments_skipped_namespace": segments_skipped_namespace,
             "segments_skipped_identity": segments_skipped_identity,
             "segments_replayed_by_identity": len(directly_restored_segment_ids),
+            "segments_replayed_by_legacy_identity": segments_replayed_by_legacy_identity,
             "segment_namespace_match": segment_namespace_match,
+            "legacy_restore_warning": legacy_warning,
             "settings_restored": settings_restored,
             "settings_warning": settings_warning,
         }

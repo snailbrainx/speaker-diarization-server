@@ -570,6 +570,94 @@ def test_identify_only_works_with_chunk_audio_without_extraction(db_session, tmp
     assert updated.speaker_name == "Bob"
 
 
+def _segment_for(db, conversation, *, speaker=None, name=None, offset=0.0):
+    segment = ConversationSegment(
+        conversation_id=conversation.id,
+        speaker_id=speaker.id if speaker else None,
+        speaker_name=speaker.name if speaker else name,
+        text="hello",
+        start_time=datetime.now(timezone.utc),
+        end_time=datetime.now(timezone.utc),
+        start_offset=offset,
+        end_offset=offset + 1.0,
+    )
+    db.add(segment)
+    db.flush()
+    return segment
+
+
+def test_identify_auto_enrolled_unknown_propagates_across_conversations(db_session, tmp_path):
+    """Auto-enrolled Unknown_{timestamp} speakers own one globally unique
+    Speaker row reused across recordings; identifying them must follow that
+    row into every conversation, not just the current one."""
+    from app import conversation_api
+    from app.schemas import IdentifySpeakerRequest
+
+    auto = Speaker(name="Unknown_1723180000000000")
+    auto.set_embedding(np.ones(4, dtype=np.float32))
+    bob = Speaker(name="Bob")
+    bob.set_embedding(np.ones(4, dtype=np.float32))
+    db_session.add_all([auto, bob])
+    db_session.commit()
+
+    conversation_a, target, _chunk = _conversation_with_segment(
+        db_session, tmp_path, status="completed", speaker=auto
+    )
+    sibling_a = _segment_for(db_session, conversation_a, speaker=auto, offset=10.0)
+    conversation_b = Conversation(
+        title="other recording", start_time=datetime.now(timezone.utc), status="completed"
+    )
+    db_session.add(conversation_b)
+    db_session.flush()
+    sibling_b = _segment_for(db_session, conversation_b, speaker=auto, offset=0.0)
+    db_session.commit()
+
+    request = IdentifySpeakerRequest(speaker_id=bob.id, enroll=False)
+    asyncio.run(conversation_api.identify_speaker_in_segment(
+        conversation_a.id, target.id, request, db_session, FakeEngine()
+    ))
+    db_session.expire_all()
+    for seg_id in (target.id, sibling_a.id, sibling_b.id):
+        seg = db_session.query(ConversationSegment).filter_by(id=seg_id).one()
+        assert seg.speaker_id == bob.id, f"segment {seg_id} was not propagated"
+        assert seg.speaker_name == "Bob"
+
+
+def test_identify_embeddingless_unknown_stays_conversation_scoped(db_session, tmp_path):
+    """Unknown_XX labels restart at 01 in every recording, so identifying one
+    must never relabel another conversation's unrelated Unknown_01."""
+    from app import conversation_api
+    from app.schemas import IdentifySpeakerRequest
+
+    bob = Speaker(name="Bob")
+    bob.set_embedding(np.ones(4, dtype=np.float32))
+    db_session.add(bob)
+    db_session.commit()
+
+    conversation_a, target, _chunk = _conversation_with_segment(
+        db_session, tmp_path, status="completed"
+    )
+    sibling_a = _segment_for(db_session, conversation_a, name="Unknown_01", offset=10.0)
+    conversation_b = Conversation(
+        title="unrelated recording", start_time=datetime.now(timezone.utc), status="completed"
+    )
+    db_session.add(conversation_b)
+    db_session.flush()
+    unrelated_b = _segment_for(db_session, conversation_b, name="Unknown_01", offset=0.0)
+    db_session.commit()
+
+    request = IdentifySpeakerRequest(speaker_id=bob.id, enroll=False)
+    asyncio.run(conversation_api.identify_speaker_in_segment(
+        conversation_a.id, target.id, request, db_session, FakeEngine()
+    ))
+    db_session.expire_all()
+    assert db_session.query(ConversationSegment).filter_by(id=target.id).one().speaker_name == "Bob"
+    assert db_session.query(ConversationSegment).filter_by(id=sibling_a.id).one().speaker_name == "Bob"
+    untouched = db_session.query(ConversationSegment).filter_by(id=unrelated_b.id).one()
+    assert untouched.speaker_name == "Unknown_01"
+    assert untouched.speaker_id is None
+
+
 def test_enrollment_refuses_chunk_audio_with_conversation_offsets(db_session, tmp_path):
     from app import conversation_api
     from app.schemas import IdentifySpeakerRequest
