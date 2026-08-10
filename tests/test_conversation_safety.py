@@ -9,7 +9,12 @@ from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 
 from app.database import Base
-from app.models import Conversation, ConversationSegment, Speaker
+from app.models import (
+    Conversation,
+    ConversationSegment,
+    Speaker,
+    SpeakerEmotionProfile,
+)
 
 
 @pytest.fixture()
@@ -269,6 +274,68 @@ def test_reprocess_lease_blocks_concurrent_delete(db_session, tmp_path):
     assert stored.processing_token is None
 
 
+def test_reprocess_flushes_new_segments_before_orphan_cleanup(db_session, tmp_path):
+    from app import conversation_api
+
+    # Match app.database.SessionLocal; the production defect is hidden by
+    # SQLAlchemy's default autoflush=True.
+    db_session.autoflush = False
+    audio_path = tmp_path / "reprocess-unknown.wav"
+    audio_path.write_bytes(b"fake-audio-for-stub-engine")
+    unknown = Speaker(name="Unknown_existing")
+    unknown.set_embedding(np.ones(4, dtype=np.float32))
+    db_session.add(unknown)
+    db_session.flush()
+    conversation = Conversation(
+        title="reprocess unknown",
+        start_time=datetime.now(timezone.utc),
+        status="completed",
+        audio_path=str(audio_path),
+    )
+    db_session.add(conversation)
+    db_session.flush()
+    db_session.add(ConversationSegment(
+        conversation_id=conversation.id,
+        speaker_id=unknown.id,
+        speaker_name=unknown.name,
+        text="old",
+        start_time=datetime.now(timezone.utc),
+        end_time=datetime.now(timezone.utc),
+        start_offset=0.0,
+        end_offset=1.0,
+    ))
+    db_session.commit()
+
+    class ExistingUnknownEngine:
+        def transcribe_with_diarization(self, *_args, **_kwargs):
+            return {
+                "segments": [{
+                    "speaker": unknown.name,
+                    "is_known": True,
+                    "confidence": 0.9,
+                    "text": "new",
+                    "start": 0.0,
+                    "end": 1.0,
+                }],
+                "num_speakers": 1,
+            }
+
+        def clear_gpu_cache(self):
+            return None
+
+    result = asyncio.run(conversation_api.reprocess_conversation(
+        conversation.id, db_session, ExistingUnknownEngine()
+    ))
+    assert result["segments"] == 1
+    db_session.expire_all()
+    surviving = db_session.query(Speaker).filter_by(name="Unknown_existing").one()
+    replacement = db_session.query(ConversationSegment).filter_by(
+        conversation_id=conversation.id
+    ).one()
+    assert replacement.speaker_id == surviving.id
+    assert replacement.speaker_name == surviving.name
+
+
 def test_recalculate_emotions_decodes_conversation_once(db_session, tmp_path):
     from app import conversation_api
 
@@ -392,6 +459,91 @@ def test_emotion_profile_rebuild_preloads_once_per_audio_path(db_session, tmp_pa
     assert recalculate_emotion_profile(
         speaker_id, "happy", db_session, engine
     ) == "created"
+    assert engine.preload_calls == 1
+    assert engine.extract_calls == 2
+
+
+def test_identify_retroactive_emotion_preloads_once_per_audio_path(
+    db_session, tmp_path, monkeypatch
+):
+    from app import conversation_api
+    from app.schemas import IdentifySpeakerRequest
+
+    audio_path = tmp_path / "identify-source.wav"
+    audio_path.write_bytes(b"fake-audio-for-stub-engine")
+    speaker = Speaker(name="Known")
+    speaker.set_embedding(np.ones(4, dtype=np.float32))
+    db_session.add(speaker)
+    db_session.flush()
+    profile = SpeakerEmotionProfile(
+        emotion_category="happy",
+        sample_count=1,
+    )
+    profile.set_embedding(np.ones(4, dtype=np.float32))
+    speaker.emotion_profiles.append(profile)
+    conversation = Conversation(
+        title="identify preload",
+        start_time=datetime.now(timezone.utc),
+        status="completed",
+        audio_path=str(audio_path),
+    )
+    db_session.add(conversation)
+    db_session.flush()
+    segments = []
+    for index in range(2):
+        segment = ConversationSegment(
+            conversation_id=conversation.id,
+            speaker_name="Unknown_01",
+            text=f"segment {index}",
+            start_time=datetime.now(timezone.utc),
+            end_time=datetime.now(timezone.utc),
+            start_offset=float(index),
+            end_offset=float(index + 1),
+            emotion_category="happy",
+            emotion_corrected=False,
+        )
+        db_session.add(segment)
+        segments.append(segment)
+    db_session.commit()
+
+    marker = object()
+
+    class CountingEngine:
+        preload_calls = 0
+        extract_calls = 0
+
+        def preload_emotion_audio(self, path):
+            assert path == str(audio_path)
+            self.preload_calls += 1
+            return marker
+
+        def extract_emotion(
+            self, path, _start, _end, *, extract_embedding, preloaded_audio
+        ):
+            assert path == str(audio_path)
+            assert extract_embedding is True
+            assert preloaded_audio is marker
+            self.extract_calls += 1
+            return {"embedding": np.ones(4, dtype=np.float32)}
+
+        def match_emotion_to_profile(self, *_args, **_kwargs):
+            return None
+
+        def clear_gpu_cache(self):
+            return None
+
+    monkeypatch.setattr(
+        conversation_api, "recalculate_speaker_embedding", lambda *_args: 0
+    )
+    monkeypatch.setattr(
+        conversation_api, "cleanup_orphaned_unknowns", lambda *_args, **_kwargs: []
+    )
+    engine = CountingEngine()
+    request = IdentifySpeakerRequest(speaker_id=speaker.id, enroll=False)
+    result = asyncio.run(conversation_api.identify_speaker_in_segment(
+        conversation.id, segments[0].id, request, db_session, engine
+    ))
+    assert result["segments_updated"] == 2
     assert engine.preload_calls == 1
     assert engine.extract_calls == 2
 

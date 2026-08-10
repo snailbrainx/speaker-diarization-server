@@ -27,7 +27,13 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .database import get_db
-from .models import AppMetadata, ConversationSegment, Speaker, SpeakerEmotionProfile
+from .models import (
+    AppMetadata,
+    Conversation,
+    ConversationSegment,
+    Speaker,
+    SpeakerEmotionProfile,
+)
 from .config import VoiceSettings, get_config
 
 router = APIRouter(prefix="/profiles", tags=["Voice Profiles"])
@@ -153,13 +159,20 @@ def _serialize_segments(db: Session) -> list:
         {
             "id": seg.id,
             "conversation_id": seg.conversation_id,
+            "snapshot_uuid": seg.snapshot_uuid,
+            "conversation_snapshot_uuid": conversation_snapshot_uuid,
             "speaker_id": seg.speaker_id,
             "speaker_name": seg.speaker_name,
             "is_misidentified": seg.is_misidentified,
             "start_offset": seg.start_offset,
             "end_offset": seg.end_offset,
         }
-        for seg in db.query(ConversationSegment).all()
+        for seg, conversation_snapshot_uuid in db.query(
+            ConversationSegment, Conversation.snapshot_uuid
+        ).join(
+            Conversation,
+            Conversation.id == ConversationSegment.conversation_id,
+        ).all()
     ]
 
 
@@ -628,21 +641,39 @@ async def restore_from_file(filename: str, db: Session = Depends(get_db)):
         segments_remapped_from_local_names = 0
         segments_not_found = 0
         segments_skipped_namespace = 0 if segment_namespace_match else len(segments_in)
-        # Integer conversation/segment IDs are only meaningful inside the DB
-        # that created them. Foreign and legacy profiles remain portable for
-        # speakers/settings, but must never replay those IDs into this DB.
+        segments_skipped_identity = 0
+        directly_restored_segment_ids: set[int] = set()
+        # Even in the same database, SQLite integer IDs may be reused after a
+        # row is deleted. Replay historical state only through persistent row
+        # UUIDs. Foreign and legacy snapshots remain portable for speakers and
+        # settings, but their integer IDs are never used to identify live rows.
         for seg_data in segments_in if segment_namespace_match else []:
-            segment_query = db.query(ConversationSegment).filter(
-                ConversationSegment.id == seg_data["id"]
-            )
-            if seg_data.get("conversation_id") is not None:
-                segment_query = segment_query.filter(
-                    ConversationSegment.conversation_id == seg_data["conversation_id"]
+            segment_snapshot_uuid = seg_data.get("snapshot_uuid")
+            conversation_snapshot_uuid = seg_data.get("conversation_snapshot_uuid")
+            if not (
+                isinstance(segment_snapshot_uuid, str)
+                and segment_snapshot_uuid
+                and isinstance(conversation_snapshot_uuid, str)
+                and conversation_snapshot_uuid
+            ):
+                segments_skipped_identity += 1
+                continue
+            segment = (
+                db.query(ConversationSegment)
+                .join(
+                    Conversation,
+                    Conversation.id == ConversationSegment.conversation_id,
                 )
-            segment = segment_query.first()
+                .filter(
+                    ConversationSegment.snapshot_uuid == segment_snapshot_uuid,
+                    Conversation.snapshot_uuid == conversation_snapshot_uuid,
+                )
+                .first()
+            )
             if not segment:
                 segments_not_found += 1
                 continue
+            directly_restored_segment_ids.add(segment.id)
 
             old_speaker_id = seg_data.get("speaker_id")
             new_speaker_id = None
@@ -669,18 +700,20 @@ async def restore_from_file(filename: str, db: Session = Depends(get_db)):
             segment.is_misidentified = seg_data.get("is_misidentified", False)
             segments_updated += 1
 
-        if not segment_namespace_match:
-            # The target rows' own denormalised names are local evidence. They
-            # can safely reconnect to newly restored speakers by name without
-            # consulting any foreign conversation/segment integer IDs.
-            for segment in db.query(ConversationSegment).all():
-                new_speaker_id = new_id_by_name.get(segment.speaker_name)
-                if new_speaker_id is None:
-                    continue
-                segment.speaker_id = new_speaker_id
-                segments_remapped_by_name += 1
-                segments_remapped_from_local_names += 1
-                segments_updated += 1
+        # The target rows' own denormalised names are local evidence. Reconnect
+        # every row not authoritatively replayed above; this safely covers
+        # foreign, legacy and stale same-database snapshots without consulting
+        # reusable integer IDs.
+        for segment in db.query(ConversationSegment).all():
+            if segment.id in directly_restored_segment_ids:
+                continue
+            new_speaker_id = new_id_by_name.get(segment.speaker_name)
+            if new_speaker_id is None:
+                continue
+            segment.speaker_id = new_speaker_id
+            segments_remapped_by_name += 1
+            segments_remapped_from_local_names += 1
+            segments_updated += 1
 
         db.commit()
 
@@ -717,6 +750,8 @@ async def restore_from_file(filename: str, db: Session = Depends(get_db)):
             "segments_remapped_from_local_names": segments_remapped_from_local_names,
             "segments_not_found": segments_not_found,
             "segments_skipped_namespace": segments_skipped_namespace,
+            "segments_skipped_identity": segments_skipped_identity,
+            "segments_replayed_by_identity": len(directly_restored_segment_ids),
             "segment_namespace_match": segment_namespace_match,
             "settings_restored": settings_restored,
             "settings_warning": settings_warning,

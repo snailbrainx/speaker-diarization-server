@@ -1,8 +1,27 @@
-from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey, LargeBinary, Text, Boolean, UniqueConstraint
-from sqlalchemy.orm import relationship
-from .database import Base, utc_now
 import json
+import uuid
+
 import numpy as np
+from sqlalchemy import (
+    Boolean,
+    Column,
+    DateTime,
+    Float,
+    ForeignKey,
+    Integer,
+    LargeBinary,
+    String,
+    Text,
+    UniqueConstraint,
+)
+from sqlalchemy.orm import relationship
+
+from .database import Base, utc_now
+
+
+def new_snapshot_uuid() -> str:
+    """Stable row identity for snapshots; unlike SQLite integer IDs, never reused."""
+    return str(uuid.uuid4())
 
 
 class AppMetadata(Base):
@@ -106,6 +125,9 @@ class Conversation(Base):
     __tablename__ = "conversations"
 
     id = Column(Integer, primary_key=True, index=True)
+    snapshot_uuid = Column(
+        String, unique=True, index=True, nullable=False, default=new_snapshot_uuid
+    )
     title = Column(String, nullable=True)  # Auto-generated or user-set
     start_time = Column(DateTime, nullable=False, default=utc_now)
     end_time = Column(DateTime, nullable=True)  # Null while recording
@@ -132,6 +154,9 @@ class ConversationSegment(Base):
     __tablename__ = "conversation_segments"
 
     id = Column(Integer, primary_key=True, index=True)
+    snapshot_uuid = Column(
+        String, unique=True, index=True, nullable=False, default=new_snapshot_uuid
+    )
     conversation_id = Column(Integer, ForeignKey("conversations.id"), nullable=False, index=True)
     speaker_id = Column(Integer, ForeignKey("speakers.id", ondelete="SET NULL"), nullable=True, index=True)  # Null for unknown - auto-set to NULL when speaker deleted
     speaker_name = Column(String, nullable=True)  # Denormalized for quick access

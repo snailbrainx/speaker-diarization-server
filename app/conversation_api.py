@@ -279,6 +279,10 @@ async def reprocess_conversation(
         conversation.num_segments = len(result["segments"])
         conversation.num_speakers = result["num_speakers"]
 
+        # SessionLocal disables autoflush. Persist replacement segments before
+        # orphan detection or the SELECT sees the just-deleted old set and can
+        # delete Unknown_* speakers referenced by pending replacement rows.
+        db.flush()
         deleted_unknowns = cleanup_orphaned_unknowns(db, engine=engine)
         if deleted_unknowns:
             logger.info(
@@ -652,6 +656,9 @@ async def identify_speaker_in_segment(
                 ConversationSegment.speaker_id == speaker.id,
                 ConversationSegment.conversation_id == conversation_id,
             ).all()
+            preloaded_audio_by_path = {}
+            preload_failures = set()
+            preloader = getattr(engine, "preload_emotion_audio", None)
 
             for seg in identified_segments:
                 if not seg.emotion_category or seg.emotion_corrected:
@@ -664,8 +671,33 @@ async def identify_speaker_in_segment(
                         seg.conversation, seg, seg_audio
                     ):
                         try:
+                            kwargs = {"extract_embedding": True}
+                            if preloader is not None:
+                                if (
+                                    seg_audio not in preloaded_audio_by_path
+                                    and seg_audio not in preload_failures
+                                ):
+                                    try:
+                                        preloaded_audio_by_path[seg_audio] = preloader(
+                                            seg_audio
+                                        )
+                                    except Exception as exc:  # noqa: BLE001 - cache one decode/model failure
+                                        preload_failures.add(seg_audio)
+                                        logger.warning(
+                                            "Could not preload emotion audio %s: %s",
+                                            seg_audio,
+                                            exc,
+                                        )
+                                if seg_audio in preload_failures:
+                                    continue
+                                kwargs["preloaded_audio"] = (
+                                    preloaded_audio_by_path[seg_audio]
+                                )
                             emotion_data = engine.extract_emotion(
-                                seg_audio, seg.start_offset, seg.end_offset, extract_embedding=True
+                                seg_audio,
+                                seg.start_offset,
+                                seg.end_offset,
+                                **kwargs,
                             )
                             if emotion_data and 'embedding' in emotion_data:
                                 emotion_embedding = emotion_data.get('embedding')

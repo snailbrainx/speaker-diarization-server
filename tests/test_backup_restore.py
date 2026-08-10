@@ -504,6 +504,8 @@ class TestRestoreValidationAndMapping:
             "segments": [{
                 "id": segment.id,
                 "conversation_id": conversation.id,
+                "snapshot_uuid": segment.snapshot_uuid,
+                "conversation_snapshot_uuid": conversation.snapshot_uuid,
                 "speaker_id": alice.id,
                 "speaker_name": "Alice",
                 "is_misidentified": True,
@@ -521,3 +523,163 @@ class TestRestoreValidationAndMapping:
         assert restored.is_misidentified is True
         assert result["segment_namespace_match"] is True
         assert result["segments_skipped_namespace"] == 0
+
+    def test_same_database_stale_snapshot_ids_cannot_touch_reused_rows(
+        self, db_session, backup_dir, tmp_path, monkeypatch
+    ):
+        import asyncio
+        from datetime import datetime, timezone
+
+        from app import backup_api
+        from app.models import Conversation, ConversationSegment, Speaker
+
+        alice = _make_speaker(db_session, "Alice")
+        bob = _make_speaker(db_session, "Bob")
+        old_conversation = Conversation(
+            title="old", start_time=datetime.now(timezone.utc), status="completed"
+        )
+        db_session.add(old_conversation)
+        db_session.flush()
+        old_segment = ConversationSegment(
+            conversation_id=old_conversation.id,
+            speaker_id=alice.id,
+            speaker_name="Alice",
+            text="old segment",
+            start_time=datetime.now(timezone.utc),
+            end_time=datetime.now(timezone.utc),
+            start_offset=0.0,
+            end_offset=1.0,
+            is_misidentified=True,
+        )
+        db_session.add(old_segment)
+        db_session.commit()
+
+        namespace = backup_api._get_database_namespace(db_session)
+        old_conversation_id = old_conversation.id
+        old_segment_id = old_segment.id
+        payload = {
+            "name": "StaleLocalSnapshot",
+            "database_namespace": namespace,
+            "speakers": [
+                {"id": alice.id, "name": "Alice", "embedding": [1.0, 0.0]},
+                {"id": bob.id, "name": "Bob", "embedding": [0.0, 1.0]},
+            ],
+            "segments": [{
+                "id": old_segment_id,
+                "conversation_id": old_conversation_id,
+                "snapshot_uuid": old_segment.snapshot_uuid,
+                "conversation_snapshot_uuid": old_conversation.snapshot_uuid,
+                "speaker_id": alice.id,
+                "speaker_name": "Alice",
+                "is_misidentified": True,
+            }],
+        }
+
+        db_session.delete(old_segment)
+        db_session.delete(old_conversation)
+        db_session.commit()
+
+        replacement_conversation = Conversation(
+            id=old_conversation_id,
+            title="replacement",
+            start_time=datetime.now(timezone.utc),
+            status="completed",
+        )
+        db_session.add(replacement_conversation)
+        db_session.flush()
+        replacement_segment = ConversationSegment(
+            id=old_segment_id,
+            conversation_id=replacement_conversation.id,
+            speaker_id=bob.id,
+            speaker_name="Bob",
+            text="replacement segment",
+            start_time=datetime.now(timezone.utc),
+            end_time=datetime.now(timezone.utc),
+            start_offset=0.0,
+            end_offset=1.0,
+            is_misidentified=False,
+        )
+        db_session.add(replacement_segment)
+        db_session.commit()
+        assert replacement_segment.snapshot_uuid != payload["segments"][0]["snapshot_uuid"]
+        assert replacement_conversation.snapshot_uuid != payload["segments"][0]["conversation_snapshot_uuid"]
+
+        (backup_dir / "profile_stale_local_snapshot.json").write_text(json.dumps(payload))
+        monkeypatch.chdir(tmp_path)
+        result = asyncio.run(backup_api.restore_from_file(
+            filename="profile_stale_local_snapshot.json", db=db_session
+        ))
+
+        db_session.expire_all()
+        restored_segment = db_session.query(ConversationSegment).filter_by(
+            id=old_segment_id
+        ).one()
+        restored_speaker = db_session.query(Speaker).filter_by(
+            id=restored_segment.speaker_id
+        ).one()
+        assert restored_speaker.name == "Bob"
+        assert restored_segment.speaker_name == "Bob"
+        assert restored_segment.is_misidentified is False
+        assert result["segments_not_found"] == 1
+        assert result["segments_remapped_from_local_names"] == 1
+
+    def test_same_database_legacy_integer_ids_are_not_replayed(
+        self, db_session, backup_dir, tmp_path, monkeypatch
+    ):
+        import asyncio
+        from datetime import datetime, timezone
+
+        from app import backup_api
+        from app.models import Conversation, ConversationSegment, Speaker
+
+        alice = _make_speaker(db_session, "Alice")
+        bob = _make_speaker(db_session, "Bob")
+        conversation = Conversation(
+            title="legacy", start_time=datetime.now(timezone.utc), status="completed"
+        )
+        db_session.add(conversation)
+        db_session.flush()
+        segment = ConversationSegment(
+            conversation_id=conversation.id,
+            speaker_id=bob.id,
+            speaker_name="Bob",
+            text="current local row",
+            start_time=datetime.now(timezone.utc),
+            end_time=datetime.now(timezone.utc),
+            start_offset=0.0,
+            end_offset=1.0,
+        )
+        db_session.add(segment)
+        db_session.commit()
+
+        payload = {
+            "name": "LegacyLocalSnapshot",
+            "database_namespace": backup_api._get_database_namespace(db_session),
+            "speakers": [
+                {"id": alice.id, "name": "Alice", "embedding": [1.0, 0.0]},
+                {"id": bob.id, "name": "Bob", "embedding": [0.0, 1.0]},
+            ],
+            # Legacy snapshots have only reusable SQLite integer IDs.
+            "segments": [{
+                "id": segment.id,
+                "conversation_id": conversation.id,
+                "speaker_id": alice.id,
+                "speaker_name": "Alice",
+                "is_misidentified": True,
+            }],
+        }
+        (backup_dir / "profile_legacy_local_snapshot.json").write_text(json.dumps(payload))
+        monkeypatch.chdir(tmp_path)
+        result = asyncio.run(backup_api.restore_from_file(
+            filename="profile_legacy_local_snapshot.json", db=db_session
+        ))
+
+        db_session.expire_all()
+        restored_segment = db_session.query(ConversationSegment).filter_by(id=segment.id).one()
+        restored_speaker = db_session.query(Speaker).filter_by(
+            id=restored_segment.speaker_id
+        ).one()
+        assert restored_speaker.name == "Bob"
+        assert restored_segment.speaker_name == "Bob"
+        assert restored_segment.is_misidentified is False
+        assert result["segments_skipped_identity"] == 1

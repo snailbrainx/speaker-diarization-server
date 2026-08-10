@@ -1,7 +1,7 @@
 """Regression tests for SQLite pragmas (GLM-004/OPUS-006/QWEN-014) and the
 conversation-list query shape.
 """
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, inspect, text
 
 
 def test_busy_timeout_pragma_applied(tmp_path, monkeypatch):
@@ -78,4 +78,45 @@ def test_conversation_list_does_not_eager_load_segments(tmp_path):
     assert len(selects) == 1, f"expected 1 SELECT, got: {selects}"
     assert not any("conversation_segments" in s for s in selects)
     db.close()
+    engine.dispose()
+
+
+def test_old_schema_migration_backfills_stable_snapshot_uuids(tmp_path, monkeypatch):
+    from app import database
+
+    engine = create_engine(f"sqlite:///{tmp_path}/old-schema.db")
+    with engine.begin() as conn:
+        conn.execute(text("CREATE TABLE conversations (id INTEGER PRIMARY KEY)"))
+        conn.execute(text(
+            "CREATE TABLE conversation_segments "
+            "(id INTEGER PRIMARY KEY, conversation_id INTEGER NOT NULL)"
+        ))
+        conn.execute(text("INSERT INTO conversations (id) VALUES (1), (2)"))
+        conn.execute(text(
+            "INSERT INTO conversation_segments (id, conversation_id) "
+            "VALUES (1, 1), (2, 2)"
+        ))
+
+    monkeypatch.setattr(database, "engine", engine)
+    database.init_db()
+    database.init_db()  # idempotent restart
+
+    schema = inspect(engine)
+    assert "snapshot_uuid" in {
+        column["name"] for column in schema.get_columns("conversations")
+    }
+    assert "snapshot_uuid" in {
+        column["name"] for column in schema.get_columns("conversation_segments")
+    }
+    with engine.connect() as conn:
+        conversation_ids = conn.execute(text(
+            "SELECT snapshot_uuid FROM conversations ORDER BY id"
+        )).scalars().all()
+        segment_ids = conn.execute(text(
+            "SELECT snapshot_uuid FROM conversation_segments ORDER BY id"
+        )).scalars().all()
+    assert len(conversation_ids) == len(set(conversation_ids)) == 2
+    assert len(segment_ids) == len(set(segment_ids)) == 2
+    assert all(conversation_ids)
+    assert all(segment_ids)
     engine.dispose()
