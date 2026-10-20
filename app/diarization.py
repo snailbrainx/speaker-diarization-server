@@ -38,6 +38,75 @@ UNKNOWN_NAME_MAX_ATTEMPTS = 5
 
 # Emotion detection constants
 MIN_VOICE_SAMPLES = 3
+
+# Opt-in speed settings (all off by default; unset = the original behaviour).
+#   WHISPER_BATCH_SIZE=16      faster-whisper's BatchedInferencePipeline: VAD chunks transcribed 16 at a time.
+#                              ~8x faster transcription on a 3090 / CMP 170HX; returns ~30 s segments, so use it
+#                              together with WORD_LEVEL_SPEAKERS.
+#   WORD_LEVEL_SPEAKERS=true   give every word the diarization speaker at its midpoint and split segments where the
+#                              speaker changes (or after a pause / a long run), instead of one speaker per segment.
+#   PYANNOTE_ALLOW_TF32=true   keep TF32 matmuls on for pyannote (it turns them off for bit-reproducibility).
+WHISPER_BATCH_SIZE = int(os.getenv("WHISPER_BATCH_SIZE", "0") or 0)
+WORD_LEVEL_SPEAKERS = os.getenv("WORD_LEVEL_SPEAKERS", "false").lower() == "true"
+PYANNOTE_ALLOW_TF32 = os.getenv("PYANNOTE_ALLOW_TF32", "false").lower() == "true"
+SPLIT_PAUSE_SEC = 1.0      # WORD_LEVEL_SPEAKERS: a pause this long between words starts a new segment
+SPLIT_MAX_SEC = 30.0       # WORD_LEVEL_SPEAKERS: longest segment before a forced split at a word boundary
+
+
+def _speaker_at(t: float, diar_segments: List[Dict]) -> Optional[str]:
+    """Diarization speaker whose turn contains time t, else the nearest turn's speaker."""
+    for d in diar_segments:
+        if d["start"] <= t <= d["end"]:
+            return d["speaker"]
+    best, label = float("inf"), None
+    for d in diar_segments:
+        dist = min(abs(d["start"] - t), abs(d["end"] - t))
+        if dist < best:
+            best, label = dist, d["speaker"]
+    return label
+
+
+def _split_by_speaker(transcription_segments: List[Dict], diar_segments: List[Dict]) -> List[Dict]:
+    """Re-cut transcription segments at word boundaries so each piece has one diarization speaker."""
+    out = []
+    for seg in transcription_segments:
+        words = seg.get("words") or []
+        if not words or not diar_segments:
+            out.append(seg)
+            continue
+        current, current_spk = [], None
+        for w in words:
+            spk = _speaker_at((w["start"] + w["end"]) / 2, diar_segments)
+            if current and (spk != current_spk or w["start"] - current[-1]["end"] > SPLIT_PAUSE_SEC
+                            or w["end"] - current[0]["start"] > SPLIT_MAX_SEC):
+                out.append(_piece(seg, current))
+                current = []
+            if not current:
+                current_spk = spk
+            current.append(w)
+        if current:
+            out.append(_piece(seg, current))
+    return out
+
+
+def _piece(seg: Dict, words: List[Dict]) -> Dict:
+    return {"start": words[0]["start"], "end": words[-1]["end"],
+            "text": "".join(w["word"] for w in words).strip(), "words": words,
+            "avg_logprob": seg.get("avg_logprob")}
+
+
+def _keep_tf32_on():
+    """pyannote calls fix_reproducibility() on every inference, which switches TF32 off; make it a no-op."""
+    import sys as _sys
+    import pyannote.audio.utils.reproducibility as rep
+    original = rep.fix_reproducibility
+    noop = lambda device: None  # noqa: E731
+    for mod in list(_sys.modules.values()):
+        if getattr(mod, "fix_reproducibility", None) is original:
+            mod.fix_reproducibility = noop
+    rep.fix_reproducibility = noop
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
 DUAL_DETECTOR_AGREE_D1 = 0.70
 DUAL_DETECTOR_AGREE_D2 = 0.80
 VOICE_STRONG_THRESHOLD = 0.85
@@ -349,6 +418,9 @@ class SpeakerRecognitionEngine:
                     os.environ["HF_TOKEN"] = self.hf_token
                 pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-community-1")
                 pipeline.to(self.device)
+                if PYANNOTE_ALLOW_TF32:
+                    _keep_tf32_on()
+                    logger.info("pyannote: TF32 kept on (PYANNOTE_ALLOW_TF32=true)")
                 self._diarization_pipeline = pipeline
         return self._diarization_pipeline
 
@@ -382,6 +454,18 @@ class SpeakerRecognitionEngine:
                 self._whisper_model = WhisperModel(model_name, device=device_name, compute_type=compute_type)
                 logger.info(f"faster-whisper model '{model_name}' loaded")
         return self._whisper_model
+
+    @property
+    def batched_whisper(self):
+        """faster-whisper BatchedInferencePipeline over the same model (only used when WHISPER_BATCH_SIZE > 0)."""
+        if getattr(self, "_batched_whisper", None) is None:
+            model = self.whisper_model
+            with self._model_lock:
+                if getattr(self, "_batched_whisper", None) is None:
+                    from faster_whisper import BatchedInferencePipeline
+                    self._batched_whisper = BatchedInferencePipeline(model=model)
+                    logger.info(f"faster-whisper batched pipeline on (batch size {WHISPER_BATCH_SIZE})")
+        return self._batched_whisper
 
     @property
     def emotion_model(self):
@@ -433,14 +517,25 @@ class SpeakerRecognitionEngine:
         # Use "auto" for auto-detection, or specify language code (e.g., "es", "fr", "de")
         language = os.getenv("WHISPER_LANGUAGE", "en")
         # faster-whisper transcription with word-level timestamps and confidence
-        segments_generator, info = self.whisper_model.transcribe(
-            audio_file,
-            language=None if language == "auto" else language,  # None = auto-detect
-            task="transcribe",
-            beam_size=5,
-            vad_filter=True,  # Use VAD to filter out non-speech
-            word_timestamps=True  # Enable word-level timestamps and probabilities
-        )
+        if WHISPER_BATCH_SIZE > 0:
+            # Batched pipeline (VAD-chunked, always filters non-speech); see WHISPER_BATCH_SIZE above.
+            segments_generator, info = self.batched_whisper.transcribe(
+                audio_file,
+                language=None if language == "auto" else language,
+                task="transcribe",
+                beam_size=5,
+                batch_size=WHISPER_BATCH_SIZE,
+                word_timestamps=True
+            )
+        else:
+            segments_generator, info = self.whisper_model.transcribe(
+                audio_file,
+                language=None if language == "auto" else language,  # None = auto-detect
+                task="transcribe",
+                beam_size=5,
+                vad_filter=True,  # Use VAD to filter out non-speech
+                word_timestamps=True  # Enable word-level timestamps and probabilities
+            )
 
         logger.info(f"Detected language: {info.language} (probability: {info.language_probability:.2f})")
 
@@ -951,6 +1046,11 @@ class SpeakerRecognitionEngine:
 
         elapsed = time.time() - start_time
         logger.info(f"Parallel processing completed in {elapsed:.2f}s")
+
+        if WORD_LEVEL_SPEAKERS:
+            before = len(transcription_segments)
+            transcription_segments = _split_by_speaker(transcription_segments, diarization_result["segments"])
+            logger.info(f"Word-level speakers: {before} transcription segments -> {len(transcription_segments)}")
 
         # Explicit cleanup after parallel processing to free VRAM before emotion extraction
         del transcription_future, diarization_future
