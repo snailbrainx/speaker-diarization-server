@@ -116,6 +116,14 @@ def _label_at_midpoint(seg: Dict, diar_segments: List[Dict]) -> Optional[str]:
     return label
 
 
+def _float_samples(segment: "AudioSegment") -> np.ndarray:
+    """Mono float32 samples in [-1, 1]: what FunASR (torchaudio.load + channel mean) reads from the same WAV file."""
+    samples = np.array(segment.get_array_of_samples(), dtype=np.float32)
+    if segment.channels > 1:
+        samples = samples.reshape(-1, segment.channels).mean(axis=1)
+    return samples / float(1 << (8 * segment.sample_width - 1))
+
+
 def _centroid(embeddings: List[np.ndarray], weights: List[float]) -> Optional[np.ndarray]:
     """Weighted mean of L2-normalised embeddings (a cosine-similarity centroid)."""
     if not embeddings:
@@ -909,20 +917,12 @@ class SpeakerRecognitionEngine:
                 if preloaded_audio is None and segment.frame_rate != 16000:
                     segment = segment.set_frame_rate(16000)
 
-                # Save to temp file
-                with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_file:
-                    segment.export(temp_file.name, format='wav')
-                    temp_path = temp_file.name
-
-                try:
-                    result = self.emotion_model.generate(
-                        temp_path,
-                        granularity="utterance",
-                        extract_embedding=extract_embedding,
-                    )
-                finally:
-                    if os.path.exists(temp_path):
-                        os.unlink(temp_path)
+                # Hand the samples over in memory: a temp WAV per segment stalls on a busy disk.
+                result = self.emotion_model.generate(
+                    _float_samples(segment),
+                    granularity="utterance",
+                    extract_embedding=extract_embedding,
+                )
             else:
                 # Process a bounded, normalized copy. Passing the original
                 # filename when it was already 16 kHz bypassed the duration

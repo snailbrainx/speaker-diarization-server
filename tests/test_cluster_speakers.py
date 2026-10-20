@@ -120,3 +120,15 @@ def test_segment_mode_names_unmatched_labels_consistently(eng):
                 (_seg(2, 3), "SPEAKER_00", None), (_seg(3, 4), None, None)]
     names = [w["speaker"] for w in eng._identify_segments(segments, [], 0.30, None)]
     assert names == ["Unknown_01", "Unknown_02", "Unknown_01", "Unknown_03"]
+
+
+def test_float_samples_match_reading_the_exported_wav(tmp_path):
+    pydub = pytest.importorskip("pydub")
+    sf = pytest.importorskip("soundfile")
+    from app.diarization import _float_samples
+    rng = np.random.default_rng(0)
+    stereo = (rng.uniform(-0.9, 0.9, size=(1600, 2)) * 32767).astype(np.int16)
+    seg = pydub.AudioSegment(stereo.tobytes(), frame_rate=16000, sample_width=2, channels=2)
+    seg.export(tmp_path / "s.wav", format="wav")
+    expected = sf.read(tmp_path / "s.wav", dtype="float32")[0].mean(axis=1)
+    assert np.allclose(_float_samples(seg), expected, atol=1e-6)
