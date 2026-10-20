@@ -12,7 +12,8 @@ from sqlalchemy import exists
 from sqlalchemy.orm import Session, joinedload
 
 from .models import Speaker, ConversationSegment, SpeakerEmotionProfile
-from .diarization import auto_enroll_unknown_speaker
+from .diarization import (CENTROID_MAX_WEIGHT_SEC, CLUSTER_SPEAKERS, MIN_SEGMENT_DURATION_SEC, _centroid,
+                          auto_enroll_unknown_speaker)
 
 logger = logging.getLogger(__name__)
 
@@ -184,13 +185,22 @@ def recalculate_speaker_embedding(
     if not segments:
         return 0
 
+    if CLUSTER_SPEAKERS:
+        # Build the profile the way cluster mode matches speakers: segments too short to embed reliably are left out
+        # (the pipeline never embeds them; re-extracted they are noise), the rest weighted by duration.
+        segments = [s for s in segments if s.end_offset - s.start_offset >= MIN_SEGMENT_DURATION_SEC]
+        if not segments:
+            return 0
+
     embeddings = []
+    weights = []
     batch_segments = []
 
     for seg in segments:
         stored = seg.get_speaker_embedding()
         if stored is not None and not np.isnan(stored).any():
             embeddings.append(stored)
+            weights.append(min(seg.end_offset - seg.start_offset, CENTROID_MAX_WEIGHT_SEC))
         else:
             audio_path = resolve_audio_path(seg.conversation, seg)
             if audio_path and not uses_segment_audio_fallback(seg.conversation, seg, audio_path):
@@ -208,12 +218,15 @@ def recalculate_speaker_embedding(
 
     if batch_segments:
         extracted = engine.extract_segment_embeddings_batch(batch_segments)
-        embeddings.extend([e for e in extracted if e is not None and not np.isnan(e).any()])
+        for e, seg in zip(extracted, batch_segments):
+            if e is not None and not np.isnan(e).any():
+                embeddings.append(e)
+                weights.append(min(seg['end_time'] - seg['start_time'], CENTROID_MAX_WEIGHT_SEC))
 
     if not embeddings:
         return 0
 
-    speaker.set_embedding(np.mean(embeddings, axis=0))
+    speaker.set_embedding(_centroid(embeddings, weights) if CLUSTER_SPEAKERS else np.mean(embeddings, axis=0))
     return len(embeddings)
 
 

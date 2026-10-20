@@ -132,3 +132,25 @@ def test_float_samples_match_reading_the_exported_wav(tmp_path):
     seg.export(tmp_path / "s.wav", format="wav")
     expected = sf.read(tmp_path / "s.wav", dtype="float32")[0].mean(axis=1)
     assert np.allclose(_float_samples(seg), expected, atol=1e-6)
+
+
+def test_cluster_mode_profile_skips_short_segments_and_weights_by_duration(db_session, monkeypatch):
+    from datetime import datetime, timezone
+    from app import services
+    from app.models import Conversation, ConversationSegment
+    monkeypatch.setattr(services, "CLUSTER_SPEAKERS", True)
+    speaker_id = _enroll(db_session, "Alice", _vec(0, 1))
+    conv = Conversation(title="t", start_time=datetime.now(timezone.utc), status="completed", audio_path=None)
+    db_session.add(conv)
+    db_session.flush()
+    for (start, end), emb in (((0, 0.3), _vec(-1, 0)), ((1, 3), _vec(1, 0.2)), ((4, 10), _vec(1, -0.2))):
+        seg = ConversationSegment(conversation_id=conv.id, speaker_id=speaker_id, speaker_name="Alice", text="x",
+                                  start_time=datetime.now(timezone.utc), end_time=datetime.now(timezone.utc),
+                                  start_offset=start, end_offset=end)
+        seg.set_speaker_embedding(emb * 7)
+        db_session.add(seg)
+    db_session.flush()
+    speaker = db_session.get(Speaker, speaker_id)
+    assert services.recalculate_speaker_embedding(speaker, db_session, None) == 2   # the 0.3 s segment is left out
+    expected = _centroid([_vec(1, 0.2), _vec(1, -0.2)], [2.0, 6.0])
+    assert np.allclose(speaker.get_embedding(), expected, atol=1e-5)
