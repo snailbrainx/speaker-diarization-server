@@ -89,7 +89,10 @@ def create_segment_from_result(
     speaker_name = seg["speaker"]
     confidence = seg.get("confidence", 0.0)
 
-    if seg.get("is_known"):
+    if seg.get("speaker_id") is not None:
+        # Identified (or auto-enrolled) once for the whole diarization speaker (SPEAKER_ASSIGNMENT=cluster)
+        speaker_id = seg["speaker_id"]
+    elif seg.get("is_known"):
         speaker = db.query(Speaker).filter(Speaker.name == speaker_name).first()
         if speaker:
             speaker_id = speaker.id

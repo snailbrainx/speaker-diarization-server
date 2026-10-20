@@ -494,6 +494,7 @@ async def _handle_segment_processed(
         import traceback
         traceback.print_exc()
         db.rollback()
+        engine.clear_speaker_cache()  # it may hold Unknown_* speakers enrolled by this rolled-back segment
         await _send_message_bounded(websocket, "error", {"message": "Segment processing error"})
         raise
     finally:
