@@ -50,10 +50,16 @@ MIN_VOICE_SAMPLES = 3
 #                              instead of each segment on its own (a short segment's embedding is too noisy: one
 #                              person ends up as several Unknown_* speakers). Words get their speaker from pyannote's
 #                              exclusive (non-overlapping) diarization. Implies word-level speakers.
+#   CLUSTER_SPEAKER_THRESHOLD=0.70  cosine similarity a speaker's centroid needs to be given a stored person's name in
+#                              cluster mode (used instead of the Settings speaker_threshold, which is tuned for single
+#                              segments). On the AMI test meetings, right person 0.75-0.92, a different person up to
+#                              0.62: at 0.30 a visitor who was never enrolled got an enrolled person's name 89% of the
+#                              time, at 0.65-0.75 never, while 95.5% of enrolled people's speech was still recognised.
 WHISPER_BATCH_SIZE = int(os.getenv("WHISPER_BATCH_SIZE", "0") or 0)
 WORD_LEVEL_SPEAKERS = os.getenv("WORD_LEVEL_SPEAKERS", "false").lower() == "true"
 PYANNOTE_ALLOW_TF32 = os.getenv("PYANNOTE_ALLOW_TF32", "false").lower() == "true"
 CLUSTER_SPEAKERS = os.getenv("SPEAKER_ASSIGNMENT", "segment").lower() == "cluster"
+CLUSTER_SPEAKER_THRESHOLD = float(os.getenv("CLUSTER_SPEAKER_THRESHOLD") or 0.70)
 SPLIT_PAUSE_SEC = 1.0      # WORD_LEVEL_SPEAKERS: a pause this long between words starts a new segment
 SPLIT_MAX_SEC = 30.0       # WORD_LEVEL_SPEAKERS: longest segment before a forced split at a word boundary
 CENTROID_MAX_WEIGHT_SEC = 10.0  # SPEAKER_ASSIGNMENT=cluster: a segment counts by its duration, up to this
@@ -1109,7 +1115,7 @@ class SpeakerRecognitionEngine:
         # Pass 2: who is speaking in each segment.
         if CLUSTER_SPEAKERS:
             identities = self._identify_clusters(audio_file, segments, diarization_result, known_speakers,
-                                                 threshold, db_session)
+                                                 CLUSTER_SPEAKER_THRESHOLD, db_session)
             speakers = [identities[label] for _, label, _ in segments]
         else:
             speakers = self._identify_segments(segments, known_speakers, threshold, db_session)
@@ -1252,8 +1258,8 @@ class SpeakerRecognitionEngine:
         """SPEAKER_ASSIGNMENT=cluster: one identity per diarization speaker, decided once from all of its speech.
 
         A speaker's voice is the duration-weighted centroid of its segments' embeddings. Speakers are matched to the
-        stored people one-to-one (pyannote has already decided they are different people), above the configured
-        threshold and no lower. A speaker that matches nobody becomes ONE new Unknown_* (auto-enrolled with the
+        stored people one-to-one (pyannote has already decided they are different people), above the threshold
+        (CLUSTER_SPEAKER_THRESHOLD) and no lower. A speaker that matches nobody becomes ONE new Unknown_* (auto-enrolled with the
         centroid), so an unsure match stays unknown instead of being given someone else's name.
         """
         groups: Dict[Optional[str], Tuple[List[np.ndarray], List[float]]] = {}
