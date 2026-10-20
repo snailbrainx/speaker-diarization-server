@@ -49,7 +49,8 @@ MIN_VOICE_SAMPLES = 3
 #   SPEAKER_ASSIGNMENT=cluster identify each diarization speaker once per file, from all of that speaker's segments,
 #                              instead of each segment on its own (a short segment's embedding is too noisy: one
 #                              person ends up as several Unknown_* speakers). Words get their speaker from pyannote's
-#                              exclusive (non-overlapping) diarization. Implies word-level speakers.
+#                              exclusive (non-overlapping) diarization. Implies word-level speakers. Uploaded and
+#                              reprocessed files only: live chunks keep per-segment matching.
 #   CLUSTER_SPEAKER_THRESHOLD=0.70  cosine similarity a speaker's centroid needs to be given a stored person's name in
 #                              cluster mode (used instead of the Settings speaker_threshold, which is tuned for single
 #                              segments). On the AMI test meetings, right person 0.75-0.92, a different person up to
@@ -1048,7 +1049,8 @@ class SpeakerRecognitionEngine:
         audio_file: str,
         known_speakers: List[Tuple[int, str, np.ndarray]] = None,
         threshold: float = 0.7,
-        db_session = None
+        db_session = None,
+        cluster_speakers: Optional[bool] = None,
     ) -> Dict:
         """
         Full pipeline: transcription + diarization + speaker recognition + personalized emotions
@@ -1058,6 +1060,8 @@ class SpeakerRecognitionEngine:
             known_speakers: Optional list of (id, name, embedding) tuples
             threshold: Similarity threshold for speaker matching
             db_session: Optional database session for personalized emotion matching
+            cluster_speakers: identify each diarization speaker once (SPEAKER_ASSIGNMENT=cluster); None = the
+                setting. Live chunks pass False: a few seconds of speech is too little for the cluster threshold.
 
         Returns:
             Dictionary with transcribed segments and speaker labels
@@ -1083,8 +1087,10 @@ class SpeakerRecognitionEngine:
         elapsed = time.time() - start_time
         logger.info(f"Parallel processing completed in {elapsed:.2f}s")
 
-        if CLUSTER_SPEAKERS or WORD_LEVEL_SPEAKERS:
-            turns = diarization_result["exclusive_segments" if CLUSTER_SPEAKERS else "segments"]
+        if cluster_speakers is None:
+            cluster_speakers = CLUSTER_SPEAKERS
+        if cluster_speakers or WORD_LEVEL_SPEAKERS:
+            turns = diarization_result["exclusive_segments" if cluster_speakers else "segments"]
             before = len(transcription_segments)
             transcription_segments = _split_by_speaker(transcription_segments, turns)
             logger.info(f"Word-level speakers: {before} transcription segments -> {len(transcription_segments)}")
@@ -1113,7 +1119,7 @@ class SpeakerRecognitionEngine:
             segments.append((trans_seg, label, self._segment_embedding_or_none(audio_file, trans_seg)))
 
         # Pass 2: who is speaking in each segment.
-        if CLUSTER_SPEAKERS:
+        if cluster_speakers:
             identities = self._identify_clusters(audio_file, segments, diarization_result, known_speakers,
                                                  CLUSTER_SPEAKER_THRESHOLD, db_session)
             speakers = [identities[label] for _, label, _ in segments]
