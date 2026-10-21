@@ -1,12 +1,13 @@
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
 from sqlalchemy import func
 from sqlalchemy.orm import Session
-from typing import List
+from typing import List, Optional
 import os
 import shutil
 import asyncio
 import logging
 from datetime import timedelta
+import numpy as np
 import torch
 from pydub import AudioSegment
 
@@ -15,7 +16,7 @@ logger = logging.getLogger(__name__)
 from .database import get_db, utc_now
 from .models import Speaker, SpeakerEmotionProfile, Conversation, ConversationSegment
 from .schemas import (
-    SpeakerResponse, SpeakerRename,
+    SpeakerResponse, SpeakerRename, SpeakerSegment, UnknownVoiceMatches, VoiceMatch,
     StatusResponse, ConversationResponse,
 )
 from .diarization import SpeakerRecognitionEngine
@@ -63,27 +64,88 @@ async def get_status():
 
 @router.get("/speakers", response_model=List[SpeakerResponse])
 async def list_speakers(db: Session = Depends(get_db)):
-    """List all enrolled speakers with segment counts"""
+    """List all enrolled speakers with segment counts, seconds of speech and when they were last heard"""
     speakers_with_counts = db.query(
         Speaker,
-        func.count(ConversationSegment.id).label('segment_count')
+        func.count(ConversationSegment.id).label('segment_count'),
+        func.coalesce(func.sum(ConversationSegment.end_offset - ConversationSegment.start_offset), 0.0),
+        func.max(ConversationSegment.end_time),
     ).outerjoin(
         ConversationSegment, Speaker.id == ConversationSegment.speaker_id
     ).group_by(Speaker.id).all()
 
     # Convert to response format
     result = []
-    for speaker, segment_count in speakers_with_counts:
+    for speaker, segment_count, speech_seconds, last_heard in speakers_with_counts:
         speaker_dict = {
             "id": speaker.id,
             "name": speaker.name,
             "created_at": speaker.created_at,
             "updated_at": speaker.updated_at,
-            "segment_count": segment_count
+            "segment_count": segment_count,
+            "speech_seconds": float(speech_seconds or 0.0),
+            "last_heard": last_heard,
         }
         result.append(SpeakerResponse(**speaker_dict))
 
     return result
+
+
+@router.get("/speakers/unknown/matches", response_model=List[UnknownVoiceMatches])
+async def unknown_voice_matches(db: Session = Depends(get_db)):
+    """Every Unknown voice with the closest named speaker and the closest other Unknown (cosine similarity of the
+    stored voices): an Unknown that is close to someone is probably them, and can be merged by identifying one of its
+    segments as that person."""
+    voices = []
+    for speaker in db.query(Speaker).all():
+        v = speaker.get_embedding() if speaker.embedding is not None else None
+        if v is None or not len(v) or np.isnan(v).any() or not np.linalg.norm(v):
+            continue
+        voices.append((speaker, v / np.linalg.norm(v)))
+    # voices of another model (before the startup migration) cannot be compared: keep the current model's size
+    dims = [len(v) for _, v in voices]
+    voices = [(s, v) for s, v in voices if len(v) == max(set(dims), key=dims.count)]
+    if not voices:
+        return []
+    matrix = np.stack([v for _, v in voices])
+    result = []
+    for i, (speaker, v) in enumerate(voices):
+        if not speaker.name.startswith("Unknown_"):
+            continue
+        sims = matrix @ v
+        best = {}
+        for j in np.argsort(-sims):
+            other = voices[j][0]
+            if j == i:
+                continue
+            kind = "unknown" if other.name.startswith("Unknown_") else "person"
+            if kind not in best:
+                best[kind] = VoiceMatch(speaker_id=other.id, speaker_name=other.name, similarity=round(float(sims[j]), 4))
+            if len(best) == 2:
+                break
+        result.append(UnknownVoiceMatches(speaker_id=speaker.id, speaker_name=speaker.name, **best))
+    return result
+
+
+@router.get("/speakers/{speaker_id}/segments", response_model=List[SpeakerSegment])
+async def list_speaker_segments(
+    speaker_id: int,
+    limit: int = 20,
+    order: str = "recent",
+    db: Session = Depends(get_db),
+):
+    """A speaker's segments, newest first (order=recent) or longest first (order=longest): to hear who a voice is,
+    or to identify one of its segments (which moves an Unknown's segments with it)."""
+    if not db.query(Speaker.id).filter(Speaker.id == speaker_id).first():
+        raise HTTPException(status_code=404, detail="Speaker not found")
+    sort = ((ConversationSegment.end_offset - ConversationSegment.start_offset).desc() if order == "longest"
+            else ConversationSegment.end_time.desc())
+    rows = db.query(ConversationSegment, Conversation.title).join(
+        Conversation, Conversation.id == ConversationSegment.conversation_id
+    ).filter(ConversationSegment.speaker_id == speaker_id).order_by(sort).limit(max(1, min(limit, 500))).all()
+    return [SpeakerSegment(id=s.id, conversation_id=s.conversation_id, conversation_title=title, text=s.text,
+                           start_offset=s.start_offset, end_offset=s.end_offset, start_time=s.start_time)
+            for s, title in rows]
 
 
 @router.post("/speakers/enroll", response_model=SpeakerResponse)
@@ -244,9 +306,10 @@ async def delete_speaker(speaker_id: int, db: Session = Depends(get_db)):
 
 
 @router.delete("/speakers/unknown/all")
-async def delete_all_unknown_speakers(db: Session = Depends(get_db)):
-    """Delete all speakers with names starting with 'Unknown_'"""
-    deleted_count, _ = delete_unknown_speakers(db, engine=get_engine())
+async def delete_all_unknown_speakers(max_seconds: Optional[float] = None, db: Session = Depends(get_db)):
+    """Delete all speakers with names starting with 'Unknown_' (with max_seconds: only those with at most that many
+    seconds of speech). Their segments stay, without a speaker."""
+    deleted_count, _ = delete_unknown_speakers(db, engine=get_engine(), max_seconds=max_seconds)
     db.commit()
 
     return {

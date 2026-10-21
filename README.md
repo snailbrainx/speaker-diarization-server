@@ -496,7 +496,8 @@ emotion2vec said *surprised* but the personalized detector is unavailable (no 3+
 Full interactive docs at `/docs` (Swagger UI). The OpenAPI JSON is at `/openapi.json`. Endpoint groups:
 
 - `GET /api/v1/status` — health + GPU.
-- `GET /api/v1/speakers`, `POST /api/v1/speakers/enroll`, `PATCH /api/v1/speakers/{id}/rename`, `DELETE /api/v1/speakers/{id}`, `DELETE /api/v1/speakers/unknown/all` — list, enroll, rename, delete.
+- `GET /api/v1/speakers`, `POST /api/v1/speakers/enroll`, `PATCH /api/v1/speakers/{id}/rename`, `DELETE /api/v1/speakers/{id}`, `DELETE /api/v1/speakers/unknown/all` — list (with seconds of speech and when last heard), enroll, rename, delete (`?max_seconds=` deletes only Unknowns heard for at most that long).
+- `GET /api/v1/speakers/{id}/segments` — a speaker's segments, newest (`order=recent`) or longest first; `GET /api/v1/speakers/unknown/matches` — each Unknown with the closest enrolled person and the closest other Unknown.
 - `GET/DELETE /api/v1/conversations/speakers/{id}/emotion-profiles`, `GET/PATCH .../emotion-threshold`, `PATCH .../emotion-profiles/{emotion}/{threshold,voice-threshold}` — emotion profiles and thresholds.
 - `GET /api/v1/conversations`, `GET/PATCH/DELETE /api/v1/conversations/{id}` — list, read, rename, delete conversations.
 - `POST /api/v1/conversations/{id}/reprocess`, `POST /api/v1/conversations/{id}/recalculate-emotions` — re-run pipelines.

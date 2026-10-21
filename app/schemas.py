@@ -11,9 +11,37 @@ class SpeakerResponse(SpeakerBase):
     created_at: datetime
     updated_at: datetime
     segment_count: int = 0  # Number of segments this speaker has
+    speech_seconds: float = 0.0  # how long their segments last in all
+    last_heard: Optional[datetime] = None  # when their latest segment ended
 
     class Config:
         from_attributes = True
+
+class SpeakerSegment(BaseModel):
+    """One of a speaker's segments, with the conversation it is in."""
+    id: int
+    conversation_id: int
+    conversation_title: Optional[str]
+    text: Optional[str]
+    start_offset: float
+    end_offset: float
+    start_time: datetime
+
+
+class VoiceMatch(BaseModel):
+    """The closest other voice to a speaker's: cosine similarity of the stored voice embeddings."""
+    speaker_id: int
+    speaker_name: str
+    similarity: float
+
+
+class UnknownVoiceMatches(BaseModel):
+    """An Unknown voice and the stored voices closest to it, to tell which Unknowns are someone already known."""
+    speaker_id: int
+    speaker_name: str
+    person: Optional[VoiceMatch] = None   # the closest named speaker
+    unknown: Optional[VoiceMatch] = None  # the closest other Unknown
+
 
 class SpeakerRename(BaseModel):
     new_name: str

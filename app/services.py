@@ -8,7 +8,7 @@ import logging
 import numpy as np
 from datetime import timedelta
 from typing import Any, Dict, List, Optional, Tuple
-from sqlalchemy import exists
+from sqlalchemy import exists, func
 from sqlalchemy.orm import Session, joinedload
 
 from .models import AppMetadata, Speaker, ConversationSegment, SpeakerEmotionProfile
@@ -373,16 +373,22 @@ def recalculate_emotion_profile(
     return None
 
 
-def delete_unknown_speakers(db: Session, engine=None) -> Tuple[int, List[str]]:
+def delete_unknown_speakers(db: Session, engine=None, max_seconds: Optional[float] = None) -> Tuple[int, List[str]]:
     """
-    Delete all speakers with names starting with 'Unknown_'.
+    Delete all speakers with names starting with 'Unknown_' (with max_seconds: only those whose segments last at most
+    that long in all, the stray voices of a few words).
     Handles FK cleanup (nullify segments, delete emotion profiles).
 
     Returns:
         Tuple of (deleted_count, list of deleted names)
     """
     _invalidate_speaker_cache(engine)
-    unknowns = db.query(Speaker).filter(Speaker.name.like("Unknown_%")).all()
+    query = db.query(Speaker).filter(Speaker.name.like("Unknown_%"))
+    if max_seconds is not None:
+        speech = (db.query(func.coalesce(func.sum(ConversationSegment.end_offset - ConversationSegment.start_offset), 0.0))
+                  .filter(ConversationSegment.speaker_id == Speaker.id).correlate(Speaker).scalar_subquery())
+        query = query.filter(speech <= max_seconds)
+    unknowns = query.all()
     if not unknowns:
         return 0, []
 
