@@ -2,7 +2,7 @@
 // which line, and the settings. A profile is saved over as you go; checkpoints are dated copies of one.
 
 import { api } from "../api.js";
-import { h, clear, icon, button, toast, toastError, confirmDialog, modal, loading, emptyState, fmtDate } from "../ui.js";
+import { h, clear, icon, button, toast, toastError, confirmDialog, modal, loading, emptyState, fmtDate, count } from "../ui.js";
 
 // When the file was written (created_at carries its time zone); else its name's timestamp, 20261021_142233 in the
 // server's local time
@@ -46,7 +46,7 @@ export function render(root) {
           p.description ? h("p", { class: "muted", style: { marginTop: "4px" } }, p.description) : null,
           h("div", { class: "kv", style: { marginTop: "8px" } },
             h("span", null, h("b", null, p.speakers_count), " speakers"),
-            h("span", null, h("b", null, p.segments_count), " lines"),
+            h("span", null, h("b", null, p.segments_count), p.segments_count === 1 ? " line" : " lines"),
             h("span", null, "saved ", h("b", null, stamp(p.timestamp, p.created_at))))),
         h("div", { class: "actions" },
           button("Restore", { kind: "primary", size: "sm", icon: "history", onClick: () => restore(p.filename, p.name) }),
@@ -81,7 +81,7 @@ export function render(root) {
     for (const c of cps) {
       box.append(h("div", { class: "checkpoint" },
         icon("clock"), h("span", null, stamp(c.timestamp, c.created_at)),
-        h("span", { class: "muted" }, `${c.speakers_count} speakers · ${c.segments_count} lines`),
+        h("span", { class: "muted" }, `${count(c.speakers_count, "speaker")} · ${count(c.segments_count, "line")}`),
         h("span", { class: "spacer" }),
         button("Restore", { size: "sm", icon: "history", onClick: () => restore(c.filename, `${p.name} (${stamp(c.timestamp, c.created_at)})`) }),
         button("", { size: "sm", kind: "ghost", icon: "trash", title: "Delete checkpoint", onClick: async () => {

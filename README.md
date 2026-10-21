@@ -328,6 +328,11 @@ the same `Unknown` in the next. When a track gets a name, its earlier lines are 
 `speaker_update` message (`segment_ids`, `speaker_id`, `speaker_name`, `is_known`). Identifying any one line of an
 `Unknown` names all of them, in every conversation.
 
+Since every new voice is kept, stray ones (a word from the TV, a cough) collect as Unknowns too. The web interface's
+Speakers page lists them with how long they spoke, plays one of their lines, shows the enrolled person or other Unknown
+each one sounds like (`GET /api/v1/speakers/unknown/matches`) to merge it in one click, and deletes the ones heard for
+only a few seconds (`DELETE /api/v1/speakers/unknown/all?max_seconds=5`).
+
 Speech is found by a speech detector (Silero VAD) rather than by loudness: quiet voices are kept, and fans, traffic,
 hum or keyboard noise never start a transcription (0% of such audio was taken for speech in a test, even when loud).
 The session clock is the audio itself: skipped silence still counts, so live timestamps are real times, and the saved

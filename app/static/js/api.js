@@ -79,7 +79,9 @@ export const api = {
   enroll: (name, file, filename) => call("POST", "/speakers/enroll", { form: formOf({ name, audio_file: [file, filename || file.name || "sample.wav"] }) }),
   renameSpeaker: (id, newName) => call("PATCH", `/speakers/${id}/rename`, { json: { new_name: newName } }),
   deleteSpeaker: (id) => call("DELETE", `/speakers/${id}`),
-  deleteUnknownSpeakers: () => call("DELETE", "/speakers/unknown/all"),
+  deleteUnknownSpeakers: (maxSeconds) => call("DELETE", "/speakers/unknown/all", { query: { max_seconds: maxSeconds } }),
+  unknownMatches: () => call("GET", "/speakers/unknown/matches"),
+  speakerSegments: (id, { limit = 20, order = "recent" } = {}) => call("GET", `/speakers/${id}/segments`, { query: { limit, order } }),
 
   // files
   process: (file, diarize, handlers) => upload("/process", formOf({ audio_file: file, diarize: String(diarize) }), handlers),

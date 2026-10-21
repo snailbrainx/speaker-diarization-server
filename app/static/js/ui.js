@@ -141,6 +141,8 @@ export function fmtBytes(n) {
   return `${n.toFixed(i ? 1 : 0)} ${u[i]}`;
 }
 
+export const count = (n, word, words = `${word}s`) => `${n} ${n === 1 ? word : words}`;
+
 export const pct = (x, digits = 0) => (x == null || !isFinite(x) ? "–" : `${(x * 100).toFixed(digits)}%`);
 
 // ---------- speakers ----------

@@ -5,7 +5,7 @@
 import { api } from "./api.js";
 import {
   h, clear, icon, button, busy, toast, toastError, modal, confirmDialog, promptDialog, openMenu, downloadText,
-  fmtClock, fmtDuration, fmtDate, pct, isUnknown, isUnnamedVoice, displayName, Palette, speakerChip, emotionChip, emotionInfo, emotionColor,
+  fmtClock, fmtDuration, fmtDate, pct, count, isUnknown, isUnnamedVoice, displayName, Palette, speakerChip, emotionChip, emotionInfo, emotionColor,
   EMOTIONS, loading, idColor,
 } from "./ui.js";
 
@@ -119,7 +119,7 @@ export async function identifyDialog(conversationId, seg, color, { sameVoiceCoun
         type: "button", class: `pick${chosen?.id === s.id ? " on" : ""}`,
         onclick: () => { chosen = s; nameInput.value = ""; draw(); },
         disabled: s.id === seg.speaker_id,
-      }, speakerChip(s.name, idColor(s.id)), h("span", { class: "spacer" }), h("span", { class: "small muted" }, `${s.segment_count} lines`)));
+      }, speakerChip(s.name, idColor(s.id)), h("span", { class: "spacer" }), h("span", { class: "small muted" }, count(s.segment_count, "line"))));
     }
   };
   filter.addEventListener("input", draw);
@@ -365,7 +365,7 @@ export function conversationView(initial, opts = {}) {
           h("span", null, icon("calendar"), fmtDate(conv.start_time)),
           h("span", null, icon("clock"), fmtDuration(duration || conv.duration)),
           h("span", null, icon("users"), `${speakers.length} ${speakers.length === 1 ? "speaker" : "speakers"}`),
-          h("span", null, icon("chat"), `${segs.length} lines`),
+          h("span", null, icon("chat"), count(segs.length, "line")),
           h("span", { class: "mono" }, `#${conv.id}`))),
       h("div", { class: "row" }, exp, more)));
   }
@@ -401,7 +401,7 @@ export function conversationView(initial, opts = {}) {
     toast("Reprocessing… this takes about as long as the first time", "info", 5000);
     try {
       const r = await api.reprocess(conv.id);
-      toast(`${r.message}: ${r.segments} lines`, "ok");
+      toast(`${r.message}: ${count(r.segments, "line")}`, "ok");
       await reload();
     } catch (e) { toastError(e); }
   }
@@ -653,7 +653,7 @@ export function conversationView(initial, opts = {}) {
         rows.get(s.id).classList.toggle("hidden", !ok);
         if (ok) shown++;
       }
-      filterInfo.textContent = shown === segs.length ? `${segs.length} lines` : `${shown} of ${segs.length} lines`;
+      filterInfo.textContent = shown === segs.length ? count(segs.length, "line") : `${shown} of ${count(segs.length, "line")}`;
     }
     applyFilter();
   }

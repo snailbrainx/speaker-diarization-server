@@ -4,7 +4,7 @@
 import { live } from "../live-session.js";
 import { listMicrophones, micAvailable } from "../audio.js";
 import {
-  h, clear, icon, button, toast, segmented, switchInput, Palette, speakerChip, fmtClock, fmtDuration, fmtBytes, isUnknown,
+  h, clear, icon, button, toast, segmented, switchInput, Palette, speakerChip, fmtClock, fmtDuration, fmtBytes, count, isUnknown,
   isUnnamedVoice,
 } from "../ui.js";
 import { segmentRow, identifyDialog, detailsDialog, speakerKey, speakerStats } from "../viewer.js";
@@ -72,14 +72,15 @@ export function render(root) {
     h("div", { class: "card-body options" }, sourceSeg, micOpts, fileOpts, h("div", { class: "divider" }), diarizeSw));
 
   // ----- transcript, speakers, log -----
-  const feed = h("div", { class: "transcript", style: { maxHeight: "62vh", overflow: "auto" } });
-  feed.addEventListener("scroll", () => { autoScroll = feed.scrollTop + feed.clientHeight >= feed.scrollHeight - 40; });
+  // newest line first; a new line keeps the view at the top unless you have scrolled down to read
+  const feed = h("div", { class: "transcript scroll", style: { maxHeight: "62vh" } });
+  feed.addEventListener("scroll", () => { autoScroll = feed.scrollTop < 40; });
   const feedEmpty = h("div", { class: "empty" }, icon("radio"), h("h3", null, "Nothing yet"),
     h("p", null, "Lines appear here a moment after each pause. New voices start as Unknown and are named once they match someone."));
   const feedCount = h("span", { class: "small muted" });
   const speakersBox = h("div", { class: "speaker-list" });
   const doneBox = h("div");
-  const logBox = h("div", { class: "log" });
+  const logBox = h("div", { class: "log scroll" });
   const logCount = h("span", { class: "small muted" });
 
   const ctx = {
@@ -112,8 +113,8 @@ export function render(root) {
     clear(feed);
     rows.clear();
     if (!live.segments.length) feed.append(feedEmpty);
-    live.segments.forEach((s) => feed.append(addRow(s, false)));
-    feedCount.textContent = `${live.segments.length} lines`;
+    [...live.segments].reverse().forEach((s) => feed.append(addRow(s, false)));
+    feedCount.textContent = count(live.segments.length, "line");
   }
 
   function drawSpeakers() {
@@ -126,9 +127,9 @@ export function render(root) {
       speakersBox.append(h("div", { class: "speaker-row" },
         speakerChip(s.name, palette.color(s.key), { id: s.id }),
         isUnnamedVoice(s.name) && live.conversationId ? button("Name", { size: "sm", kind: "ghost", icon: "identify", onClick: () => nameVoice(longest) })
-          : unknown ? h("span", { class: "badge", title: "Too little speech so far to tell whose voice this is; these lines join their voice once it has a speaker" }, "not placed yet")
+          : unknown ? h("span", { class: "badge", title: "Too short to tell whose voice it is" }, "voice not placed")
           : h("span", { class: "badge ok" }, "known"),
-        h("span", { class: "meta" }, `${s.segs.length} · ${fmtDuration(s.talk)}`)));
+        h("span", { class: "meta", title: "Lines · speech" }, `${s.segs.length} · ${fmtDuration(s.talk)}`)));
     }
     statEls.speakers.textContent = st.length || "–";
   }
@@ -197,9 +198,9 @@ export function render(root) {
     status: () => vad.classList.toggle("on", live.vad),
     segment: (e) => {
       feedEmpty.remove();
-      feed.append(addRow(e.detail, true));
-      if (autoScroll) feed.scrollTop = feed.scrollHeight;
-      feedCount.textContent = `${live.segments.length} lines`;
+      feed.prepend(addRow(e.detail, true));
+      if (autoScroll) feed.scrollTop = 0;
+      feedCount.textContent = count(live.segments.length, "line");
       drawSpeakers();
       drawStats();
     },
