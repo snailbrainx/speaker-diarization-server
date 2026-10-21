@@ -653,7 +653,8 @@ class SpeakerRecognitionEngine:
         with self._cache_lock:
             speakers = db_session.query(Speaker).all()
             profiles = _build_profile_list(speakers)
-            self._speaker_cache = profiles
+            if not db_session.info.get("voices_changed"):   # never share a transaction's uncommitted voices
+                self._speaker_cache = profiles
             logger.info(f"📦 Speaker cache loaded: {len(speakers)} speakers → {len(profiles)} profiles")
             return len(profiles)
 
@@ -1516,6 +1517,8 @@ class SpeakerRecognitionEngine:
                 segment_data["speaker_id"] = who["speaker_id"]
             if who.get("track") is not None:
                 segment_data["track"] = who["track"]
+            if who.get("enroll") is not None:   # one dict per new speaker, shared by all their segments
+                segment_data["enroll"] = who["enroll"]
 
             # Add emotion data if available (include embedding for caching)
             if emotion_data:
@@ -1612,8 +1615,11 @@ class SpeakerRecognitionEngine:
         A speaker's voice is the duration-weighted centroid of its segments' embeddings. It takes the name of the stored
         person it matches best, above the threshold (CLUSTER_SPEAKER_THRESHOLD) and live_tracking.NAME_MARGIN above the
         next person, never a second choice; two speakers may share a name only if their own voices are alike (pyannote
-        split one person). A speaker that matches nobody becomes ONE new Unknown_* (auto-enrolled with the
-        centroid), so an unsure match stays unknown instead of being given someone else's name.
+        split one person). A speaker that matches nobody becomes ONE new Unknown_* with the centroid as its voice, so
+        an unsure match stays unknown instead of being given someone else's name. Decides only: the Unknown is created
+        when the result is saved (its segments carry "enroll", see services.create_segment_from_result), since a row
+        written here would hold SQLite's write lock through the rest of the pipeline and could reach other requests
+        before it is committed.
         """
         centroids = self._label_centroids(audio_file, segments, diarization_result["exclusive_segments"])
         labels = list(centroids)   # order of first appearance
@@ -1665,9 +1671,7 @@ class SpeakerRecognitionEngine:
                 continue
             centroid = centroids[label]
             if db_session and centroid is not None:
-                speaker_id, name = _create_unknown_speaker(centroid, db_session)
-                self.add_speaker_to_cache(speaker_id, name, centroid)
-                identities[label] = self._speaker(name, speaker_id, confidence=1.0)
+                identities[label] = dict(self._speaker("Unknown", confidence=1.0), enroll={"voice": centroid})
             else:
                 identities[label] = self._speaker(f"Unknown_{unknown_counter:02d}")
                 unknown_counter += 1
@@ -1746,17 +1750,12 @@ class SpeakerRecognitionEngine:
             if track.speaker_id is None:
                 if track.seconds < live_tracking.PROVISIONAL_SECONDS:
                     continue
-                track.speaker_id, name = _create_unknown_speaker(voice, db_session)
+                track.speaker_id, _ = _create_unknown_speaker(voice, db_session)
                 track.own_unknown = True
-                self.add_speaker_to_cache(track.speaker_id, name, voice)
             elif track.own_unknown:
                 speaker = db_session.query(Speaker).filter(Speaker.id == track.speaker_id).first()
                 if speaker is not None:
                     speaker.set_embedding(voice)
-                    with self._cache_lock:
-                        for p in self._speaker_cache or []:
-                            if p["speaker_id"] == track.speaker_id and p["profile_type"] == "general":
-                                p["embedding"] = voice
 
     def _label_centroids(self, audio_file, segments, turns: List[Dict],
                          also: Tuple[str, ...] = ()) -> Dict[Optional[str], Optional[np.ndarray]]:
@@ -1888,9 +1887,13 @@ class SpeakerRecognitionEngine:
                 logger.info(f"  ⚡ Using cached profiles: {len(self._speaker_cache)} profiles")
                 return self._speaker_cache
             logger.info(f"  ⚠️ Cache not loaded, querying DB...")
-            self._speaker_cache = _build_profile_list(db_session.query(Speaker).all())
-            logger.info(f"  🔍 Checking against {len(self._speaker_cache)} voice profiles (general + emotion-specific)")
-            return self._speaker_cache
+            profiles = _build_profile_list(db_session.query(Speaker).all())
+            logger.info(f"  🔍 Checking against {len(profiles)} voice profiles (general + emotion-specific)")
+            # A session with uncommitted voice changes sees rows no other request can: they stay out of the shared
+            # cache until committed (a rollback would leave other requests holding a speaker that never existed).
+            if not db_session.info.get("voices_changed"):
+                self._speaker_cache = profiles
+            return profiles
 
     def match_speaker_with_all_profiles(self, segment_embedding, db_session, threshold=0.35):
         """

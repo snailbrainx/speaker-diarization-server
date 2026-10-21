@@ -13,7 +13,8 @@ from sqlalchemy.orm import Session, joinedload
 
 from .models import AppMetadata, Speaker, ConversationSegment, SpeakerEmotionProfile
 from .diarization import (CENTROID_MAX_WEIGHT_SEC, CLUSTER_SPEAKERS, MIN_SEGMENT_DURATION_SEC,
-                          SPEAKER_EMBEDDING_MODEL, _centroid, _in_memory, auto_enroll_unknown_speaker)
+                          SPEAKER_EMBEDDING_MODEL, _centroid, _create_unknown_speaker, _in_memory,
+                          auto_enroll_unknown_speaker)
 
 logger = logging.getLogger(__name__)
 
@@ -65,7 +66,6 @@ def create_segment_from_result(
     threshold: float,
     segment_audio_path: str = None,
     start_offset_base: float = 0.0,
-    engine=None,
 ) -> ConversationSegment:
     """
     Create a ConversationSegment from a diarization result dict.
@@ -81,7 +81,6 @@ def create_segment_from_result(
         threshold: Speaker similarity threshold
         segment_audio_path: Optional path to segment WAV file (for streaming)
         start_offset_base: Offset to add to segment times (for streaming)
-        engine: SpeakerRecognitionEngine (needed for cache updates during streaming)
 
     Returns:
         ConversationSegment (added to session but not committed)
@@ -91,8 +90,16 @@ def create_segment_from_result(
     confidence = seg.get("confidence", 0.0)
 
     if seg.get("speaker_id") is not None:
-        # Identified (or auto-enrolled) once for the whole diarization speaker (SPEAKER_ASSIGNMENT=cluster)
+        # Identified once for the whole diarization speaker (SPEAKER_ASSIGNMENT=cluster) or by its live track
         speaker_id = seg["speaker_id"]
+    elif seg.get("enroll") is not None:
+        # SPEAKER_ASSIGNMENT=cluster: a diarization speaker nobody matched becomes one new Unknown with its voice,
+        # created when its first segment is saved; its other segments share the same "enroll" dict and speaker.
+        enroll = seg["enroll"]
+        if "speaker" not in enroll:
+            enroll["speaker"] = _create_unknown_speaker(enroll["voice"], db)
+        speaker_id, speaker_name = enroll["speaker"]
+        confidence = 1.0
     elif seg.get("is_known"):
         speaker = db.query(Speaker).filter(Speaker.name == speaker_name).first()
         if speaker:
@@ -100,17 +107,10 @@ def create_segment_from_result(
     else:
         embedding = seg.get("embedding")
         if embedding is not None and speaker_name and speaker_name.startswith("Unknown_"):
+            # (not added to the engine's shared cache: every engine reloads it once this is committed)
             speaker_id, speaker_name = auto_enroll_unknown_speaker(
                 embedding, db, threshold=threshold
             )
-            # Add to speaker cache if engine provided (streaming mode)
-            if speaker_id and engine and hasattr(engine, 'add_speaker_to_cache'):
-                engine.add_speaker_to_cache(
-                    speaker_id=speaker_id,
-                    speaker_name=speaker_name,
-                    embedding=embedding,
-                    profile_type='general'
-                )
             confidence = 1.0 if speaker_id else confidence
 
     words_json = json.dumps(seg["words"]) if seg.get("words") else None

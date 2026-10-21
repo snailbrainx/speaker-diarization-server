@@ -473,7 +473,6 @@ async def _handle_segment_processed(
                 threshold=threshold,
                 segment_audio_path=segment_file,
                 start_offset_base=start_offset,
-                engine=engine,
             )
             db.flush()
             if seg.get("track") is not None:

@@ -216,7 +216,8 @@ def test_emotion_voice_profiles_never_decide_who_someone_is(eng, db):
     db.commit()
     segments = [({"start": 0.0, "end": 4.0}, "SPEAKER_00", C)]
     ids = eng._identify_clusters("a.wav", segments, {"exclusive_segments": []}, [], 0.60, db)
-    assert ids["SPEAKER_00"]["speaker"].startswith("Unknown_")      # not Bob: a voice like C was never Bob's own
+    assert ids["SPEAKER_00"]["speaker_id"] is None and ids["SPEAKER_00"]["enroll"] is not None   # a new Unknown, not
+    # Bob: a voice like C was never Bob's own
 
 
 def test_a_live_track_follows_the_users_correction(eng, db):
