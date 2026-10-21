@@ -91,3 +91,18 @@ def test_skipped_silence_keeps_real_times_and_the_recording_lines_up(monkeypatch
     with wave.open(out.path) as wf:
         assert wf.getnframes() == int(10.0 * 16000)                           # silence in the skipped gap
     rec.cleanup()
+
+
+def test_a_long_turn_cut_keeps_speech_on_both_sides_of_it(monkeypatch):
+    """Short words and pauses too short to cut: the long-turn cut finds speech where it was heard, not from the length
+    of the part kept (which once dropped a first half with seconds of speech in it)."""
+    rec = _recorder(monkeypatch, lambda a: a.max() > 0)
+    word, gap = np.full(3200, 0.3, np.float32), np.zeros(6400, np.float32)   # 0.2 s of speech, 0.4 s of pause
+    for _ in range(25):                      # 15 s: 5 s of speech, never a 0.5 s pause
+        rec.process_audio_chunk((16000, word))
+        rec.process_audio_chunk((16000, gap))
+    assert rec.segments_queued == 1           # cut at 7.6 s: the first part (2.6 s of speech) is processed
+    assert sum(e - s for s, e in rec._speech_runs) == 12 * 3200   # the rest keeps its own 2.4 s
+    rec.stop_recording()
+    assert rec.segments_queued == 2
+    rec.cleanup()
