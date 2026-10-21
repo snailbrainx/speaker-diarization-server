@@ -22,8 +22,10 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
+from fastapi.staticfiles import StaticFiles
 from contextlib import asynccontextmanager
 from sqlalchemy import or_
 import torch
@@ -217,13 +219,18 @@ app.include_router(settings_router, prefix="/api/v1")
 app.include_router(profiles_router, prefix="/api/v1")  # Voice Profiles
 app.include_router(streaming_router, prefix="/api/v1")  # WebSocket streaming
 app.include_router(mcp_router)  # MCP at /mcp
+# Web interface: static files only, everything it shows comes from the API above
+app.mount("/ui", StaticFiles(directory=os.path.join(os.path.dirname(__file__), "static"), html=True), name="ui")
 
 
 @app.get("/")
-async def root():
-    """Root endpoint"""
+async def root(request: Request):
+    """Root endpoint: a browser is sent to the web interface, API clients get this summary."""
+    if "text/html" in request.headers.get("accept", ""):
+        return RedirectResponse("/ui/")
     return {
         "message": "Speaker Diarization API",
+        "ui": "/ui/",
         "docs": "/docs",
         "api": "/api/v1",
         "mcp": "/mcp (MCP JSON-RPC interface)",

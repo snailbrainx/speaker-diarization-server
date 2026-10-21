@@ -1,6 +1,9 @@
-"""A conversation's recording can be fetched (and seeked) whole, and live word times are stored like file
-ones, from the conversation start."""
+"""The web interface (app/static) and the API it needs: the page is served at /ui/ and browsers opening / are sent
+there, every module it imports exists, a conversation's recording can be fetched (and seeked) whole, and live word
+times are stored like file ones, from the conversation start."""
+import re
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
 from fastapi import FastAPI
@@ -12,6 +15,9 @@ from sqlalchemy.pool import StaticPool
 from app.database import Base, get_db
 from app.models import Conversation
 
+STATIC = Path(__file__).resolve().parents[1] / "app" / "static"
+
+
 @pytest.fixture()
 def db_session():
     engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
@@ -20,6 +26,28 @@ def db_session():
     yield db
     db.close()
     engine.dispose()
+
+
+def test_the_web_interface_is_served_and_browsers_are_sent_to_it():
+    from app.main import app
+    client = TestClient(app)   # no lifespan: no models are loaded
+    page = client.get("/ui/")
+    assert page.status_code == 200 and "js/main.js" in page.text
+    assert client.get("/ui/js/main.js").headers["content-type"].startswith(("text/javascript", "application/javascript"))
+    browser = client.get("/", headers={"accept": "text/html,application/xhtml+xml"}, follow_redirects=False)
+    assert browser.status_code == 307 and browser.headers["location"] == "/ui/"
+    assert client.get("/").json()["ui"] == "/ui/"   # API clients and the health check still get JSON
+
+
+def test_every_module_the_page_loads_exists():
+    html = (STATIC / "index.html").read_text()
+    wanted = [STATIC / m for m in re.findall(r'(?:src|href)="([^":#]+)"', html)]
+    for js in STATIC.rglob("*.js"):
+        text = js.read_text()
+        wanted += [js.parent / m for m in re.findall(r'from "(\.[^"]+)"', text)]
+        wanted += [js.parent / m for m in re.findall(r'new URL\("(\.[^"]+)", import\.meta\.url\)', text)]
+    missing = sorted({str(p.resolve().relative_to(STATIC)) for p in wanted if not p.resolve().is_file()})
+    assert len(wanted) > 20 and missing == []
 
 
 def test_a_conversation_recording_is_served_whole_and_by_range(db_session, tmp_path):
@@ -42,7 +70,6 @@ def test_a_conversation_recording_is_served_whole_and_by_range(db_session, tmp_p
     assert part.status_code == 206 and part.content == wav.read_bytes()[100:200]
     assert client.get(f"/conversations/{unrecorded.id}/audio").status_code == 404
     assert client.get("/conversations/999/audio").status_code == 404
-
 
 
 def test_live_word_times_are_stored_from_the_conversation_start(db_session):

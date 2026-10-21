@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <title>Speaker Diarization</title>
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="css/app.css">
+  <script>
+    // Theme before first paint: the saved choice, else the system's
+    try {
+      const t = localStorage.getItem("theme");
+      if (t) document.documentElement.dataset.theme = t;
+    } catch (e) {}
+  </script>
+  <script type="module" src="js/main.js"></script>
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar">
+      <a class="brand" href="#/live">
+        <img src="favicon.svg" alt="" width="28" height="28">
+        <span>Speaker<br><b>Diarization</b></span>
+      </a>
+      <nav class="nav" id="nav"></nav>
+      <div class="sidebar-foot">
+        <div class="server-pill" id="server-pill" title="Server status">
+          <span class="dot"></span><span class="label">Connecting…</span>
+        </div>
+        <button class="btn icon ghost" id="theme-toggle" title="Switch light / dark"></button>
+      </div>
+    </aside>
+    <main class="main" id="main"></main>
+  </div>
+  <div class="toasts" id="toasts" aria-live="polite"></div>
+</body>
+</html>
