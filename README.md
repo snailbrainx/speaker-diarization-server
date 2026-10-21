@@ -8,7 +8,9 @@ GPU-accelerated speaker diarization, transcription, and emotion recognition with
 
 ## Screenshots
 
-Example [Next.js frontend](https://github.com/snailbrainx/speaker_identity_nextjs):
+The server itself is headless: everything goes through the REST API, the WebSocket stream and the MCP server.
+The screenshots below are from an older version of the separate example
+[Next.js frontend](https://github.com/snailbrainx/speaker_identity_nextjs) and may not match the current API or features.
 
 <table>
   <tr>
@@ -44,7 +46,7 @@ Example [Next.js frontend](https://github.com/snailbrainx/speaker_identity_nextj
 | Speaker embed   | `pyannote/embedding` (512-D)                                                |
 | Transcription   | faster-whisper 1.2.1 / CTranslate2, `large-v3` default                |
 | Emotion         | emotion2vec_plus_large via FunASR (1024-D, 9 categories)                    |
-| API             | FastAPI 0.115.5 + WebSockets + uvicorn                                      |
+| API             | FastAPI 0.141.1 + WebSockets + uvicorn                                      |
 | DB              | SQLAlchemy 2.0 / SQLite (WAL)                                               |
 | ML runtime      | PyTorch 2.10 + CUDA 12.8 (Blackwell/RTX 5090 `sm_120` ready)                |
 | MCP transport   | JSON-RPC 2.0 over HTTP (+ optional SSE), no external MCP library            |
@@ -121,11 +123,19 @@ All configuration is environment variables (see `.env.example` for the curated l
 | `CORS_ORIGINS`   | *(unset)*                              | Comma-separated origins. Leave empty for internal-only use.    |
 | `LOG_LEVEL`      | `INFO`                                 | Python logging level.                                          |
 
+### Live streaming limits
+
+| Variable                          | Default                          | Purpose                                                   |
+|-----------------------------------|----------------------------------|-----------------------------------------------------------|
+| `MAX_STREAM_BUFFER_SECONDS`       | `120` (`300` in docker-compose)  | Longest speech buffered before a segment is force-flushed. |
+| `SEGMENT_HANDLER_TIMEOUT_SECONDS` | `600`                            | How long a live segment may take to process.              |
+| `WS_SEND_TIMEOUT_SECONDS`         | `10` (`5` in docker-compose)     | Timeout for sending a message to a WebSocket client.      |
+
 ### Voice & emotion tuning (also editable at runtime via `/api/v1/settings/voice`)
 
 | Variable                 | Default  | Purpose                                                        |
 |--------------------------|----------|----------------------------------------------------------------|
-| `SPEAKER_THRESHOLD`      | `0.30`   | Cosine threshold for speaker match. Lower → stricter.          |
+| `SPEAKER_THRESHOLD`      | `0.30`   | Cosine threshold for speaker match. Higher → stricter.         |
 | `CONTEXT_PADDING`        | `0.15`   | Seconds of audio added around a segment before embedding.      |
 | `SILENCE_DURATION`       | `0.5`    | Streaming: seconds of silence before flushing a segment.       |
 | `FILTER_HALLUCINATIONS`  | `true`   | Drop Whisper filler phrases ("thank you.", etc.).              |
@@ -148,6 +158,36 @@ All configuration is environment variables (see `.env.example` for the curated l
 | `CUDA_VISIBLE_DEVICES`      | *(unset)*     | Select physical GPUs. `0`, `0,2`, etc.                          |
 | `CUDA_DEVICE_ORDER`         | `PCI_BUS_ID`  | Pinned by `run_local.sh` and `docker-compose.yml` so indices match `nvidia-smi` instead of CUDA's "fastest first" reshuffle. |
 | `CLEANUP_VRAM_THRESHOLD_GB` | `12`          | Only run the VRAM cleanup loop when allocated memory exceeds this. |
+
+### Speed & speaker assignment (opt-in)
+
+All off by default; unset means the original behaviour. Recommended for uploaded recordings: all five together.
+
+| Variable                    | Default   | Purpose                                                                                     |
+|-----------------------------|-----------|---------------------------------------------------------------------------------------------|
+| `WHISPER_BATCH_SIZE`        | *(unset)* | e.g. `16`: batched faster-whisper (VAD chunks in batches). ~8x faster transcription on long audio. Use with `WORD_LEVEL_SPEAKERS`. |
+| `WORD_LEVEL_SPEAKERS`       | `false`   | Each word gets the diarization speaker at its midpoint; segments split where the speaker changes. |
+| `PYANNOTE_ALLOW_TF32`       | `false`   | Keep TF32 on for pyannote (it disables it for reproducibility). Faster on Ampere and newer.   |
+| `SPEAKER_ASSIGNMENT`        | `segment` | `cluster`: identify each diarization speaker **once per file** from all of its speech, one-to-one against stored speakers; an unmatched speaker becomes one `Unknown_*`. Uploaded/reprocessed files only; live chunks keep per-segment matching. |
+| `CLUSTER_SPEAKER_THRESHOLD` | `0.70`    | Cluster mode's match threshold (used instead of `SPEAKER_THRESHOLD`, which is tuned for single segments). Higher → stricter. |
+
+Measured on public test sets (RTX 3090; AMI = 16 test meetings, VoxConverse = 40 dev clips):
+
+| | default | speed settings | + `SPEAKER_ASSIGNMENT=cluster` |
+|---|---|---|---|
+| Speed, AMI (× real time, server-side) | 11.7× | 23.5× | same or slightly faster¹ |
+| WER, LibriSpeech test-clean (40 clips) | 2.9% | 1.0% | 1.0% |
+| WER, AMI (mixed headset audio) | 24.7% | 24.6% | 24.6% |
+| Speaker confusion, VoxConverse / AMI | 11.9% / 24.8% | 10.6% / 18.7% | **2.6% / 2.1%** |
+| AMI words attributed to the wrong speaker | 41.2% | 33.8% | **13.3%** |
+| Speaker labels per 4-person AMI meeting, nobody enrolled (median, range) | 48 (10–120) | 33 (18–52) | **4 (3–5)** |
+| Enrolled speakers in later meetings: right / wrong / unknown² | – | 86.8% / 8.5% / 4.7% | **97.5% / 2.2% / 0.2%** |
+| Speech of unenrolled speakers given an enrolled name² | – | 10.3% | **0%** |
+
+¹ 6% less processing time than the speed settings alone, measured side by side on the same GPU.
+² Each AMI series has the same four people in four meetings: speakers were named in the first meeting with the
+identify endpoint, then the other three meetings were processed; a meeting from another series stood in for
+unenrolled speakers.
 
 ## How it Works
 
@@ -185,6 +225,7 @@ Key behaviors:
 - **Parallel Whisper + pyannote** — ~2× faster than sequential.
 - **Context padding** — 0.15 s of audio on each side of a segment makes the embedding robust to background noise.
 - **Auto-enrollment** — unidentified voices get an `Unknown_N` profile immediately so they accumulate samples. Rename/identify and every past `Unknown_N` segment re-labels.
+- **Cluster mode** (`SPEAKER_ASSIGNMENT=cluster`, opt-in) — instead of matching each segment's embedding on its own, each pyannote speaker is matched once from the centroid of all its segments, so one person gets one label per file (one `Unknown_N` if not enrolled) and a single identify names them everywhere.
 - **Misidentified-flag** — segments flagged `is_misidentified` are excluded from embedding averaging, keeping profiles clean.
 - **Dual-detector emotion** — emotion2vec always runs; if the speaker has ≥ 3 voice samples for an emotion, a voice-profile detector also runs. Best match wins with deterministic tie-break rules.
 - **Personalized learning** — user emotion corrections store both the 1024-D emotion embedding and the 512-D voice embedding, merged with weighted averaging into the speaker's profile.
@@ -250,11 +291,11 @@ emotion2vec said *surprised* but the personalized detector is unavailable (no 3+
 Full interactive docs at `/docs` (Swagger UI). The OpenAPI JSON is at `/openapi.json`. Endpoint groups:
 
 - `GET /api/v1/status` — health + GPU.
-- `GET/POST /api/v1/speakers`, `PATCH/DELETE /api/v1/speakers/{id}` — speaker CRUD, enroll, rename.
-- `GET /api/v1/speakers/{id}/emotion-profiles`, per-emotion thresholds — emotion-profile CRUD.
-- `GET/POST /api/v1/conversations`, `PATCH/DELETE /api/v1/conversations/{id}` — conversation CRUD.
+- `GET /api/v1/speakers`, `POST /api/v1/speakers/enroll`, `PATCH /api/v1/speakers/{id}/rename`, `DELETE /api/v1/speakers/{id}`, `DELETE /api/v1/speakers/unknown/all` — list, enroll, rename, delete.
+- `GET/DELETE /api/v1/conversations/speakers/{id}/emotion-profiles`, `GET/PATCH .../emotion-threshold`, `PATCH .../emotion-profiles/{emotion}/{threshold,voice-threshold}` — emotion profiles and thresholds.
+- `GET /api/v1/conversations`, `GET/PATCH/DELETE /api/v1/conversations/{id}` — list, read, rename, delete conversations.
 - `POST /api/v1/conversations/{id}/reprocess`, `POST /api/v1/conversations/{id}/recalculate-emotions` — re-run pipelines.
-- `POST /api/v1/conversations/{id}/segments/{sid}/{identify,correct-emotion}`, `PATCH .../misidentified` — segment corrections.
+- `POST /api/v1/conversations/{id}/segments/{sid}/{identify,correct-emotion}`, `PATCH .../{misidentified,emotion-misidentified}` — segment corrections.
 - `GET /api/v1/conversations/segments/{sid}/audio` — extract segment audio.
 - `POST /api/v1/process` — upload and process a whole file.
 - `GET/POST /api/v1/settings/voice`, `POST /api/v1/settings/voice/reset` — runtime-tunable voice settings.
@@ -366,7 +407,7 @@ Docker bind-mounts `./volumes`, `./data`, `./backups`, and `./certs` (read-only)
 
 **"CUDA out of memory"** — switch `WHISPER_MODEL` to a smaller variant (`small` or `base`) or raise `CLEANUP_VRAM_THRESHOLD_GB` so cleanup runs more often.
 
-**Speaker not recognized** — enroll with 10–30 s of clean audio. Lower `SPEAKER_THRESHOLD` to ~0.20 for challenging audio (movies, music).
+**Speaker not recognized** — enroll with 10–30 s of clean audio. Lower `SPEAKER_THRESHOLD` to ~0.20 for challenging audio (movies, music). In cluster mode the threshold is `CLUSTER_SPEAKER_THRESHOLD` (0.70); speakers with only a few seconds of enrolled speech may stay `Unknown` until identified in more recordings.
 
 **Browser microphone not working** — WebSocket mic capture requires HTTPS. Generate or drop a cert/key into `certs/`.
 

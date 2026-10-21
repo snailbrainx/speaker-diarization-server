@@ -27,6 +27,12 @@ services:
       - WHISPER_MODEL=${WHISPER_MODEL:-large-v3}
       - WHISPER_LANGUAGE=${WHISPER_LANGUAGE:-en}
       - OFFLINE_MODE=${OFFLINE_MODE:-false}
+      # Opt-in speed / speaker-assignment settings (README "Speed & speaker assignment"); empty = off.
+      - WHISPER_BATCH_SIZE=${WHISPER_BATCH_SIZE:-}
+      - WORD_LEVEL_SPEAKERS=${WORD_LEVEL_SPEAKERS:-}
+      - PYANNOTE_ALLOW_TF32=${PYANNOTE_ALLOW_TF32:-}
+      - SPEAKER_ASSIGNMENT=${SPEAKER_ASSIGNMENT:-}
+      - CLUSTER_SPEAKER_THRESHOLD=${CLUSTER_SPEAKER_THRESHOLD:-}
     # Match the `app` user baked into the image (uid 1000) so bind-mounted
     # volumes stay writable without chown gymnastics on the host.
     user: "1000:1000"

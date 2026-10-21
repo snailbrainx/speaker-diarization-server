@@ -363,6 +363,7 @@ async def process_audio(
         traceback.print_exc()
         # Roll back half-built segments and release only our own operation.
         fail_processing_lease(db, conversation.id, processing_token)
+        engine.clear_speaker_cache()  # it may hold Unknown_* speakers enrolled by this rolled-back request
         raise HTTPException(status_code=500, detail="Audio processing failed")
 
 

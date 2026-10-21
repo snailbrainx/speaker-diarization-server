@@ -415,6 +415,8 @@ async def _handle_segment_processed(
             known_speakers,
             threshold=threshold,
             db_session=db,
+            # A live chunk holds a few seconds of speech: per-segment matching as before, never cluster mode.
+            cluster_speakers=False,
         )
 
         # Timeout only stops the recorder waiting; inference can still finish
@@ -494,6 +496,7 @@ async def _handle_segment_processed(
         import traceback
         traceback.print_exc()
         db.rollback()
+        engine.clear_speaker_cache()  # it may hold Unknown_* speakers enrolled by this rolled-back segment
         await _send_message_bounded(websocket, "error", {"message": "Segment processing error"})
         raise
     finally:

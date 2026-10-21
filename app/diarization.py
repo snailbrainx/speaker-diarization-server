@@ -38,6 +38,119 @@ UNKNOWN_NAME_MAX_ATTEMPTS = 5
 
 # Emotion detection constants
 MIN_VOICE_SAMPLES = 3
+
+# Opt-in speed settings (all off by default; unset = the original behaviour).
+#   WHISPER_BATCH_SIZE=16      faster-whisper's BatchedInferencePipeline: VAD chunks transcribed 16 at a time.
+#                              ~8x faster transcription on an RTX 3090; returns ~30 s segments, so use it
+#                              together with WORD_LEVEL_SPEAKERS.
+#   WORD_LEVEL_SPEAKERS=true   give every word the diarization speaker at its midpoint and split segments where the
+#                              speaker changes (or after a pause / a long run), instead of one speaker per segment.
+#   PYANNOTE_ALLOW_TF32=true   keep TF32 matmuls on for pyannote (it turns them off for bit-reproducibility).
+#   SPEAKER_ASSIGNMENT=cluster identify each diarization speaker once per file, from all of that speaker's segments,
+#                              instead of each segment on its own (a short segment's embedding is too noisy: one
+#                              person ends up as several Unknown_* speakers). Words get their speaker from pyannote's
+#                              exclusive (non-overlapping) diarization. Implies word-level speakers. Uploaded and
+#                              reprocessed files only: live chunks keep per-segment matching.
+#   CLUSTER_SPEAKER_THRESHOLD=0.70  cosine similarity a speaker's centroid needs to be given a stored person's name in
+#                              cluster mode (used instead of the Settings speaker_threshold, which is tuned for single
+#                              segments). On the AMI test meetings, right person 0.75-0.92, a different person up to
+#                              0.62: at 0.30 a visitor who was never enrolled got an enrolled person's name 89% of the
+#                              time, at 0.65-0.75 never, while 95.5% of enrolled people's speech was still recognised.
+WHISPER_BATCH_SIZE = int(os.getenv("WHISPER_BATCH_SIZE", "0") or 0)
+WORD_LEVEL_SPEAKERS = os.getenv("WORD_LEVEL_SPEAKERS", "false").lower() == "true"
+PYANNOTE_ALLOW_TF32 = os.getenv("PYANNOTE_ALLOW_TF32", "false").lower() == "true"
+CLUSTER_SPEAKERS = os.getenv("SPEAKER_ASSIGNMENT", "segment").lower() == "cluster"
+CLUSTER_SPEAKER_THRESHOLD = float(os.getenv("CLUSTER_SPEAKER_THRESHOLD") or 0.70)
+SPLIT_PAUSE_SEC = 1.0      # WORD_LEVEL_SPEAKERS: a pause this long between words starts a new segment
+SPLIT_MAX_SEC = 30.0       # WORD_LEVEL_SPEAKERS: longest segment before a forced split at a word boundary
+CENTROID_MAX_WEIGHT_SEC = 10.0  # SPEAKER_ASSIGNMENT=cluster: a segment counts by its duration, up to this
+CENTROID_FALLBACK_TURNS = 3     # cluster with no embeddable segment: embed its longest diarization turns instead
+
+
+def _speaker_at(t: float, diar_segments: List[Dict]) -> Optional[str]:
+    """Diarization speaker whose turn contains time t, else the nearest turn's speaker."""
+    for d in diar_segments:
+        if d["start"] <= t <= d["end"]:
+            return d["speaker"]
+    best, label = float("inf"), None
+    for d in diar_segments:
+        dist = min(abs(d["start"] - t), abs(d["end"] - t))
+        if dist < best:
+            best, label = dist, d["speaker"]
+    return label
+
+
+def _split_by_speaker(transcription_segments: List[Dict], diar_segments: List[Dict]) -> List[Dict]:
+    """Re-cut transcription segments at word boundaries so each piece has one diarization speaker."""
+    out = []
+    for seg in transcription_segments:
+        words = seg.get("words") or []
+        if not words or not diar_segments:
+            out.append(seg)
+            continue
+        current, current_spk = [], None
+        for w in words:
+            spk = _speaker_at((w["start"] + w["end"]) / 2, diar_segments)
+            if current and (spk != current_spk or w["start"] - current[-1]["end"] > SPLIT_PAUSE_SEC
+                            or w["end"] - current[0]["start"] > SPLIT_MAX_SEC):
+                out.append(_piece(seg, current, current_spk))
+                current = []
+            if not current:
+                current_spk = spk
+            current.append(w)
+        if current:
+            out.append(_piece(seg, current, current_spk))
+    return out
+
+
+def _piece(seg: Dict, words: List[Dict], speaker_label: Optional[str]) -> Dict:
+    return {"start": words[0]["start"], "end": words[-1]["end"],
+            "text": "".join(w["word"] for w in words).strip(), "words": words,
+            "avg_logprob": seg.get("avg_logprob"), "speaker_label": speaker_label}
+
+
+def _label_at_midpoint(seg: Dict, diar_segments: List[Dict]) -> Optional[str]:
+    """Diarization speaker at the segment's midpoint, else the speaker of the turn whose midpoint is closest."""
+    mid_time = (seg["start"] + seg["end"]) / 2
+    for diar_seg in diar_segments:
+        if diar_seg["start"] <= mid_time <= diar_seg["end"]:
+            return diar_seg["speaker"]
+    label, min_distance = None, float("inf")
+    for diar_seg in diar_segments:
+        distance = abs((diar_seg["start"] + diar_seg["end"]) / 2 - mid_time)
+        if distance < min_distance:
+            min_distance, label = distance, diar_seg["speaker"]
+    return label
+
+
+def _float_samples(segment: "AudioSegment") -> np.ndarray:
+    """Mono float32 samples in [-1, 1]: what FunASR (torchaudio.load + channel mean) reads from the same WAV file."""
+    samples = np.array(segment.get_array_of_samples(), dtype=np.float32)
+    if segment.channels > 1:
+        samples = samples.reshape(-1, segment.channels).mean(axis=1)
+    return samples / float(1 << (8 * segment.sample_width - 1))
+
+
+def _centroid(embeddings: List[np.ndarray], weights: List[float]) -> Optional[np.ndarray]:
+    """Weighted mean of L2-normalised embeddings (a cosine-similarity centroid)."""
+    if not embeddings:
+        return None
+    unit = [e / (np.linalg.norm(e) or 1.0) for e in embeddings]
+    return np.average(np.stack(unit), axis=0, weights=weights).astype(np.float32)
+
+
+def _keep_tf32_on():
+    """pyannote calls fix_reproducibility() on every inference, which switches TF32 off; make it a no-op."""
+    import sys as _sys
+    import pyannote.audio.utils.reproducibility as rep
+    original = rep.fix_reproducibility
+    noop = lambda device: None  # noqa: E731
+    for mod in list(_sys.modules.values()):
+        if getattr(mod, "fix_reproducibility", None) is original:
+            mod.fix_reproducibility = noop
+    rep.fix_reproducibility = noop
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
 DUAL_DETECTOR_AGREE_D1 = 0.70
 DUAL_DETECTOR_AGREE_D2 = 0.80
 VOICE_STRONG_THRESHOLD = 0.85
@@ -152,7 +265,11 @@ def auto_enroll_unknown_speaker(embedding: np.ndarray, db_session, threshold: fl
     if best_match is not None:
         logger.info(f"  ℹ️ Best match was '{best_match.name}' with {best_similarity:.2%} (below fallback threshold {fallback_threshold:.2%})")
 
-    # No match found — create a new Unknown speaker with a collision-proof name.
+    return _create_unknown_speaker(embedding, db_session)
+
+
+def _create_unknown_speaker(embedding: np.ndarray, db_session):
+    """New Unknown_<timestamp> speaker with this embedding (flushed, not committed). Returns (speaker_id, name)."""
     timestamp_name = None
     for _ in range(UNKNOWN_NAME_MAX_ATTEMPTS):
         timestamp_name = f"Unknown_{int(time.time() * 1000000)}"
@@ -349,6 +466,9 @@ class SpeakerRecognitionEngine:
                     os.environ["HF_TOKEN"] = self.hf_token
                 pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-community-1")
                 pipeline.to(self.device)
+                if PYANNOTE_ALLOW_TF32:
+                    _keep_tf32_on()
+                    logger.info("pyannote: TF32 kept on (PYANNOTE_ALLOW_TF32=true)")
                 self._diarization_pipeline = pipeline
         return self._diarization_pipeline
 
@@ -382,6 +502,18 @@ class SpeakerRecognitionEngine:
                 self._whisper_model = WhisperModel(model_name, device=device_name, compute_type=compute_type)
                 logger.info(f"faster-whisper model '{model_name}' loaded")
         return self._whisper_model
+
+    @property
+    def batched_whisper(self):
+        """faster-whisper BatchedInferencePipeline over the same model (only used when WHISPER_BATCH_SIZE > 0)."""
+        if getattr(self, "_batched_whisper", None) is None:
+            model = self.whisper_model
+            with self._model_lock:
+                if getattr(self, "_batched_whisper", None) is None:
+                    from faster_whisper import BatchedInferencePipeline
+                    self._batched_whisper = BatchedInferencePipeline(model=model)
+                    logger.info(f"faster-whisper batched pipeline on (batch size {WHISPER_BATCH_SIZE})")
+        return self._batched_whisper
 
     @property
     def emotion_model(self):
@@ -433,14 +565,25 @@ class SpeakerRecognitionEngine:
         # Use "auto" for auto-detection, or specify language code (e.g., "es", "fr", "de")
         language = os.getenv("WHISPER_LANGUAGE", "en")
         # faster-whisper transcription with word-level timestamps and confidence
-        segments_generator, info = self.whisper_model.transcribe(
-            audio_file,
-            language=None if language == "auto" else language,  # None = auto-detect
-            task="transcribe",
-            beam_size=5,
-            vad_filter=True,  # Use VAD to filter out non-speech
-            word_timestamps=True  # Enable word-level timestamps and probabilities
-        )
+        if WHISPER_BATCH_SIZE > 0:
+            # Batched pipeline (VAD-chunked, always filters non-speech); see WHISPER_BATCH_SIZE above.
+            segments_generator, info = self.batched_whisper.transcribe(
+                audio_file,
+                language=None if language == "auto" else language,
+                task="transcribe",
+                beam_size=5,
+                batch_size=WHISPER_BATCH_SIZE,
+                word_timestamps=True
+            )
+        else:
+            segments_generator, info = self.whisper_model.transcribe(
+                audio_file,
+                language=None if language == "auto" else language,  # None = auto-detect
+                task="transcribe",
+                beam_size=5,
+                vad_filter=True,  # Use VAD to filter out non-speech
+                word_timestamps=True  # Enable word-level timestamps and probabilities
+            )
 
         logger.info(f"Detected language: {info.language} (probability: {info.language_probability:.2f})")
 
@@ -501,19 +644,16 @@ class SpeakerRecognitionEngine:
         with torch.no_grad():
             output = self.diarization_pipeline(audio_file)
 
-        # Convert to dictionary format
-        segments = []
-        # In pyannote.audio 4.0+, use the speaker_diarization attribute
-        for turn, speaker in output.speaker_diarization:
-            segments.append({
-                "start": turn.start,
-                "end": turn.end,
-                "speaker": speaker,
-                "duration": turn.end - turn.start
-            })
+        # Convert to dictionary format. In pyannote.audio 4.0+, speaker_diarization holds the turns (overlapping where
+        # two people talk at once); exclusive_speaker_diarization has one speaker at a time, for aligning words.
+        def turns(annotation):
+            return [{"start": turn.start, "end": turn.end, "speaker": speaker, "duration": turn.end - turn.start}
+                    for turn, speaker in annotation]
 
+        segments = turns(output.speaker_diarization)
         result = {
             "segments": segments,
+            "exclusive_segments": turns(output.exclusive_speaker_diarization),
             "num_speakers": len(set(s["speaker"] for s in segments))
         }
 
@@ -784,20 +924,12 @@ class SpeakerRecognitionEngine:
                 if preloaded_audio is None and segment.frame_rate != 16000:
                     segment = segment.set_frame_rate(16000)
 
-                # Save to temp file
-                with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_file:
-                    segment.export(temp_file.name, format='wav')
-                    temp_path = temp_file.name
-
-                try:
-                    result = self.emotion_model.generate(
-                        temp_path,
-                        granularity="utterance",
-                        extract_embedding=extract_embedding,
-                    )
-                finally:
-                    if os.path.exists(temp_path):
-                        os.unlink(temp_path)
+                # Hand the samples over in memory: a temp WAV per segment stalls on a busy disk.
+                result = self.emotion_model.generate(
+                    _float_samples(segment),
+                    granularity="utterance",
+                    extract_embedding=extract_embedding,
+                )
             else:
                 # Process a bounded, normalized copy. Passing the original
                 # filename when it was already 16 kHz bypassed the duration
@@ -917,7 +1049,8 @@ class SpeakerRecognitionEngine:
         audio_file: str,
         known_speakers: List[Tuple[int, str, np.ndarray]] = None,
         threshold: float = 0.7,
-        db_session = None
+        db_session = None,
+        cluster_speakers: Optional[bool] = None,
     ) -> Dict:
         """
         Full pipeline: transcription + diarization + speaker recognition + personalized emotions
@@ -927,6 +1060,8 @@ class SpeakerRecognitionEngine:
             known_speakers: Optional list of (id, name, embedding) tuples
             threshold: Similarity threshold for speaker matching
             db_session: Optional database session for personalized emotion matching
+            cluster_speakers: identify each diarization speaker once (SPEAKER_ASSIGNMENT=cluster); None = the
+                setting. Live chunks pass False: a few seconds of speech is too little for the cluster threshold.
 
         Returns:
             Dictionary with transcribed segments and speaker labels
@@ -952,137 +1087,53 @@ class SpeakerRecognitionEngine:
         elapsed = time.time() - start_time
         logger.info(f"Parallel processing completed in {elapsed:.2f}s")
 
+        if cluster_speakers is None:
+            cluster_speakers = CLUSTER_SPEAKERS
+        if cluster_speakers or WORD_LEVEL_SPEAKERS:
+            turns = diarization_result["exclusive_segments" if cluster_speakers else "segments"]
+            before = len(transcription_segments)
+            transcription_segments = _split_by_speaker(transcription_segments, turns)
+            logger.info(f"Word-level speakers: {before} transcription segments -> {len(transcription_segments)}")
+
         # Explicit cleanup after parallel processing to free VRAM before emotion extraction
         del transcription_future, diarization_future
         gc.collect()
         self.clear_gpu_cache_async("parallel")
 
-        # Hoist settings lookups out of the per-segment loop.
+        # Hoist settings lookups out of the per-segment loops.
         settings = get_config().get_settings()
         filter_hallucinations = settings.filter_hallucinations
         global_emotion_threshold = settings.emotion_threshold
         enable_personalized_emotions = os.getenv("ENABLE_PERSONALIZED_EMOTIONS", "true").lower() == "true"
 
-        unknown_speaker_map: Dict[str, str] = {}
-        unknown_counter = 1
+        # Pass 1: drop hallucinations, give each segment its diarization speaker and its own voice embedding.
+        # The cheap text-only filter runs BEFORE any embedding or emotion extraction so Whisper's
+        # "thank you for watching" ghosts don't cost us a GPU pass each.
+        segments = []
+        for trans_seg in transcription_segments:
+            if filter_hallucinations and _is_hallucination(
+                    trans_seg["text"], trans_seg["end"] - trans_seg["start"], trans_seg.get("avg_logprob")):
+                logger.info(f"⏭️ Skipping hallucination: '{trans_seg['text'][:60]}'")
+                continue
+            label = trans_seg.get("speaker_label") or _label_at_midpoint(trans_seg, diarization_result["segments"])
+            segments.append((trans_seg, label, self._segment_embedding_or_none(audio_file, trans_seg)))
 
-        transcribed_with_speakers = []
+        # Pass 2: who is speaking in each segment.
+        if cluster_speakers:
+            identities = self._identify_clusters(audio_file, segments, diarization_result, known_speakers,
+                                                 CLUSTER_SPEAKER_THRESHOLD, db_session)
+            speakers = [identities[label] for _, label, _ in segments]
+        else:
+            speakers = self._identify_segments(segments, known_speakers, threshold, db_session)
 
+        # Pass 3: emotion, then the output segment.
         # Decode/resample the conversation audio ONCE for the emotion pass
         # (lazy: only if any segment actually needs emotion extraction).
-        # Previously every segment re-decoded the whole file.
         preloaded_emotion_audio = None
         emotion_preload_failed = False
+        transcribed_with_speakers = []
 
-        for trans_seg in transcription_segments:
-            # Cheap text-only hallucination filter — applied BEFORE any embedding
-            # or emotion extraction so Whisper's "thank you for watching" ghosts
-            # don't cost us a GPU pass each.
-            if filter_hallucinations:
-                duration = trans_seg["end"] - trans_seg["start"]
-                avg_logprob = trans_seg.get("avg_logprob")
-                if _is_hallucination(trans_seg["text"], duration, avg_logprob):
-                    logger.info(f"⏭️ Skipping hallucination: '{trans_seg['text'][:60]}'")
-                    continue
-
-            # Find which speaker was talking during this transcription segment
-            # Use the middle of the transcription segment for matching
-            mid_time = (trans_seg["start"] + trans_seg["end"]) / 2
-
-            # Find the diarization segment that contains this time
-            speaker_label = None
-            for diar_seg in diarization_result["segments"]:
-                if diar_seg["start"] <= mid_time <= diar_seg["end"]:
-                    speaker_label = diar_seg["speaker"]
-                    break
-
-            if speaker_label is None:
-                # If no exact match, find the closest diarization segment
-                min_distance = float('inf')
-                for diar_seg in diarization_result["segments"]:
-                    diar_mid = (diar_seg["start"] + diar_seg["end"]) / 2
-                    distance = abs(diar_mid - mid_time)
-                    if distance < min_distance:
-                        min_distance = distance
-                        speaker_label = diar_seg["speaker"]
-
-            # Try to match to known speaker if provided
-            speaker_name = speaker_label  # Default to diarization label (will be converted to Unknown_XX)
-            is_known = False
-            confidence = 0.0
-            embedding = None
-            matched_emotion_from_voice = None  # Will be set if matched via emotion voice profile
-
-            # ALWAYS extract embeddings (needed for embedding verification and speaker matching)
-            # Check if segment is long enough for embedding extraction
-            segment_duration = trans_seg["end"] - trans_seg["start"]
-            if segment_duration < MIN_SEGMENT_DURATION_SEC:
-                logger.info(f"⏭️ Skipping embedding extraction (segment too short: {segment_duration:.2f}s)")
-            else:
-                try:
-                    # Extract embedding for this segment
-                    segment_embedding = self.extract_segment_embedding(
-                        audio_file,
-                        trans_seg["start"],
-                        trans_seg["end"]
-                    )
-                    # Validate embedding
-                    if np.isnan(segment_embedding).any():
-                        logger.info(f"⏭️ Segment embedding has NaN - skipping")
-                    else:
-                        # Store valid embedding for later use (auto-enrollment or verification)
-                        embedding = segment_embedding
-
-                        # NEW: Enhanced matching against ALL voice profiles (general + emotion-specific)
-                        if db_session:
-                            enhanced_match = self.match_speaker_with_all_profiles(
-                                segment_embedding,
-                                db_session,
-                                threshold=threshold
-                            )
-
-                            if enhanced_match:
-                                speaker_name = enhanced_match['speaker_name']
-                                confidence = enhanced_match['confidence']
-                                is_known = True
-                                matched_emotion_from_voice = enhanced_match.get('matched_emotion')  # May be None
-                                # Keep embedding for caching
-                        elif known_speakers:
-                            # Fallback to old method if no db_session
-                            match = self.match_speaker(segment_embedding, known_speakers, threshold)
-                            if match:
-                                _, speaker_name, confidence = match
-                                is_known = True
-                                logger.info(f"Matched segment to {speaker_name} with confidence {confidence:.2%}")
-                                # Keep embedding for caching
-                except RuntimeError as e:
-                    error_str = str(e)
-                    if "Kernel size" in error_str or "input size" in error_str:
-                        logger.info(f"⏭️ Skipping embedding extraction (segment too short for embedding model)")
-                    elif "beyond file duration" in error_str:
-                        logger.info(f"⏭️ Skipping embedding extraction (segment at file boundary)")
-                    else:
-                        raise
-                except Exception as e:
-                    # Catch pyannote errors like sample mismatches at file boundaries
-                    if "samples instead of the expected" in str(e) or "requested chunk" in str(e):
-                        logger.info(f"⏭️ Skipping embedding extraction (segment beyond file duration: {trans_seg['start']:.2f}s-{trans_seg['end']:.2f}s)")
-                    else:
-                        raise
-
-            # If still not matched to known speaker (or embedding failed), map to Unknown_XX
-            if not is_known:
-                if speaker_label:
-                    # Create consistent mapping from diarization label to Unknown_XX
-                    if speaker_label not in unknown_speaker_map:
-                        unknown_speaker_map[speaker_label] = f"Unknown_{unknown_counter:02d}"
-                        unknown_counter += 1
-                    speaker_name = unknown_speaker_map[speaker_label]
-                else:
-                    # No speaker label at all - create generic unknown
-                    speaker_name = f"Unknown_{unknown_counter:02d}"
-                    unknown_counter += 1
-
+        for (trans_seg, speaker_label, embedding), who in zip(segments, speakers):
             if preloaded_emotion_audio is None and not emotion_preload_failed:
                 try:
                     preloaded_emotion_audio = self.preload_emotion_audio(audio_file)
@@ -1099,89 +1150,27 @@ class SpeakerRecognitionEngine:
                 extract_embedding=enable_personalized_emotions,
                 preloaded_audio=preloaded_emotion_audio,
             )
-
-            # NEW: If we matched via emotion voice profile, use that as primary signal
-            if matched_emotion_from_voice is not None and emotion_data:
-                logger.info(f"  🎯 Voice profile match indicates emotion: {matched_emotion_from_voice}")
-
-                # Create detector breakdown showing voice match as primary
-                emotion_data['detector_breakdown'] = {
-                    'emotion2vec_detector': {
-                        'emotion': emotion_data['emotion_category'],
-                        'confidence': float(emotion_data.get('emotion_confidence', 0.0))
-                    },
-                    'voice_profile_detector': {
-                        'emotion': matched_emotion_from_voice,
-                        'confidence': float(confidence)  # Use speaker match confidence
-                    },
-                    'final_decision': {
-                        'emotion': matched_emotion_from_voice,
-                        'confidence': float(confidence),
-                        'reason': f'Matched {speaker_name}_{matched_emotion_from_voice} voice profile',
-                        'voice_profile_available': True
-                    }
-                }
-
-                # Override emotion with voice profile match
-                emotion_data['emotion_category'] = matched_emotion_from_voice
-                emotion_data['emotion_confidence'] = float(confidence)  # Convert to Python float
-
-                logger.info(f"  🔬 Enhanced Match Results:")
-                logger.info(f"     emotion2vec: {emotion_data['detector_breakdown']['emotion2vec_detector']['emotion']} ({emotion_data['detector_breakdown']['emotion2vec_detector']['confidence']:.2%})")
-                logger.info(f"     Voice profile: {matched_emotion_from_voice} ({confidence:.2%})")
-                logger.info(f"     Final: {matched_emotion_from_voice} - Matched emotion voice profile")
-
-            # Personalized emotion matching (if enabled and speaker has profiles and NOT already matched via voice)
-            elif emotion_data and enable_personalized_emotions and is_known and db_session:
-                emotion_embedding = emotion_data.get('embedding')
-
-                if emotion_embedding is not None:
-                    try:
-                        speaker = db_session.query(Speaker).filter(Speaker.name == speaker_name).first()
-
-                        if speaker and speaker.emotion_profiles:
-                            dual_result = self.match_emotion_dual_detector(
-                                emotion_embedding=emotion_embedding,
-                                voice_embedding=embedding,
-                                speaker_emotion_profiles=speaker.emotion_profiles,
-                                global_threshold=global_emotion_threshold,
-                                speaker_threshold=speaker.emotion_threshold,
-                                generic_emotion=emotion_data['emotion_category'],
-                                generic_confidence=emotion_data['emotion_confidence'],
-                            )
-
-                            # Use final decision from dual-detector
-                            final = dual_result['final_decision']
-                            emotion_data['emotion_category'] = final['emotion']
-                            emotion_data['emotion_confidence'] = final['confidence']
-
-                            # Store detector breakdown for client display
-                            emotion_data['detector_breakdown'] = dual_result
-
-                            logger.info(f"  🔬 Dual-Detector Results:")
-                            logger.info(f"     Detector 1 (emotion2vec): {dual_result['emotion2vec_detector']['emotion']} ({dual_result['emotion2vec_detector']['confidence']:.2%})")
-                            if dual_result['voice_profile_detector']:
-                                logger.info(f"     Detector 2 (voice profile): {dual_result['voice_profile_detector']['emotion']} ({dual_result['voice_profile_detector']['confidence']:.2%})")
-                            else:
-                                logger.info(f"     Detector 2 (voice profile): Not available")
-                            logger.info(f"     Final: {final['emotion']} ({final['confidence']:.2%}) - {final['reason']}")
-
-                    except Exception as e:
-                        logger.info(f"  Warning: Personalized emotion matching failed: {e}")
-                        # Fall back to generic emotion detection
+            if emotion_data:
+                if who["matched_emotion"] is not None:
+                    self._apply_voice_profile_emotion(emotion_data, who)
+                elif enable_personalized_emotions and who["is_known"] and db_session:
+                    self._apply_personalized_emotion(emotion_data, who["speaker"], embedding, db_session,
+                                                     global_emotion_threshold)
 
             segment_data = {
                 "start": trans_seg["start"],
                 "end": trans_seg["end"],
                 "text": trans_seg["text"],
-                "speaker": speaker_name,
+                "speaker": who["speaker"],
                 "speaker_label": speaker_label,
-                "is_known": is_known,
-                "confidence": float(confidence) if confidence is not None else 0.0,  # Convert to Python float
+                "is_known": who["is_known"],
+                "confidence": float(who["confidence"] or 0.0),  # Convert to Python float
                 "embedding": embedding,  # Include embedding for unknown speakers
                 "words": trans_seg.get("words", []),  # Include word-level data
                 "avg_logprob": trans_seg.get("avg_logprob")  # Include segment confidence
             }
+            if who["speaker_id"] is not None:   # already resolved (SPEAKER_ASSIGNMENT=cluster)
+                segment_data["speaker_id"] = who["speaker_id"]
 
             # Add emotion data if available (include embedding for caching)
             if emotion_data:
@@ -1200,6 +1189,233 @@ class SpeakerRecognitionEngine:
             "num_speakers": diarization_result["num_speakers"]
         }
 
+    def _segment_embedding_or_none(self, audio_file: str, seg: Dict) -> Optional[np.ndarray]:
+        """Voice embedding of one segment, or None if it is too short, at a file boundary or NaN."""
+        segment_duration = seg["end"] - seg["start"]
+        if segment_duration < MIN_SEGMENT_DURATION_SEC:
+            logger.info(f"⏭️ Skipping embedding extraction (segment too short: {segment_duration:.2f}s)")
+            return None
+        try:
+            embedding = self.extract_segment_embedding(audio_file, seg["start"], seg["end"])
+        except RuntimeError as e:
+            error_str = str(e)
+            if "Kernel size" in error_str or "input size" in error_str:
+                logger.info(f"⏭️ Skipping embedding extraction (segment too short for embedding model)")
+            elif "beyond file duration" in error_str:
+                logger.info(f"⏭️ Skipping embedding extraction (segment at file boundary)")
+            else:
+                raise
+            return None
+        except Exception as e:
+            # Catch pyannote errors like sample mismatches at file boundaries
+            if "samples instead of the expected" in str(e) or "requested chunk" in str(e):
+                logger.info(f"⏭️ Skipping embedding extraction (segment beyond file duration: {seg['start']:.2f}s-{seg['end']:.2f}s)")
+                return None
+            raise
+        if np.isnan(embedding).any():
+            logger.info(f"⏭️ Segment embedding has NaN - skipping")
+            return None
+        return embedding
+
+    @staticmethod
+    def _speaker(name, speaker_id=None, is_known=False, confidence=0.0, matched_emotion=None) -> Dict:
+        return {"speaker": name, "speaker_id": speaker_id, "is_known": is_known, "confidence": confidence,
+                "matched_emotion": matched_emotion}
+
+    def _identify_segments(self, segments, known_speakers, threshold, db_session) -> List[Dict]:
+        """Default (SPEAKER_ASSIGNMENT=segment): match every segment's own embedding against the stored profiles.
+
+        Unmatched segments are named Unknown_NN per diarization label here, then auto-enrolled one segment at a
+        time when they are saved (create_segment_from_result).
+        """
+        unknown_speaker_map: Dict[str, str] = {}
+        unknown_counter = 1
+        out = []
+        for _, speaker_label, embedding in segments:
+            who = self._speaker(speaker_label)
+            if embedding is not None:
+                if db_session:
+                    # Enhanced matching against ALL voice profiles (general + emotion-specific)
+                    match = self.match_speaker_with_all_profiles(embedding, db_session, threshold=threshold)
+                    if match:
+                        who = self._speaker(match["speaker_name"], is_known=True, confidence=match["confidence"],
+                                            matched_emotion=match.get("matched_emotion"))
+                elif known_speakers:
+                    # Fallback to old method if no db_session
+                    match = self.match_speaker(embedding, known_speakers, threshold)
+                    if match:
+                        _, name, confidence = match
+                        who = self._speaker(name, is_known=True, confidence=confidence)
+                        logger.info(f"Matched segment to {name} with confidence {confidence:.2%}")
+            if not who["is_known"]:
+                # Consistent mapping from diarization label to Unknown_XX (no label: a generic unknown)
+                if speaker_label and speaker_label in unknown_speaker_map:
+                    who["speaker"] = unknown_speaker_map[speaker_label]
+                else:
+                    who["speaker"] = f"Unknown_{unknown_counter:02d}"
+                    unknown_counter += 1
+                    if speaker_label:
+                        unknown_speaker_map[speaker_label] = who["speaker"]
+            out.append(who)
+        return out
+
+    def _identify_clusters(self, audio_file, segments, diarization_result, known_speakers, threshold,
+                           db_session) -> Dict[Optional[str], Dict]:
+        """SPEAKER_ASSIGNMENT=cluster: one identity per diarization speaker, decided once from all of its speech.
+
+        A speaker's voice is the duration-weighted centroid of its segments' embeddings. Speakers are matched to the
+        stored people one-to-one (pyannote has already decided they are different people), above the threshold
+        (CLUSTER_SPEAKER_THRESHOLD) and no lower. A speaker that matches nobody becomes ONE new Unknown_* (auto-enrolled with the
+        centroid), so an unsure match stays unknown instead of being given someone else's name.
+        """
+        groups: Dict[Optional[str], Tuple[List[np.ndarray], List[float]]] = {}
+        for seg, label, embedding in segments:
+            embeddings, weights = groups.setdefault(label, ([], []))
+            if embedding is not None:
+                embeddings.append(embedding)
+                weights.append(min(seg["end"] - seg["start"], CENTROID_MAX_WEIGHT_SEC))
+        labels = list(groups)   # order of first appearance
+        centroids = {label: _centroid(*groups[label]) for label in labels}
+        for label in labels:
+            if centroids[label] is None and label is not None:
+                centroids[label] = self._turns_centroid(audio_file, label, diarization_result["exclusive_segments"])
+
+        # Candidate people: speaker_id -> (name, all their voice profiles: general + emotion-specific)
+        people: Dict[Any, Tuple[str, List[np.ndarray]]] = {}
+        if db_session:
+            for p in self._all_profiles(db_session):
+                people.setdefault(p["speaker_id"], (p["speaker_name"], []))[1].append(p["embedding"])
+        else:
+            for speaker_id, name, embedding in known_speakers:
+                if not np.isnan(embedding).any():
+                    people.setdefault(speaker_id, (name, []))[1].append(embedding)
+
+        ids = list(people)
+        matchable = [label for label in labels if centroids[label] is not None]
+        identities: Dict[Optional[str], Dict] = {}
+        if ids and matchable:
+            sims = np.array([[max(float(cosine_similarity(centroids[label].reshape(1, -1), e.reshape(1, -1))[0][0])
+                                  for e in people[i][1]) for i in ids] for label in matchable])
+            for label, row in zip(matchable, sims):
+                top = sorted(((s, people[i][0]) for s, i in zip(row, ids)), reverse=True)[:3]
+                logger.info(f"  Speaker {label}: best matches " + ", ".join(f"{n} {s:.3f}" for s, n in top))
+            from scipy.optimize import linear_sum_assignment
+            rows, cols = linear_sum_assignment(np.where(sims > threshold, -sims, 0.0))
+            for r, c in zip(rows, cols):
+                if sims[r, c] > threshold:
+                    label, speaker_id = matchable[r], ids[c]
+                    identities[label] = self._speaker(people[speaker_id][0], speaker_id, True, sims[r, c])
+                    logger.info(f"  ✅ Speaker {label} → {people[speaker_id][0]} ({sims[r, c]:.2%})")
+
+        unknown_counter = 1
+        for label in labels:
+            if label in identities:
+                continue
+            centroid = centroids[label]
+            if db_session and centroid is not None:
+                speaker_id, name = _create_unknown_speaker(centroid, db_session)
+                self.add_speaker_to_cache(speaker_id, name, centroid)
+                identities[label] = self._speaker(name, speaker_id, confidence=1.0)
+            else:
+                identities[label] = self._speaker(f"Unknown_{unknown_counter:02d}")
+                unknown_counter += 1
+            logger.info(f"  ❔ Speaker {label} → {identities[label]['speaker']} (no stored voice above {threshold:.2%})")
+        return identities
+
+    def _turns_centroid(self, audio_file: str, label: str, turns: List[Dict]) -> Optional[np.ndarray]:
+        """Centroid of a diarization speaker's longest turns (for a speaker none of whose segments could be embedded)."""
+        longest = sorted((t for t in turns if t["speaker"] == label), key=lambda t: t["duration"], reverse=True)
+        embeddings, weights = [], []
+        for turn in longest[:CENTROID_FALLBACK_TURNS]:
+            embedding = self._segment_embedding_or_none(audio_file, turn)
+            if embedding is not None:
+                embeddings.append(embedding)
+                weights.append(min(turn["duration"], CENTROID_MAX_WEIGHT_SEC))
+        return _centroid(embeddings, weights)
+
+    def _apply_voice_profile_emotion(self, emotion_data: Dict, who: Dict):
+        """The segment matched one of the speaker's emotion voice profiles: use that as the primary emotion signal."""
+        matched_emotion, confidence, speaker_name = who["matched_emotion"], who["confidence"], who["speaker"]
+        logger.info(f"  🎯 Voice profile match indicates emotion: {matched_emotion}")
+
+        # Create detector breakdown showing voice match as primary
+        emotion_data['detector_breakdown'] = {
+            'emotion2vec_detector': {
+                'emotion': emotion_data['emotion_category'],
+                'confidence': float(emotion_data.get('emotion_confidence', 0.0))
+            },
+            'voice_profile_detector': {
+                'emotion': matched_emotion,
+                'confidence': float(confidence)  # Use speaker match confidence
+            },
+            'final_decision': {
+                'emotion': matched_emotion,
+                'confidence': float(confidence),
+                'reason': f'Matched {speaker_name}_{matched_emotion} voice profile',
+                'voice_profile_available': True
+            }
+        }
+
+        # Override emotion with voice profile match
+        emotion_data['emotion_category'] = matched_emotion
+        emotion_data['emotion_confidence'] = float(confidence)  # Convert to Python float
+
+        logger.info(f"  🔬 Enhanced Match Results:")
+        logger.info(f"     emotion2vec: {emotion_data['detector_breakdown']['emotion2vec_detector']['emotion']} ({emotion_data['detector_breakdown']['emotion2vec_detector']['confidence']:.2%})")
+        logger.info(f"     Voice profile: {matched_emotion} ({confidence:.2%})")
+        logger.info(f"     Final: {matched_emotion} - Matched emotion voice profile")
+
+    def _apply_personalized_emotion(self, emotion_data: Dict, speaker_name: str, voice_embedding, db_session,
+                                    global_emotion_threshold: float):
+        """Known speaker with learned emotion profiles: let the dual detector make the final emotion decision."""
+        emotion_embedding = emotion_data.get('embedding')
+        if emotion_embedding is None:
+            return
+        try:
+            speaker = db_session.query(Speaker).filter(Speaker.name == speaker_name).first()
+            if not (speaker and speaker.emotion_profiles):
+                return
+            dual_result = self.match_emotion_dual_detector(
+                emotion_embedding=emotion_embedding,
+                voice_embedding=voice_embedding,
+                speaker_emotion_profiles=speaker.emotion_profiles,
+                global_threshold=global_emotion_threshold,
+                speaker_threshold=speaker.emotion_threshold,
+                generic_emotion=emotion_data['emotion_category'],
+                generic_confidence=emotion_data['emotion_confidence'],
+            )
+
+            # Use final decision from dual-detector
+            final = dual_result['final_decision']
+            emotion_data['emotion_category'] = final['emotion']
+            emotion_data['emotion_confidence'] = final['confidence']
+
+            # Store detector breakdown for client display
+            emotion_data['detector_breakdown'] = dual_result
+
+            logger.info(f"  🔬 Dual-Detector Results:")
+            logger.info(f"     Detector 1 (emotion2vec): {dual_result['emotion2vec_detector']['emotion']} ({dual_result['emotion2vec_detector']['confidence']:.2%})")
+            if dual_result['voice_profile_detector']:
+                logger.info(f"     Detector 2 (voice profile): {dual_result['voice_profile_detector']['emotion']} ({dual_result['voice_profile_detector']['confidence']:.2%})")
+            else:
+                logger.info(f"     Detector 2 (voice profile): Not available")
+            logger.info(f"     Final: {final['emotion']} ({final['confidence']:.2%}) - {final['reason']}")
+
+        except Exception as e:
+            logger.info(f"  Warning: Personalized emotion matching failed: {e}")
+            # Fall back to generic emotion detection
+
+    def _all_profiles(self, db_session) -> List[Dict[str, Any]]:
+        """Every voice profile (general + emotion-specific): the warm cache, else one DB scan (memoized)."""
+        with self._cache_lock:
+            if self._speaker_cache is not None:
+                logger.info(f"  ⚡ Using cached profiles: {len(self._speaker_cache)} profiles")
+                return self._speaker_cache
+            logger.info(f"  ⚠️ Cache not loaded, querying DB...")
+            self._speaker_cache = _build_profile_list(db_session.query(Speaker).all())
+            logger.info(f"  🔍 Checking against {len(self._speaker_cache)} voice profiles (general + emotion-specific)")
+            return self._speaker_cache
+
     def match_speaker_with_all_profiles(self, segment_embedding, db_session, threshold=0.35):
         """
         Enhanced speaker matching that checks ALL voice profiles (general + emotion-specific).
@@ -1216,19 +1432,7 @@ class SpeakerRecognitionEngine:
         best_match = None
         best_similarity = threshold
 
-        # Prefer the warm cache; fall back to a DB scan (and memoize).
-        with self._cache_lock:
-            if self._speaker_cache is not None:
-                all_profiles = self._speaker_cache
-                logger.info(f"  ⚡ Using cached profiles: {len(all_profiles)} profiles")
-            else:
-                logger.info(f"  ⚠️ Cache not loaded, querying DB...")
-                speakers = db_session.query(Speaker).all()
-                all_profiles = _build_profile_list(speakers)
-                self._speaker_cache = all_profiles
-                logger.info(f"  🔍 Checking against {len(all_profiles)} voice profiles (general + emotion-specific)")
-
-        for profile in all_profiles:
+        for profile in self._all_profiles(db_session):
             similarity = cosine_similarity(
                 segment_embedding.reshape(1, -1),
                 profile['embedding'].reshape(1, -1)

@@ -308,6 +308,7 @@ async def reprocess_conversation(
         }
     except Exception:
         fail_processing_lease(db, conversation_id, processing_token)
+        engine.clear_speaker_cache()  # it may hold Unknown_* speakers enrolled by this rolled-back request
         raise
 
 
