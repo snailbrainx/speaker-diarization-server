@@ -159,21 +159,22 @@ All configuration is environment variables (see `.env.example` for the curated l
 | `CUDA_DEVICE_ORDER`         | `PCI_BUS_ID`  | Pinned by `run_local.sh` and `docker-compose.yml` so indices match `nvidia-smi` instead of CUDA's "fastest first" reshuffle. |
 | `CLEANUP_VRAM_THRESHOLD_GB` | `12`          | Only run the VRAM cleanup loop when allocated memory exceeds this. |
 
-### Speed & speaker assignment (opt-in)
+### Speed & speaker assignment
 
-All off by default; unset means the original behaviour. Recommended for uploaded recordings: all five together.
+On by default. To get the original behaviour back, set `WHISPER_BATCH_SIZE=0`, `WORD_LEVEL_SPEAKERS=false`,
+`PYANNOTE_ALLOW_TF32=false` and `SPEAKER_ASSIGNMENT=segment`.
 
 | Variable                    | Default   | Purpose                                                                                     |
 |-----------------------------|-----------|---------------------------------------------------------------------------------------------|
-| `WHISPER_BATCH_SIZE`        | *(unset)* | e.g. `16`: batched faster-whisper (VAD chunks in batches). ~8x faster transcription on long audio. Use with `WORD_LEVEL_SPEAKERS`. |
-| `WORD_LEVEL_SPEAKERS`       | `false`   | Each word gets the diarization speaker at its midpoint; segments split where the speaker changes. |
-| `PYANNOTE_ALLOW_TF32`       | `false`   | Keep TF32 on for pyannote (it disables it for reproducibility). Faster on Ampere and newer.   |
-| `SPEAKER_ASSIGNMENT`        | `segment` | `cluster`: identify each diarization speaker **once per file** from all of its speech, one-to-one against stored speakers; an unmatched speaker becomes one `Unknown_*`. Uploaded/reprocessed files only; live chunks keep per-segment matching. |
+| `WHISPER_BATCH_SIZE`        | `4` on GPU, `0` on CPU | Batched faster-whisper (VAD chunks in batches): ~8x faster transcription on long audio, no end-of-file repeat hallucination. `0` = sequential decoding. Larger batches use more VRAM (peak ~8 GB at 4, ~10 GB at 8, ~13 GB at 16 on long recordings) without being faster, since diarization is the slower half. |
+| `WORD_LEVEL_SPEAKERS`       | `true`    | Each word gets the diarization speaker at its midpoint; segments split where the speaker changes. `false` = one speaker per Whisper segment. |
+| `PYANNOTE_ALLOW_TF32`       | `true`    | Keep TF32 on for pyannote (it disables it for reproducibility). Faster on Ampere and newer.   |
+| `SPEAKER_ASSIGNMENT`        | `cluster` | `cluster`: identify each diarization speaker **once per file** from all of its speech, one-to-one against stored speakers; an unmatched speaker becomes one `Unknown_*`. Uploaded/reprocessed files only; live chunks keep per-segment matching. `segment` = match every segment on its own (original). |
 | `CLUSTER_SPEAKER_THRESHOLD` | `0.70`    | Cluster mode's match threshold (used instead of `SPEAKER_THRESHOLD`, which is tuned for single segments). Higher → stricter. |
 
 Measured on public test sets (RTX 3090; AMI = 16 test meetings, VoxConverse = 40 dev clips):
 
-| | default | speed settings | + `SPEAKER_ASSIGNMENT=cluster` |
+| | original | speed settings only | current defaults (+ cluster) |
 |---|---|---|---|
 | Speed, AMI (× real time, server-side) | 11.7× | 23.5× | same or slightly faster¹ |
 | WER, LibriSpeech test-clean (40 clips) | 2.9% | 1.0% | 1.0% |
@@ -184,7 +185,8 @@ Measured on public test sets (RTX 3090; AMI = 16 test meetings, VoxConverse = 40
 | Enrolled speakers in later meetings: right / wrong / unknown² | – | 86.8% / 8.5% / 4.7% | **97.5% / 2.2% / 0.2%** |
 | Speech of unenrolled speakers given an enrolled name² | – | 10.3% | **0%** |
 
-¹ 6% less processing time than the speed settings alone, measured side by side on the same GPU.
+¹ 6% less processing time than the speed settings alone, measured side by side on the same GPU. (Measured with
+`WHISPER_BATCH_SIZE=16`; batch 4, the default, is equally fast and gives the same transcripts.)
 ² Each AMI series has the same four people in four meetings: speakers were named in the first meeting with the
 identify endpoint, then the other three meetings were processed; a meeting from another series stood in for
 unenrolled speakers.
@@ -209,6 +211,8 @@ upload / WS chunk
                       │
                       ▼
         cosine match vs known speaker profiles
+        (files: once per diarization speaker, from its centroid;
+         live chunks: per segment)
         │                              │
         ▼                              ▼
    known speaker                 Unknown_NN  (auto-enrolled)
@@ -225,7 +229,7 @@ Key behaviors:
 - **Parallel Whisper + pyannote** — ~2× faster than sequential.
 - **Context padding** — 0.15 s of audio on each side of a segment makes the embedding robust to background noise.
 - **Auto-enrollment** — unidentified voices get an `Unknown_N` profile immediately so they accumulate samples. Rename/identify and every past `Unknown_N` segment re-labels.
-- **Cluster mode** (`SPEAKER_ASSIGNMENT=cluster`, opt-in) — instead of matching each segment's embedding on its own, each pyannote speaker is matched once from the centroid of all its segments, so one person gets one label per file (one `Unknown_N` if not enrolled) and a single identify names them everywhere.
+- **Cluster mode** (`SPEAKER_ASSIGNMENT=cluster`, the default for files) — instead of matching each segment's embedding on its own, each pyannote speaker is matched once from the centroid of all its segments, so one person gets one label per file (one `Unknown_N` if not enrolled) and a single identify names them everywhere.
 - **Misidentified-flag** — segments flagged `is_misidentified` are excluded from embedding averaging, keeping profiles clean.
 - **Dual-detector emotion** — emotion2vec always runs; if the speaker has ≥ 3 voice samples for an emotion, a voice-profile detector also runs. Best match wins with deterministic tie-break rules.
 - **Personalized learning** — user emotion corrections store both the 1024-D emotion embedding and the 512-D voice embedding, merged with weighted averaging into the speaker's profile.
@@ -406,6 +410,11 @@ Docker bind-mounts `./volumes`, `./data`, `./backups`, and `./certs` (read-only)
 **Wrong GPU selected** — set `CUDA_VISIBLE_DEVICES` to match the `nvidia-smi` index you want; `CUDA_DEVICE_ORDER=PCI_BUS_ID` is already pinned for you.
 
 **"CUDA out of memory"** — switch `WHISPER_MODEL` to a smaller variant (`small` or `base`) or raise `CLEANUP_VRAM_THRESHOLD_GB` so cleanup runs more often.
+
+**Speakers named before upgrading are recognised less often** — profiles auto-enrolled by the old per-segment
+matching are often built from a single short segment, which may not reach `CLUSTER_SPEAKER_THRESHOLD`. Identify the
+speaker once in a recent conversation (the profile is then rebuilt from all of their segments), or set
+`SPEAKER_ASSIGNMENT=segment` to keep the old behaviour.
 
 **Speaker not recognized** — enroll with 10–30 s of clean audio. Lower `SPEAKER_THRESHOLD` to ~0.20 for challenging audio (movies, music). In cluster mode the threshold is `CLUSTER_SPEAKER_THRESHOLD` (0.70); speakers with only a few seconds of enrolled speech may stay `Unknown` until identified in more recordings.
 

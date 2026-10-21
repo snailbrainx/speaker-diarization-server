@@ -27,7 +27,7 @@ services:
       - WHISPER_MODEL=${WHISPER_MODEL:-large-v3}
       - WHISPER_LANGUAGE=${WHISPER_LANGUAGE:-en}
       - OFFLINE_MODE=${OFFLINE_MODE:-false}
-      # Opt-in speed / speaker-assignment settings (README "Speed & speaker assignment"); empty = off.
+      # Speed / speaker-assignment settings (README "Speed & speaker assignment"); empty = the defaults.
       - WHISPER_BATCH_SIZE=${WHISPER_BATCH_SIZE:-}
       - WORD_LEVEL_SPEAKERS=${WORD_LEVEL_SPEAKERS:-}
       - PYANNOTE_ALLOW_TF32=${PYANNOTE_ALLOW_TF32:-}
