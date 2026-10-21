@@ -322,10 +322,11 @@ restore (if that fails, the restore fails and nothing is replaced).
 A live chunk holds a few seconds of speech, too little to name someone reliably on its own. So a live session keeps
 one track per voice (`LIVE_SPEAKER_TRACKING=true`): each chunk's diarization speakers join the session's tracks by
 voice, a track's voice is the mean of everything it has said so far, and a track is named only when that voice
-clearly matches one stored speaker (similarity ≥ 0.70 and 0.05 above the next, after ≥ 2 s of speech). Until then it
-is one `Unknown` of its own, the same for all its lines; when it gets a name, its earlier lines are renamed and the
-client receives a `speaker_update` message (`segment_ids`, `speaker_id`, `speaker_name`, `is_known`). A stranger who
-comes back in a later session is matched to the same `Unknown`, and identifying any one of its lines names all of them.
+clearly matches one stored speaker (similarity ≥ 0.62 and 0.05 above the next; one short line can be enough). Until
+then it is one `Unknown` of its own, the same for all its lines, and stored at once: a voice heard in one session is
+the same `Unknown` in the next. When a track gets a name, its earlier lines are renamed and the client receives a
+`speaker_update` message (`segment_ids`, `speaker_id`, `speaker_name`, `is_known`). Identifying any one line of an
+`Unknown` names all of them, in every conversation.
 
 Speech is found by a speech detector (Silero VAD) rather than by loudness: quiet voices are kept, and fans, traffic,
 hum or keyboard noise never start a transcription (0% of such audio was taken for speech in a test, even when loud).
@@ -348,8 +349,15 @@ meeting of four people nobody named. Averages over the four groups:
 ¹ Three groups; in the fourth (a quiet recording) almost nothing was transcribed: its speech fell under the old
 loudness threshold. Most of the difference between the first two columns is the recorder (speech detection, timing),
 the voice model and the speech-to-text; tracking then takes strangers' wrong names to zero and halves the Unknowns to
-name. Known people are typically named in their first or second line (under 2 s of their speech); a voice too short to
-place (a lone "yes") stays a plain `Unknown` (about 1–3% of the speech) rather than risk a wrong name.
+name. Known people are typically named in their first or second line (under 2 s of their speech).
+
+People who talk in short phrases give each chunk a second or so of speech, and one such line's voice can be only
+about 0.5 similar to the same person's next line, and about 0.6 to their profile (in a test with a browser
+microphone). The thresholds above were set for that, on the same meetings replayed offline with every 0.8–2 s line as
+a chunk of its own: named people are named in 65% of their speech with 1.8% wrong, where the previous thresholds
+(0.70, and only after 2 s of a voice's speech) named 50% and a session of short replies could end without naming
+anyone. On the meetings as recorded the results are unchanged, and strangers are never given a name, even when only
+one person is enrolled.
 
 ### Overlapping speech (optional)
 
@@ -618,7 +626,7 @@ matching are often built from a single short segment, which may not reach `CLUST
 speaker once in a recent conversation (the profile is then rebuilt from all of their segments), or set
 `SPEAKER_ASSIGNMENT=segment` to keep the old behaviour.
 
-**Speaker not recognized** — enroll with 10–30 s of clean audio. In cluster mode the threshold is `CLUSTER_SPEAKER_THRESHOLD` (0.60), live it is the track threshold (0.70, after 2 s of speech); speakers with only a few seconds of enrolled speech may stay `Unknown` until identified in more recordings. With per-segment matching (`SPEAKER_ASSIGNMENT=segment`), lower `SPEAKER_THRESHOLD` to ~0.20 for challenging audio (movies, music).
+**Speaker not recognized** — enroll with 10–30 s of clean audio. In cluster mode the threshold is `CLUSTER_SPEAKER_THRESHOLD` (0.60), live it is the track threshold (0.62); speakers with only a few seconds of enrolled speech may stay `Unknown` until identified in more recordings. With per-segment matching (`SPEAKER_ASSIGNMENT=segment`), lower `SPEAKER_THRESHOLD` to ~0.20 for challenging audio (movies, music).
 
 **Browser microphone not working** — browsers allow the microphone only on HTTPS pages or `localhost`. Run `./generate_cert.sh` (or drop your own `cert.pem`/`key.pem` into `certs/`), restart, open `https://<host>:8418/` and accept the certificate warning. The web interface can still stream an audio file without a microphone.
 
