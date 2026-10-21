@@ -46,6 +46,27 @@ def backup_dir(tmp_path, monkeypatch):
     return d
 
 
+class _NoAudioEngine:
+    """The voice-model boundary. Restoring an older backup converts its voices to the current model from the
+    recordings; these tests have no audio, so nothing is embedded (and no model is loaded)."""
+    embedding_dim = 4
+
+    def _segment_embedding_or_none(self, _audio, _seg):
+        return None
+
+    def extract_segment_embeddings_batch(self, segments):
+        return [None] * len(segments)
+
+    def clear_speaker_cache(self):
+        pass
+
+
+@pytest.fixture(autouse=True)
+def _voice_model(monkeypatch):
+    from app import api
+    monkeypatch.setattr(api, "get_engine", lambda: _NoAudioEngine())
+
+
 def _make_speaker(db, name="Alice"):
     import numpy as np
     s = Speaker(name=name)
@@ -337,6 +358,46 @@ class TestProfileOverwriteProtection:
 
 
 class TestRestoreValidationAndMapping:
+    def test_a_failed_voice_conversion_leaves_the_database_as_it_was(
+        self, db_session, backup_dir, tmp_path, monkeypatch
+    ):
+        """An older backup's voices are converted in the restore's own transaction: when that fails, the restore
+        fails with nothing replaced (it used to answer 500 after already replacing every speaker)."""
+        import asyncio
+
+        from fastapi import HTTPException
+
+        from app import api, backup_api
+        from app.models import AppMetadata
+        from app.services import VOICE_MODEL_KEY
+
+        _make_speaker(db_session, "Original")
+        payload = {   # no "voice_model": made before it was recorded, so its voices are converted
+            "name": "Legacy",
+            "speakers": [{"id": 7, "name": "Replacement", "embedding": [1.0, 0.0]}],
+            "segments": [],
+        }
+        (backup_dir / "profile_legacy.json").write_text(json.dumps(payload))
+        monkeypatch.chdir(tmp_path)
+
+        def unavailable():
+            raise OSError("voice model not available")
+
+        monkeypatch.setattr(api, "get_engine", unavailable)
+        with pytest.raises(HTTPException) as exc_info:
+            asyncio.run(backup_api.restore_from_file(filename="profile_legacy.json", db=db_session))
+        assert exc_info.value.status_code == 500
+        db_session.expire_all()
+        assert [speaker.name for speaker in db_session.query(Speaker).all()] == ["Original"]
+        assert db_session.get(AppMetadata, VOICE_MODEL_KEY) is None
+
+        monkeypatch.setattr(api, "get_engine", lambda: _NoAudioEngine())
+        result = asyncio.run(backup_api.restore_from_file(filename="profile_legacy.json", db=db_session))
+        assert result["voice_profiles_rebuilt"]["speakers_without_audio"] == ["Replacement"]
+        db_session.expire_all()
+        assert [speaker.name for speaker in db_session.query(Speaker).all()] == ["Replacement"]
+        assert db_session.get(AppMetadata, VOICE_MODEL_KEY).value == backup_api.SPEAKER_EMBEDDING_MODEL
+
     def test_invalid_settings_rejected_before_database_mutation(
         self, db_session, backup_dir, tmp_path, monkeypatch
     ):

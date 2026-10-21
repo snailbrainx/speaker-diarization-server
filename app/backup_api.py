@@ -791,6 +791,17 @@ async def restore_from_file(filename: str, db: Session = Depends(get_db)):
             segments_remapped_from_local_names += 1
             segments_updated += 1
 
+        # Voices from a backup made with another voice-embedding model (older backups: pyannote/embedding) are
+        # rebuilt from their recordings with the current one, as at startup, in this same transaction: if that
+        # fails, the restore fails with nothing changed (never restored speakers whose voices cannot be compared).
+        voice_profiles_rebuilt = None
+        backup_voice_model = data.get("voice_model") or LEGACY_VOICE_MODEL
+        if backup_voice_model != SPEAKER_EMBEDDING_MODEL:
+            db.merge(AppMetadata(key=VOICE_MODEL_KEY, value=backup_voice_model))
+            db.flush()
+            from .api import get_engine
+            voice_profiles_rebuilt = migrate_voice_embeddings(db, get_engine(), commit=False)
+
         db.commit()
 
         # Active streams keep an in-memory speaker cache keyed by the OLD
@@ -801,16 +812,6 @@ async def restore_from_file(filename: str, db: Session = Depends(get_db)):
             get_engine().clear_speaker_cache()
         except Exception:  # noqa: BLE001 - model/cache availability must not undo a committed restore
             logger.info("Speaker cache invalidation skipped after restore")
-
-        # Voices from a backup made with another voice-embedding model (older backups: pyannote/embedding) are
-        # rebuilt from their recordings with the current one, as at startup.
-        voice_profiles_rebuilt = None
-        backup_voice_model = data.get("voice_model") or LEGACY_VOICE_MODEL
-        if backup_voice_model != SPEAKER_EMBEDDING_MODEL:
-            db.merge(AppMetadata(key=VOICE_MODEL_KEY, value=backup_voice_model))
-            db.commit()
-            from .api import get_engine
-            voice_profiles_rebuilt = migrate_voice_embeddings(db, get_engine())
 
         # A JSON settings file and SQLite cannot share one transaction. The DB
         # restore is already committed, so a later settings I/O failure must be
