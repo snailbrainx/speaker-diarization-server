@@ -133,7 +133,8 @@ def create_segment_from_result(
         detector_breakdown=json.dumps(seg["detector_breakdown"]) if seg.get("detector_breakdown") else None,
         segment_audio_path=segment_audio_path,
         words_data=words_json,
-        avg_logprob=seg.get("avg_logprob")
+        avg_logprob=seg.get("avg_logprob"),
+        is_overlap=bool(seg.get("overlap")),
     )
 
     if seg.get("embedding") is not None:
@@ -166,6 +167,7 @@ def recalculate_speaker_embedding(
     """
     Recalculate a speaker's embedding from all their non-misidentified segments.
     Uses cached embeddings where available, falls back to audio extraction.
+    Segments recovered from overlapping speech are left out: their audio holds two voices.
 
     Returns:
         Number of embeddings used, or 0 if no valid segments found
@@ -178,6 +180,7 @@ def recalculate_speaker_embedding(
         .filter(
             ConversationSegment.speaker_id == speaker.id,
             ConversationSegment.is_misidentified == False,
+            ConversationSegment.is_overlap == False,   # two voices at once: never anyone's voice sample
         )
         .all()
     )
@@ -322,8 +325,8 @@ def recalculate_emotion_profile(
                     seg.id,
                 )
 
-        # Voice embedding
-        voice_emb = seg.get_speaker_embedding()
+        # Voice embedding (none from overlapping speech: two voices at once)
+        voice_emb = None if seg.is_overlap else seg.get_speaker_embedding()
         if voice_emb is not None and not np.isnan(voice_emb).any():
             voice_embeddings.append(voice_emb)
 
@@ -421,7 +424,8 @@ def migrate_voice_embeddings(db: Session, engine, commit: bool = True) -> Option
     db.query(ConversationSegment).update({ConversationSegment.speaker_embedding: None}, synchronize_session=False)
     counts: Dict[str, Any] = {"segments": 0, "speakers_rebuilt": 0, "speakers_without_audio": []}
     by_conversation: Dict[int, List[ConversationSegment]] = {}
-    for seg in db.query(ConversationSegment).filter(ConversationSegment.speaker_id.isnot(None)).all():
+    for seg in db.query(ConversationSegment).filter(ConversationSegment.speaker_id.isnot(None),
+                                                    ConversationSegment.is_overlap == False).all():  # noqa: E712
         by_conversation.setdefault(seg.conversation_id, []).append(seg)
     for segments in by_conversation.values():
         path = resolve_audio_path(segments[0].conversation)
@@ -451,6 +455,7 @@ def migrate_voice_embeddings(db: Session, engine, commit: bool = True) -> Option
                 continue
             voices = [v for (v,) in db.query(ConversationSegment.speaker_embedding).filter(
                 ConversationSegment.speaker_id == speaker.id, ConversationSegment.is_misidentified == False,  # noqa: E712
+                ConversationSegment.is_overlap == False,  # noqa: E712
                 ConversationSegment.emotion_corrected == True, ConversationSegment.emotion_misidentified == False,  # noqa: E712
                 ConversationSegment.emotion_category == profile.emotion_category,
                 ConversationSegment.speaker_embedding.isnot(None)).all()]

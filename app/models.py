@@ -196,6 +196,9 @@ class ConversationSegment(Base):
     # Misidentification tracking
     is_misidentified = Column(Boolean, default=False, nullable=False)  # True if this segment was wrongly assigned to current speaker
 
+    # Words recovered from overlapping speech (OVERLAP_SEPARATION): its span holds two voices, so it never trains a voice profile
+    is_overlap = Column(Boolean, default=False, nullable=False)
+
     # Cached embeddings (for fast recalculation without audio re-extraction)
     # Stored as binary (numpy array -> bytes) to avoid reprocessing audio files
     speaker_embedding = Column(LargeBinary, nullable=True)  # 512-D pyannote embedding (~2KB)

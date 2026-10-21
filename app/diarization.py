@@ -1515,6 +1515,8 @@ class SpeakerRecognitionEngine:
                 segment_data["track"] = who["track"]
             if who.get("enroll") is not None:   # one dict per new speaker, shared by all their segments
                 segment_data["enroll"] = who["enroll"]
+            if trans_seg.get("overlap"):   # recovered from overlapping speech: saved as such (never a voice sample)
+                segment_data["overlap"] = True
 
             # Add emotion data if available (include embedding for caching)
             if emotion_data:

@@ -60,3 +60,40 @@ def test_unsure_words_and_a_voice_like_the_main_speaker_add_nothing():
 def test_no_overlap_leaves_the_segments_as_they_are():
     segments = [(seg([word("hi", 0.0, 0.5)], "A"), "A", A)]
     assert run(segments, [turn(0, 1, "A"), turn(2, 3, "B")], [A, B], [[], []]) is segments
+
+
+def test_recovered_overlap_segments_never_train_a_voice_profile(tmp_path):
+    """A recovered segment's span holds two voices: it is saved as such, and rebuilding the speaker's voice leaves it
+    out instead of embedding the mix from the recording (it has no embedding of its own)."""
+    from datetime import datetime, timezone
+
+    import soundfile as sf
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    from app.models import Base, Conversation, ConversationSegment, Speaker
+    from app.services import create_segment_from_result, recalculate_speaker_embedding
+    db = sessionmaker(bind=create_engine(f"sqlite:///{tmp_path}/o.db"))()
+    Base.metadata.create_all(db.get_bind())
+    wav = tmp_path / "c.wav"
+    sf.write(wav, np.zeros(16000 * 8, dtype=np.float32), 16000)
+    conv = Conversation(title="c", start_time=datetime.now(timezone.utc), status="completed", audio_path=str(wav))
+    bob = Speaker(name="Bob")
+    bob.set_embedding(B)
+    db.add_all([conv, bob])
+    db.flush()
+    own = dict(seg([word("hello", 0.0, 2.0)], "B"), speaker="Bob", speaker_id=bob.id, embedding=B)
+    mixed = dict(seg([word("yeah", 5.0, 6.0)], "B"), speaker="Bob", speaker_id=bob.id, embedding=None, overlap=True)
+    saved = [create_segment_from_result(s, conv.id, conv.start_time, db, threshold=0.3) for s in (own, mixed)]
+    db.flush()
+    assert [s.is_overlap for s in saved] == [False, True]
+
+    class Engine:
+        def extract_segment_embeddings_batch(self, segments):
+            raise AssertionError(f"embedded the mixed audio of {segments}")
+
+        def clear_speaker_cache(self):
+            pass
+
+    assert recalculate_speaker_embedding(bob, db, Engine()) == 1
+    assert np.allclose(bob.get_embedding(), B)
