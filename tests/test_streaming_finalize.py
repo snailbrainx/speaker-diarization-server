@@ -46,7 +46,7 @@ class TestStopRecordingWaitsForAsyncHandlers:
             recorder.silence_duration = 0.05
 
             async def handler(
-                _websocket, _conversation_id, _processing_token, _seg, _engine
+                _websocket, _conversation_id, _processing_token, _seg, _engine, **_options
             ):
                 await asyncio.sleep(0.3)  # stand-in for GPU transcription
                 state["finished"] += 1
@@ -422,6 +422,20 @@ class TestRecorderHardening:
         assert stats["buffered_samples"] == 0
         recorder.cleanup()
 
+    def test_long_turn_without_pause_is_cut_at_its_quietest_point(self):
+        recorder = StreamingRecorder(max_workers=1, sample_rate=16000)
+        recorder.LONG_TURN_SECONDS = 4.0
+        recorder.silence_duration = 999  # never flush on silence
+        recorder.start_recording(3)
+        chunks = [np.full(16000, 0.5, dtype=np.float32) for _ in range(4)]  # 1 s each
+        chunks[3][:3200] = 0.01  # the quietest 0.2 s: 3.0-3.2 s
+        for chunk in chunks:
+            recorder.process_audio_chunk((16000, chunk))
+        assert recorder.segments_queued == 1
+        assert recorder.cumulative_offset == pytest.approx(3.1)  # flushed up to the middle of the dip
+        assert recorder.get_stats()["buffered_samples"] == 4 * 16000 - int(3.1 * 16000)
+        recorder.cleanup()
+
     @staticmethod
     def _write_wav(
         path,
@@ -526,8 +540,14 @@ class TestRecorderHardening:
 
     def test_configured_buffer_cap_reaches_runtime(self, monkeypatch):
         monkeypatch.setenv("MAX_STREAM_BUFFER_SECONDS", "7.5")
+        monkeypatch.setenv("STREAM_LONG_TURN_SECONDS", "0")  # off
         recorder = StreamingRecorder(max_workers=1, sample_rate=16000)
-        assert recorder.MAX_BUFFER_SECONDS == 7.5
+        assert recorder.MAX_BUFFER_SECONDS == 7.5 and recorder.LONG_TURN_SECONDS == 0
+        recorder.cleanup()
+        monkeypatch.setenv("MAX_STREAM_BUFFER_SECONDS", "0")  # invalid: the default
+        monkeypatch.setenv("STREAM_LONG_TURN_SECONDS", "soon")
+        recorder = StreamingRecorder(max_workers=1, sample_rate=16000)
+        assert recorder.MAX_BUFFER_SECONDS == 120.0 and recorder.LONG_TURN_SECONDS == 15.0
         recorder.cleanup()
 
     def test_empty_and_large_finite_frames_emit_finite_json_levels(self):

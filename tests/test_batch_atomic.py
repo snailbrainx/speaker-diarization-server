@@ -61,7 +61,7 @@ def test_real_worker_resumes_after_crash_between_transcript_and_json(
         calls = 0
         diarization_pipeline = object()
         embedding_model = object()
-        whisper_model = object()
+        asr_model = object()
         emotion_model = object()
 
         def transcribe_with_diarization(self, *_args, **_kwargs):
