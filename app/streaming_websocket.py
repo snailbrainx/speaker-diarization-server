@@ -277,7 +277,7 @@ async def websocket_endpoint(
         # LIVE_SPEAKER_TRACKING: the session's speakers are tracked across chunks and named from all their speech
         recorder.on_segment_processed = _make_segment_callback(
             websocket, conversation_id, processing_token, loop, diarize=bool(init_message.get("diarize", True)),
-            tracks=SessionTracks() if LIVE_SPEAKER_TRACKING else None,
+            tracks=SessionTracks(conversation_id) if LIVE_SPEAKER_TRACKING else None,
         )
 
         recorder.start_recording(conversation_id)
@@ -403,8 +403,13 @@ async def _handle_segment_processed(
     handler is not safe to share with this thread-scheduled coroutine, and the
     blocking GPU call below runs in a worker thread that also needs to touch the
     session for speaker/emotion profile lookups.
+
+    The session's tracks change only with a saved chunk: if anything fails before the commit they go back to how
+    they were (the chunk's segment ids, new Unknowns and renames were rolled back, and SQLite can reuse those ids).
     """
     db = SessionLocal()
+    tracks_before = tracks.snapshot() if tracks is not None else None
+    committed = False
     try:
         # Get conversation
         conversation = db.query(Conversation).filter(
@@ -473,7 +478,6 @@ async def _handle_segment_processed(
                 threshold=threshold,
                 segment_audio_path=segment_file,
                 start_offset_base=start_offset,
-                engine=engine,
             )
             db.flush()
             if seg.get("track") is not None:
@@ -512,6 +516,7 @@ async def _handle_segment_processed(
         )
 
         db.commit()
+        committed = True
 
         # Send segments to client with bounded backpressure. Persistence is
         # already committed; a stuck browser must not pin recorder shutdown.
@@ -530,7 +535,9 @@ async def _handle_segment_processed(
         import traceback
         traceback.print_exc()
         db.rollback()
-        engine.clear_speaker_cache()  # it may hold Unknown_* speakers enrolled by this rolled-back segment
+        if tracks is not None and not committed:
+            tracks.restore(tracks_before)
+        engine.clear_speaker_cache()  # reload from what is committed
         await _send_message_bounded(websocket, "error", {"message": "Segment processing error"})
         raise
     finally:
@@ -572,7 +579,8 @@ def _relabel_tracks(db: Session, conversation_id: int, tracks: Optional[SessionT
     for track in {id(s["track"]): s["track"] for s in segments if s.get("track") is not None}.values():
         if track.speaker_id is None or not track.segment_ids:
             continue
-        rows = db.query(ConversationSegment).filter(ConversationSegment.id.in_(track.segment_ids),
+        rows = db.query(ConversationSegment).filter(ConversationSegment.conversation_id == conversation_id,
+                                                    ConversationSegment.id.in_(track.segment_ids),
                                                     ConversationSegment.speaker_id.is_(None),
                                                     ConversationSegment.speaker_name == "Unknown")
         ids = [r.id for r in rows]

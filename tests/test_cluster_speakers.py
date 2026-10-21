@@ -53,6 +53,32 @@ def _enroll(db, name, embedding):
 DIAR = {"segments": [], "exclusive_segments": [], "num_speakers": 0}
 
 
+def _new_unknown(who):
+    """A speaker nobody matched: no stored speaker yet, its voice to be saved as a new Unknown with its segments."""
+    return who["speaker_id"] is None and who.get("enroll") is not None and not who["is_known"]
+
+
+def _save(db, identities, labels):
+    """Save one segment per label as the upload path does, each carrying its speaker's identity."""
+    from datetime import datetime, timezone
+    from app.models import Conversation
+    from app.services import create_segment_from_result
+    conv = Conversation(title="t", start_time=datetime.now(timezone.utc), status="processing", audio_path=None)
+    db.add(conv)
+    db.flush()
+    out = []
+    for i, label in enumerate(labels):
+        who = identities[label]
+        seg = {"start": float(i), "end": i + 1.0, "text": "hi", "words": [], "speaker": who["speaker"],
+               "is_known": who["is_known"], "confidence": who["confidence"], "embedding": None}
+        for key in ("speaker_id", "enroll"):
+            if who.get(key) is not None:
+                seg[key] = who[key]
+        out.append(create_segment_from_result(seg, conv.id, conv.start_time, db, threshold=0.30))
+    db.flush()
+    return out
+
+
 def test_split_by_speaker_keeps_each_words_diarization_label():
     words = [{"word": " hi", "start": 0.0, "end": 0.4}, {"word": " there", "start": 0.5, "end": 0.9},
              {"word": " yes", "start": 1.2, "end": 1.5}]
@@ -71,10 +97,23 @@ def test_one_new_unknown_per_diarization_speaker(eng, db_session):
     segments = [(_seg(0, 2), "SPEAKER_00", _vec(1, 0.3)), (_seg(2, 4), "SPEAKER_01", _vec(0, 1)),
                 (_seg(4, 6), "SPEAKER_00", _vec(1, -0.3)), (_seg(6, 7), "SPEAKER_01", _vec(0.2, 1))]
     ids = eng._identify_clusters("a.wav", segments, DIAR, [], 0.30, db_session)
-    assert set(ids) == {"SPEAKER_00", "SPEAKER_01"}
-    assert ids["SPEAKER_00"]["speaker_id"] != ids["SPEAKER_01"]["speaker_id"]
-    assert all(v["speaker"].startswith("Unknown_") and not v["is_known"] for v in ids.values())
-    assert db_session.query(Speaker).count() == 2
+    assert set(ids) == {"SPEAKER_00", "SPEAKER_01"} and all(_new_unknown(v) for v in ids.values())
+    assert db_session.query(Speaker).count() == 0                     # nothing written while the file is processed
+    saved = _save(db_session, ids, ["SPEAKER_00", "SPEAKER_01", "SPEAKER_00", "SPEAKER_01"])
+    assert db_session.query(Speaker).count() == 2                     # one Unknown per speaker, made on save
+    assert saved[0].speaker_id == saved[2].speaker_id != saved[1].speaker_id == saved[3].speaker_id
+    assert all(s.speaker_name.startswith("Unknown_") for s in saved)
+
+
+def test_processing_a_file_takes_no_write_lock(eng, db_session, tmp_path):
+    """Identifying a file's speakers writes nothing, so a live segment or an edit can still commit while the rest of
+    its pipeline (emotions) runs; a new Unknown flushed here once held SQLite's writer lock until the upload's commit."""
+    import sqlite3
+    eng._identify_clusters("a.wav", [(_seg(0, 3), "SPEAKER_00", _vec(1, 0))], DIAR, [], 0.30, db_session)
+    other = sqlite3.connect(f"{tmp_path}/cluster.db", timeout=0.1)
+    other.execute("INSERT INTO speakers (name, embedding) VALUES ('Other', x'00')")
+    other.commit()
+    other.close()
 
 
 def test_a_speaker_never_gets_its_second_best_person(eng, db_session):
@@ -92,26 +131,38 @@ def test_second_speaker_like_a_person_but_unlike_their_speaker_stays_unknown(eng
     segments = [(_seg(0, 3), "SPEAKER_00", _vec(0.866, 0.5)), (_seg(3, 6), "SPEAKER_01", _vec(0.86, -0.51))]
     ids = eng._identify_clusters("a.wav", segments, DIAR, [], 0.60, db_session)
     assert ids["SPEAKER_00"]["speaker_id"] == alice
-    assert ids["SPEAKER_01"]["speaker"].startswith("Unknown_") and not ids["SPEAKER_01"]["is_known"]
+    assert _new_unknown(ids["SPEAKER_01"])
 
 
 def test_a_speaker_between_two_people_is_unknown(eng, db_session):
     _enroll(db_session, "Alice", _vec(1, 0)), _enroll(db_session, "Bob", _vec(0.98, 0.2))
     ids = eng._identify_clusters("a.wav", [(_seg(0, 3), "SPEAKER_00", _vec(1, 0.1))], DIAR, [], 0.30, db_session)
-    assert ids["SPEAKER_00"]["speaker"].startswith("Unknown_")   # 0.995 vs 0.993: too close to call
+    assert _new_unknown(ids["SPEAKER_00"])   # 0.995 vs 0.993: too close to call
 
 
 def test_below_threshold_is_unknown_not_a_guess(eng, db_session):
     _enroll(db_session, "Alice", _vec(1, 0))
     ids = eng._identify_clusters("a.wav", [(_seg(0, 3), "SPEAKER_00", _vec(0.25, 1))], DIAR, [], 0.30, db_session)
-    assert ids["SPEAKER_00"]["speaker"].startswith("Unknown_")
+    assert _new_unknown(ids["SPEAKER_00"])
 
 
 def test_new_unknown_is_matched_in_the_next_file(eng, db_session):
     first = eng._identify_clusters("a.wav", [(_seg(0, 3), "SPEAKER_00", _vec(1, 0.1))], DIAR, [], 0.30, db_session)
+    saved = _save(db_session, first, ["SPEAKER_00"])
+    db_session.commit()
     eng._speaker_cache = None   # next request reloads from the DB
     again = eng._identify_clusters("b.wav", [(_seg(0, 3), "SPEAKER_03", _vec(1, -0.1))], DIAR, [], 0.30, db_session)
-    assert again["SPEAKER_03"]["speaker_id"] == first["SPEAKER_00"]["speaker_id"]
+    assert again["SPEAKER_03"]["speaker_id"] == saved[0].speaker_id
+
+
+def test_uncommitted_voices_never_reach_the_shared_cache(eng, db_session, tmp_path):
+    """A request's own new speaker is visible to it, but other requests use the shared cache: it is filled only from
+    committed voices (one rolled back once left another request holding a speaker that never existed)."""
+    _enroll(db_session, "Unknown_1", _vec(1, 0))                       # flushed, not committed
+    assert [p["speaker_name"] for p in eng._all_profiles(db_session)] == ["Unknown_1"]
+    assert eng._speaker_cache is None
+    db_session.rollback()
+    assert eng._all_profiles(db_session) == [] and eng._speaker_cache == []
 
 
 def test_without_db_uses_known_speakers_and_temporary_unknown_names(eng):

@@ -13,7 +13,8 @@ from sqlalchemy.orm import Session, joinedload
 
 from .models import AppMetadata, Speaker, ConversationSegment, SpeakerEmotionProfile
 from .diarization import (CENTROID_MAX_WEIGHT_SEC, CLUSTER_SPEAKERS, MIN_SEGMENT_DURATION_SEC,
-                          SPEAKER_EMBEDDING_MODEL, _centroid, _in_memory, auto_enroll_unknown_speaker)
+                          SPEAKER_EMBEDDING_MODEL, _centroid, _create_unknown_speaker, _in_memory,
+                          auto_enroll_unknown_speaker)
 
 logger = logging.getLogger(__name__)
 
@@ -65,7 +66,6 @@ def create_segment_from_result(
     threshold: float,
     segment_audio_path: str = None,
     start_offset_base: float = 0.0,
-    engine=None,
 ) -> ConversationSegment:
     """
     Create a ConversationSegment from a diarization result dict.
@@ -81,7 +81,6 @@ def create_segment_from_result(
         threshold: Speaker similarity threshold
         segment_audio_path: Optional path to segment WAV file (for streaming)
         start_offset_base: Offset to add to segment times (for streaming)
-        engine: SpeakerRecognitionEngine (needed for cache updates during streaming)
 
     Returns:
         ConversationSegment (added to session but not committed)
@@ -91,8 +90,16 @@ def create_segment_from_result(
     confidence = seg.get("confidence", 0.0)
 
     if seg.get("speaker_id") is not None:
-        # Identified (or auto-enrolled) once for the whole diarization speaker (SPEAKER_ASSIGNMENT=cluster)
+        # Identified once for the whole diarization speaker (SPEAKER_ASSIGNMENT=cluster) or by its live track
         speaker_id = seg["speaker_id"]
+    elif seg.get("enroll") is not None:
+        # SPEAKER_ASSIGNMENT=cluster: a diarization speaker nobody matched becomes one new Unknown with its voice,
+        # created when its first segment is saved; its other segments share the same "enroll" dict and speaker.
+        enroll = seg["enroll"]
+        if "speaker" not in enroll:
+            enroll["speaker"] = _create_unknown_speaker(enroll["voice"], db)
+        speaker_id, speaker_name = enroll["speaker"]
+        confidence = 1.0
     elif seg.get("is_known"):
         speaker = db.query(Speaker).filter(Speaker.name == speaker_name).first()
         if speaker:
@@ -100,17 +107,10 @@ def create_segment_from_result(
     else:
         embedding = seg.get("embedding")
         if embedding is not None and speaker_name and speaker_name.startswith("Unknown_"):
+            # (not added to the engine's shared cache: every engine reloads it once this is committed)
             speaker_id, speaker_name = auto_enroll_unknown_speaker(
                 embedding, db, threshold=threshold
             )
-            # Add to speaker cache if engine provided (streaming mode)
-            if speaker_id and engine and hasattr(engine, 'add_speaker_to_cache'):
-                engine.add_speaker_to_cache(
-                    speaker_id=speaker_id,
-                    speaker_name=speaker_name,
-                    embedding=embedding,
-                    profile_type='general'
-                )
             confidence = 1.0 if speaker_id else confidence
 
     words_json = json.dumps(seg["words"]) if seg.get("words") else None
@@ -133,7 +133,8 @@ def create_segment_from_result(
         detector_breakdown=json.dumps(seg["detector_breakdown"]) if seg.get("detector_breakdown") else None,
         segment_audio_path=segment_audio_path,
         words_data=words_json,
-        avg_logprob=seg.get("avg_logprob")
+        avg_logprob=seg.get("avg_logprob"),
+        is_overlap=bool(seg.get("overlap")),
     )
 
     if seg.get("embedding") is not None:
@@ -166,6 +167,7 @@ def recalculate_speaker_embedding(
     """
     Recalculate a speaker's embedding from all their non-misidentified segments.
     Uses cached embeddings where available, falls back to audio extraction.
+    Segments recovered from overlapping speech are left out: their audio holds two voices.
 
     Returns:
         Number of embeddings used, or 0 if no valid segments found
@@ -178,6 +180,7 @@ def recalculate_speaker_embedding(
         .filter(
             ConversationSegment.speaker_id == speaker.id,
             ConversationSegment.is_misidentified == False,
+            ConversationSegment.is_overlap == False,   # two voices at once: never anyone's voice sample
         )
         .all()
     )
@@ -322,8 +325,8 @@ def recalculate_emotion_profile(
                     seg.id,
                 )
 
-        # Voice embedding
-        voice_emb = seg.get_speaker_embedding()
+        # Voice embedding (none from overlapping speech: two voices at once)
+        voice_emb = None if seg.is_overlap else seg.get_speaker_embedding()
         if voice_emb is not None and not np.isnan(voice_emb).any():
             voice_embeddings.append(voice_emb)
 
@@ -399,13 +402,14 @@ VOICE_MODEL_KEY = "speaker_embedding_model"
 LEGACY_VOICE_MODEL = "pyannote/embedding"
 
 
-def migrate_voice_embeddings(db: Session, engine) -> Optional[Dict[str, Any]]:
+def migrate_voice_embeddings(db: Session, engine, commit: bool = True) -> Optional[Dict[str, Any]]:
     """Stored voices made by another voice-embedding model (SPEAKER_EMBEDDING_MODEL changed, or a database from before
     the setting, made with pyannote/embedding) cannot be compared with new ones. Once: every segment of a speaker is
     embedded again from its recording, then each speaker's voice, and the voice part of each emotion profile, is
     rebuilt from those segments (emotion2vec embeddings do not depend on the voice model and are kept). A speaker
     whose recordings are gone keeps their name and segments but has no voice (NaN, skipped by matching) until they
-    are identified again; their names are logged. Returns counts, or None when the stored voices are current."""
+    are identified again; their names are logged. Returns counts, or None when the stored voices are current.
+    commit=False leaves the commit to the caller (a restore converts the restored voices in its own transaction)."""
     row = db.get(AppMetadata, VOICE_MODEL_KEY)
     has_voices = (db.query(Speaker.id).first() is not None
                   or db.query(ConversationSegment.id).filter(ConversationSegment.speaker_embedding.isnot(None)).first())
@@ -413,13 +417,15 @@ def migrate_voice_embeddings(db: Session, engine) -> Optional[Dict[str, Any]]:
     if made_by == SPEAKER_EMBEDDING_MODEL:
         if row is None:
             db.add(AppMetadata(key=VOICE_MODEL_KEY, value=SPEAKER_EMBEDDING_MODEL))
-            db.commit()
+            if commit:
+                db.commit()
         return None
     logger.info(f"Voice profiles were made by {made_by}; rebuilding them with {SPEAKER_EMBEDDING_MODEL}...")
     db.query(ConversationSegment).update({ConversationSegment.speaker_embedding: None}, synchronize_session=False)
     counts: Dict[str, Any] = {"segments": 0, "speakers_rebuilt": 0, "speakers_without_audio": []}
     by_conversation: Dict[int, List[ConversationSegment]] = {}
-    for seg in db.query(ConversationSegment).filter(ConversationSegment.speaker_id.isnot(None)).all():
+    for seg in db.query(ConversationSegment).filter(ConversationSegment.speaker_id.isnot(None),
+                                                    ConversationSegment.is_overlap == False).all():  # noqa: E712
         by_conversation.setdefault(seg.conversation_id, []).append(seg)
     for segments in by_conversation.values():
         path = resolve_audio_path(segments[0].conversation)
@@ -449,6 +455,7 @@ def migrate_voice_embeddings(db: Session, engine) -> Optional[Dict[str, Any]]:
                 continue
             voices = [v for (v,) in db.query(ConversationSegment.speaker_embedding).filter(
                 ConversationSegment.speaker_id == speaker.id, ConversationSegment.is_misidentified == False,  # noqa: E712
+                ConversationSegment.is_overlap == False,  # noqa: E712
                 ConversationSegment.emotion_corrected == True, ConversationSegment.emotion_misidentified == False,  # noqa: E712
                 ConversationSegment.emotion_category == profile.emotion_category,
                 ConversationSegment.speaker_embedding.isnot(None)).all()]
@@ -459,7 +466,10 @@ def migrate_voice_embeddings(db: Session, engine) -> Optional[Dict[str, Any]]:
         db.add(AppMetadata(key=VOICE_MODEL_KEY, value=SPEAKER_EMBEDDING_MODEL))
     else:
         row.value = SPEAKER_EMBEDDING_MODEL
-    db.commit()
+    if commit:
+        db.commit()
+    else:
+        db.flush()
     _invalidate_speaker_cache(engine)
     if counts["speakers_without_audio"]:
         logger.warning(f"Voice rebuild: no recordings left for {', '.join(counts['speakers_without_audio'])}: "

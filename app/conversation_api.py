@@ -308,7 +308,7 @@ async def reprocess_conversation(
         }
     except Exception:
         fail_processing_lease(db, conversation_id, processing_token)
-        engine.clear_speaker_cache()  # it may hold Unknown_* speakers enrolled by this rolled-back request
+        engine.clear_speaker_cache()  # reload from what is committed
         raise
 
 
@@ -506,7 +506,11 @@ async def identify_speaker_in_segment(
     # full recording yet, but the segment's own embedding was stored when it was saved.
     embedding = None
     cached = segment.get_speaker_embedding()
-    if enroll and existing is None and conversation.status in {"recording", "processing"} \
+    if enroll and existing is None and segment.is_overlap:
+        # Two voices at once (recovered overlapping speech): the new person's voice comes from their other segments
+        # (recalculated below), never from this mix; with none, they have no voice until identified elsewhere.
+        embedding = np.full(engine.embedding_dim, np.nan, dtype=np.float32)
+    elif enroll and existing is None and conversation.status in {"recording", "processing"} \
             and cached is not None and not np.isnan(cached).any():
         embedding = cached
     elif enroll and existing is None:

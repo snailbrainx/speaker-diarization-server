@@ -65,6 +65,7 @@ _MIGRATIONS = (
     ("conversations", "processing_token", "TEXT"),
     ("conversations", "snapshot_uuid", "TEXT"),
     ("conversation_segments", "snapshot_uuid", "TEXT"),
+    ("conversation_segments", "is_overlap", "INTEGER DEFAULT 0"),
 )
 
 _SNAPSHOT_UUID_TABLES = ("conversations", "conversation_segments")

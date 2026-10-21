@@ -278,7 +278,8 @@ and unenrolled visitors still got no one's name; transcription and diarization a
 another model cannot be compared with new ones, so when the model changes (including the first start after
 upgrading from `pyannote/embedding`), every named or Unknown speaker's voice is rebuilt from their recordings with the
 new model, once. A speaker whose recordings are gone keeps their name and segments and is recognised again after one
-identify. Backups record the model; restoring an older backup rebuilds its voices the same way.
+identify. Backups record the model; restoring an older backup rebuilds its voices the same way, as part of the
+restore (if that fails, the restore fails and nothing is replaced).
 
 ### Live speaker identification
 
@@ -336,6 +337,8 @@ meetings; held out: the 18 AMI dev meetings and 40 other VoxConverse clips):
 
 It is off by default: it roughly halves the speed on meetings, and about 0.5% more of the speech goes to the wrong
 person (the second voice is sometimes given to the wrong speaker), against more of what was said being transcribed.
+Segments added this way are marked as overlapping speech (`is_overlap`): their stretch of the recording holds two
+voices, so they never go into anyone's voice profile.
 
 ## How it Works
 

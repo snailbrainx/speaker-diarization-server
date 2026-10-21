@@ -27,7 +27,7 @@ services:
       - WS_SEND_TIMEOUT_SECONDS=${WS_SEND_TIMEOUT_SECONDS:-5}
       - WHISPER_MODEL=${WHISPER_MODEL:-large-v3}
       - WHISPER_LANGUAGE=${WHISPER_LANGUAGE:-en}
-      # Speech-to-text engine: whisper (default) or parakeet (README "Speech-to-text"); empty = the default.
+      # Speech-to-text engine: parakeet (default for English) or whisper (README "Speech-to-text"); empty = the default.
       - ASR_BACKEND=${ASR_BACKEND:-}
       - PARAKEET_MODEL=${PARAKEET_MODEL:-}
       # Diarization runtime: pyannote (default) or speakrs (same models, faster); empty = the default.
@@ -41,6 +41,9 @@ services:
       - CLUSTER_SPEAKER_THRESHOLD=${CLUSTER_SPEAKER_THRESHOLD:-}
       - SNAP_TO_TURNS=${SNAP_TO_TURNS:-}
       - OVERLAP_SEPARATION=${OVERLAP_SEPARATION:-}
+      - LIVE_SPEAKER_TRACKING=${LIVE_SPEAKER_TRACKING:-}
+      # Voice-embedding model for speaker identification (README "Voice embeddings"); empty = the default.
+      - SPEAKER_EMBEDDING_MODEL=${SPEAKER_EMBEDDING_MODEL:-}
     # Match the `app` user baked into the image (uid 1000) so bind-mounted
     # volumes stay writable without chown gymnastics on the host.
     user: "1000:1000"

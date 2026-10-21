@@ -142,3 +142,17 @@ def test_load_audio_downmixes_and_resamples(tmp_path):
     audio = _load_audio_16k(str(tmp_path / "a.wav"))
     assert audio.dtype == np.float32 and audio.ndim == 1 and len(audio) == 2 * SR
     assert 0.2 < np.abs(audio).max() < 0.3  # channel mean of a 0.5 tone and silence
+
+
+def test_each_whisper_transcription_gets_its_own_batched_pipeline():
+    """faster-whisper's batched pipeline carries the last word's end time between batches; one shared by concurrent
+    requests aligned one file's words with another's history. The (expensive) model is still shared."""
+    fw = pytest.importorskip("faster_whisper")
+    if not hasattr(fw, "BatchedInferencePipeline"):
+        pytest.skip("faster-whisper is stubbed here")
+    eng = SpeakerRecognitionEngine.__new__(SpeakerRecognitionEngine)
+    eng._whisper_model, eng._model_lock = object(), threading.Lock()
+    first, second = eng.batched_whisper(), eng.batched_whisper()
+    first.last_speech_timestamp = 100.0          # as left by a request still running, or one that raised
+    assert second is not first and second.model is first.model is eng._whisper_model
+    assert second.last_speech_timestamp == 0.0

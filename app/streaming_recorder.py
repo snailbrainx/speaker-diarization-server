@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor, wait as futures_wait
 from contextlib import ExitStack
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Callable, Dict, List, Literal, Optional
+from typing import Callable, Dict, List, Literal, Optional, Tuple
 
 from .services import data_path
 
@@ -130,7 +130,8 @@ class StreamingRecorder:
         self._buffered_samples = 0
         self._silent_samples = 0  # audio received since the last chunk with speech: the clock is the audio, not the
                                   # wall, so packets arriving in bursts neither cut nor delay segments
-        self._speech_samples = 0  # audio in the buffer that was speech (a buffer without enough is not processed)
+        self._speech_runs: List[Tuple[int, int]] = []  # where the buffer is speech: [start, end) samples, in order
+                                                       # (a chunk without enough speech is not processed)
         self._is_speech = _speech_detector(sample_rate, silence_threshold)
         self.chunk_count = 0
         self.speech_detected = False
@@ -181,6 +182,7 @@ class StreamingRecorder:
         self.current_buffer = []
         self._buffered_samples = 0
         self._silent_samples = 0
+        self._speech_runs = []
         self.chunk_count = 0
         self.total_segments = 0
         self.segments_processed = 0
@@ -276,13 +278,17 @@ class StreamingRecorder:
             self.on_audio_level(energy)
 
         with self._lock:
+            start = self._buffered_samples
             self.current_buffer.append(audio_data)
             self._buffered_samples += len(audio_data)
             self.chunk_count += 1
 
             if self._is_speech(audio_data):
                 self._silent_samples = 0
-                self._speech_samples += len(audio_data)
+                if self._speech_runs and self._speech_runs[-1][1] == start:
+                    self._speech_runs[-1] = (self._speech_runs[-1][0], self._buffered_samples)
+                else:
+                    self._speech_runs.append((start, self._buffered_samples))
                 self.speech_detected = True
             else:
                 self.speech_detected = False
@@ -329,8 +335,11 @@ class StreamingRecorder:
         self.current_buffer = [rest] if len(rest) else []
         self._buffered_samples = len(rest)
         self._silent_samples = 0
-        speech_seconds = (self._speech_samples - min(self._speech_samples, len(rest))) / self.sample_rate
-        self._speech_samples = min(self._speech_samples, len(rest))
+        # The speech on each side of the cut, from where it was heard (speech and short pauses interleave, so the
+        # part kept can hold less of it than its length).
+        cut = len(segment_audio)
+        speech_seconds = sum(min(e, cut) - s for s, e in self._speech_runs if s < cut) / self.sample_rate
+        self._speech_runs = [(max(s, cut) - cut, e - cut) for s, e in self._speech_runs if e > cut]
 
         duration = len(segment_audio) / self.sample_rate
         # The session clock counts skipped audio too, so segment times are real times (and the full recording gets

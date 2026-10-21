@@ -216,7 +216,8 @@ def test_emotion_voice_profiles_never_decide_who_someone_is(eng, db):
     db.commit()
     segments = [({"start": 0.0, "end": 4.0}, "SPEAKER_00", C)]
     ids = eng._identify_clusters("a.wav", segments, {"exclusive_segments": []}, [], 0.60, db)
-    assert ids["SPEAKER_00"]["speaker"].startswith("Unknown_")      # not Bob: a voice like C was never Bob's own
+    assert ids["SPEAKER_00"]["speaker_id"] is None and ids["SPEAKER_00"]["enroll"] is not None   # a new Unknown, not
+    # Bob: a voice like C was never Bob's own
 
 
 def test_a_live_track_follows_the_users_correction(eng, db):
@@ -255,3 +256,104 @@ def test_stored_voice_changes_drop_every_engines_cache_after_commit(eng, db):
     assert eng._speaker_cache is not None      # not before the commit (a reload then would cache the old state)
     db.commit()
     assert eng._speaker_cache is None
+
+
+def test_track_lookups_read_only_the_sessions_own_segments(db):
+    """SQLite gives a deleted or rolled-back segment's id to the next new row, which may belong to another
+    conversation: a track's segment ids are only ever looked up in its own session's conversation."""
+    from app.streaming_websocket import _relabel_tracks
+    live = Conversation(title="live", start_time=datetime.now(timezone.utc), status="recording")
+    other = Conversation(title="other", start_time=datetime.now(timezone.utc), status="recording")
+    db.add_all([live, other])
+    db.flush()
+    ann, bob = enroll(db, "Ann", A), enroll(db, "Bob", B)
+    now = datetime.now(timezone.utc)
+    provisional = ConversationSegment(conversation_id=other.id, speaker_id=None, speaker_name="Unknown",
+                                      start_time=now, end_time=now, start_offset=0, end_offset=1)
+    bobs = ConversationSegment(conversation_id=other.id, speaker_id=bob, speaker_name="Bob", start_time=now,
+                               end_time=now, start_offset=1, end_offset=2)
+    db.add_all([provisional, bobs])
+    db.flush()
+
+    class Eng:
+        def clear_speaker_cache(self):
+            pass
+
+    named = lt.Track(id=1, voice_sum=A, seconds=3.0, speaker_id=ann, segment_ids=[provisional.id])
+    assert _relabel_tracks(db, live.id, lt.SessionTracks(live.id), [{"track": named}], Eng()) == []
+    db.expire_all()
+    assert db.get(ConversationSegment, provisional.id).speaker_name == "Unknown"
+    unnamed = lt.Track(id=2, voice_sum=A, seconds=3.0, segment_ids=[bobs.id])
+    SpeakerRecognitionEngine._follow_user([unnamed], db, {ann: "Ann", bob: "Bob"}, live.id)
+    assert unnamed.speaker_id is None                                  # not "corrected" to another session's Bob
+
+
+def test_a_chunk_that_fails_to_save_leaves_the_tracks_as_they_were(tmp_path, monkeypatch):
+    """The tracks change only with a saved chunk: a failed save once left its rolled-back segment ids (and new
+    Unknowns and renames) in the session, and a later naming relabelled whatever row SQLite gave those ids next."""
+    import asyncio
+    from types import SimpleNamespace
+    from app import streaming_websocket
+    engine_db = create_engine(f"sqlite:///{tmp_path}/live.db")
+    Base.metadata.create_all(engine_db)
+    Session = sessionmaker(bind=engine_db)
+    db = Session()
+    conv = Conversation(title="live", start_time=datetime.now(timezone.utc), status="recording",
+                        processing_token="tok")
+    db.add(conv)
+    db.commit()
+    conv_id = db.query(Conversation).first().id
+    db.close()
+    chunk_file = tmp_path / "chunk.wav"
+    chunk_file.write_bytes(b"RIFF")
+    tracks = lt.SessionTracks(conv_id)
+
+    class FakeEngine:
+        save_track_voices = SpeakerRecognitionEngine.save_track_voices
+
+        def transcribe_with_diarization(self, *_args, tracks=None, **_kwargs):
+            track = tracks.assign({"S0": (A, 4.0)})["S0"]
+            return {"segments": [{"start": 0.0, "end": 4.0, "text": "hello", "words": [], "speaker": "Unknown",
+                                  "is_known": False, "confidence": 1.0, "embedding": None, "track": track}],
+                    "num_speakers": 1}
+
+        def clear_gpu_cache_async(self, _reason):
+            pass
+
+        def clear_speaker_cache(self):
+            pass
+
+    class FakeSocket:
+        client_state = streaming_websocket.WebSocketState.CONNECTED
+
+        async def send_json(self, _data):
+            pass
+
+        async def send_text(self, _data):
+            pass
+
+    monkeypatch.setattr(streaming_websocket, "SessionLocal", Session)
+    monkeypatch.setattr(streaming_websocket, "get_config",
+                        lambda: SimpleNamespace(get_settings=lambda: SimpleNamespace(speaker_threshold=0.30)))
+
+    def run():
+        asyncio.run(streaming_websocket._handle_segment_processed(
+            FakeSocket(), conv_id, "tok", {"segment_file": str(chunk_file), "start_offset": 0.0}, FakeEngine(),
+            tracks=tracks))
+
+    run()                                                               # saved: the track has its Unknown and line
+    (track,) = tracks.tracks
+    saved_ids, unknown = list(track.segment_ids), track.speaker_id
+    assert len(saved_ids) == 1 and unknown is not None
+
+    def fail(*_args, **_kwargs):
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(streaming_websocket, "_relabel_tracks", fail)
+    with pytest.raises(RuntimeError):
+        run()                                                           # its segment was flushed, then rolled back
+    (track,) = tracks.tracks
+    assert (track.segment_ids, track.speaker_id, track.seconds) == (saved_ids, unknown, 4.0)
+    db = Session()
+    assert db.query(ConversationSegment).count() == 1 and db.query(Speaker).count() == 1
+    db.close()
