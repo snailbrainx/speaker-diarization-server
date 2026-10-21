@@ -161,3 +161,18 @@ def test_whole_file_emotion_path_passes_only_capped_audio_to_model(tmp_path):
     observed.clear()
     engine.extract_emotion(str(short))
     assert observed["path"] == str(short)
+
+
+def test_every_pipeline_setting_reaches_the_container_and_the_example():
+    """Each setting app/diarization.py reads at import is forwarded by docker-compose.yml (there is no env_file, so a
+    setting missing there is silently ignored when put in .env) and shown in .env.example."""
+    import re
+    root = Path(__file__).resolve().parents[1]
+    source = (root / "app" / "diarization.py").read_text()
+    compose = (root / "docker-compose.yml").read_text()
+    example = (root / ".env.example").read_text()
+    settings = set(re.findall(r'^[A-Z_]+ = .*?(?:os\.getenv|_env_flag)\("([A-Z_]+)"', source, re.M))
+    assert {"LIVE_SPEAKER_TRACKING", "SPEAKER_EMBEDDING_MODEL", "OVERLAP_SEPARATION"} <= settings
+    for variable in sorted(settings):
+        assert f"{variable}=${{{variable}:-" in compose, variable
+        assert f"{variable}=" in example, variable
