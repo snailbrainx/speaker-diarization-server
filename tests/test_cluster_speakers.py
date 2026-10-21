@@ -77,21 +77,28 @@ def test_one_new_unknown_per_diarization_speaker(eng, db_session):
     assert db_session.query(Speaker).count() == 2
 
 
-def test_matches_are_one_to_one_by_total_similarity(eng, db_session):
+def test_a_speaker_never_gets_its_second_best_person(eng, db_session):
     alice, bob = _enroll(db_session, "Alice", _vec(1, 0)), _enroll(db_session, "Bob", _vec(0.6, 1))
-    # SPEAKER_01 is closer to Alice than to Bob, but SPEAKER_00 is Alice: SPEAKER_01 must get Bob.
+    # Both speakers are closest to Alice and their voices are alike (pyannote split her): both are Alice, and the
+    # second is not handed Bob (once the one-to-one assignment did exactly that).
     segments = [(_seg(0, 3), "SPEAKER_00", _vec(1, 0.05)), (_seg(3, 6), "SPEAKER_01", _vec(1, 0.4))]
     ids = eng._identify_clusters("a.wav", segments, DIAR, [], 0.30, db_session)
-    assert (ids["SPEAKER_00"]["speaker_id"], ids["SPEAKER_01"]["speaker_id"]) == (alice, bob)
-    assert ids["SPEAKER_00"]["is_known"] and ids["SPEAKER_01"]["is_known"]
+    assert (ids["SPEAKER_00"]["speaker_id"], ids["SPEAKER_01"]["speaker_id"]) == (alice, alice)
 
 
-def test_second_speaker_like_a_taken_person_stays_unknown(eng, db_session):
+def test_second_speaker_like_a_person_but_unlike_their_speaker_stays_unknown(eng, db_session):
     alice = _enroll(db_session, "Alice", _vec(1, 0))
-    segments = [(_seg(0, 3), "SPEAKER_00", _vec(1, 0.05)), (_seg(3, 6), "SPEAKER_01", _vec(1, 0.5))]
-    ids = eng._identify_clusters("a.wav", segments, DIAR, [], 0.30, db_session)
+    # each is 0.87 like Alice, but only 0.5 like the other: two people, only the closer one may be Alice
+    segments = [(_seg(0, 3), "SPEAKER_00", _vec(0.866, 0.5)), (_seg(3, 6), "SPEAKER_01", _vec(0.86, -0.51))]
+    ids = eng._identify_clusters("a.wav", segments, DIAR, [], 0.60, db_session)
     assert ids["SPEAKER_00"]["speaker_id"] == alice
     assert ids["SPEAKER_01"]["speaker"].startswith("Unknown_") and not ids["SPEAKER_01"]["is_known"]
+
+
+def test_a_speaker_between_two_people_is_unknown(eng, db_session):
+    _enroll(db_session, "Alice", _vec(1, 0)), _enroll(db_session, "Bob", _vec(0.98, 0.2))
+    ids = eng._identify_clusters("a.wav", [(_seg(0, 3), "SPEAKER_00", _vec(1, 0.1))], DIAR, [], 0.30, db_session)
+    assert ids["SPEAKER_00"]["speaker"].startswith("Unknown_")   # 0.995 vs 0.993: too close to call
 
 
 def test_below_threshold_is_unknown_not_a_guess(eng, db_session):

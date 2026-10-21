@@ -27,10 +27,45 @@ import threading
 import queue
 import gc
 
+import weakref
+from sqlalchemy import event
+from sqlalchemy.orm import Session as OrmSession
+
+from . import live_tracking, overlap
 from .config import get_config
-from .models import Speaker, SpeakerEmotionProfile
+from .models import ConversationSegment, Speaker, SpeakerEmotionProfile
 
 logger = logging.getLogger(__name__)
+
+# Engines whose speaker-profile cache must be dropped whenever stored voices change (any session, any endpoint).
+_ENGINES: "weakref.WeakSet" = weakref.WeakSet()
+_VOICE_TABLES = (Speaker, SpeakerEmotionProfile)
+
+
+@event.listens_for(OrmSession, "after_flush")
+def _note_voice_rows(session, _flush_context):
+    if any(isinstance(o, _VOICE_TABLES) for o in (*session.new, *session.dirty, *session.deleted)):
+        session.info["voices_changed"] = True
+
+
+@event.listens_for(OrmSession, "do_orm_execute")
+def _note_voice_bulk_writes(state):
+    mapper = state.bind_mapper
+    if (state.is_update or state.is_delete) and mapper is not None and mapper.class_ in _VOICE_TABLES:
+        state.session.info["voices_changed"] = True
+
+
+def _drop_voice_caches(session):
+    """After a commit (or a rollback, which can discard voices a cache already holds) that touched stored voices,
+    every engine reloads its profiles on next use: invalidating before the commit left a window in which a reload
+    cached the old state."""
+    if session.info.pop("voices_changed", False):
+        for engine in list(_ENGINES):
+            engine.clear_speaker_cache()
+
+
+event.listen(OrmSession, "after_commit", _drop_voice_caches)
+event.listen(OrmSession, "after_rollback", _drop_voice_caches)
 
 # Speaker matching constants
 FALLBACK_THRESHOLD_REDUCTION = 0.05
@@ -60,15 +95,21 @@ def _env_flag(name: str, default: bool) -> bool:
 #                              person ends up as several Unknown_* speakers). Words get their speaker from pyannote's
 #                              exclusive (non-overlapping) diarization. Implies word-level speakers. Uploaded and
 #                              reprocessed files only: live chunks keep per-segment matching. segment = the original.
-#   CLUSTER_SPEAKER_THRESHOLD=0.70  cosine similarity a speaker's centroid needs to be given a stored person's name in
+#   SPEAKER_EMBEDDING_MODEL=pyannote/wespeaker-voxceleb-resnet34-LM  the voice-embedding model behind speaker
+#                              identification (the WeSpeaker ResNet34 inside pyannote's community-1 pipeline). Against
+#                              pyannote/embedding (the original) on AMI meetings: half the error on 0.5-1.5 s segments
+#                              (EER 5.4% vs 9.6%), and twice the gap between a person's own voice (lowest 0.69) and
+#                              anyone else's (highest 0.46, vs 0.64 / 0.53). Stored voices made by another model are
+#                              rebuilt from their recordings at startup (services.migrate_voice_embeddings).
+#   CLUSTER_SPEAKER_THRESHOLD=0.60  cosine similarity a speaker's centroid needs to be given a stored person's name in
 #                              cluster mode (used instead of the Settings speaker_threshold, which is tuned for single
-#                              segments). On the AMI test meetings, right person 0.75-0.92, a different person up to
-#                              0.62: at 0.30 a visitor who was never enrolled got an enrolled person's name 89% of the
-#                              time, at 0.65-0.75 never, while 95.5% of enrolled people's speech was still recognised.
-#   ASR_BACKEND=whisper        speech-to-text engine: whisper (faster-whisper, WHISPER_MODEL) or parakeet (NVIDIA
-#                              Parakeet-TDT through NeMo, PARAKEET_MODEL; needs nemo_toolkit[asr]). Parakeet gives the
-#                              same segments with word timestamps and word confidences, so everything after it is
-#                              unchanged. parakeet-tdt-0.6b-v2 is English-only; -v3 covers 25 European languages.
+#                              segments): halfway between those two figures for the default embedding model (0.70 was
+#                              the value for pyannote/embedding).
+#   ASR_BACKEND=parakeet       speech-to-text engine: parakeet (NVIDIA Parakeet-TDT through NeMo, PARAKEET_MODEL) or
+#                              whisper (faster-whisper, WHISPER_MODEL). Default: parakeet for English (better on
+#                              meetings and 2-4x faster) when NeMo is installed, else whisper (other languages,
+#                              WHISPER_LANGUAGE). Parakeet gives the same segments with word timestamps and word
+#                              confidences. parakeet-tdt-0.6b-v2 is English-only; -v3 covers 25 European languages.
 #   DIARIZATION_BACKEND=pyannote  speaker diarization runtime: pyannote (pyannote.audio) or speakrs (a Rust/CUDA
 #                              implementation of the same community-1 models and clustering: the same turns within
 #                              0.1 DER, ~6x faster on long recordings; built into the Docker image).
@@ -76,7 +117,22 @@ def _env_flag(name: str, default: bool) -> bool:
 #                              segments). Word timestamps cover only the voiced core of the words, so word-tight
 #                              segments left the speech around them unlabelled: most of the gap between the app's DER
 #                              and pyannote's own. false = segments span first to last word, the original behaviour.
-ASR_BACKEND = (os.getenv("ASR_BACKEND") or "whisper").strip().lower()
+#   OVERLAP_SEPARATION=false   true = where the diarization hears two people at once, separate the two voices
+#                              (MossFormer2) and transcribe both: the second speaker's words become their own segments,
+#                              the main speaker's missed words join theirs (app/overlap.py). Better transcripts of
+#                              crosstalk, at about half the speed on meetings; off by default.
+#   LIVE_SPEAKER_TRACKING=true live sessions keep a track per voice across chunks and name it from all its speech so
+#                              far (app/live_tracking.py): one Unknown per stranger, named people recognised once
+#                              their track clearly matches, earlier lines relabelled. false = every live segment matched
+#                              on its own, the original behaviour.
+def _default_asr() -> str:
+    """parakeet for English when NVIDIA NeMo is installed (the Docker image has it), else whisper."""
+    import importlib.util
+    english = (os.getenv("WHISPER_LANGUAGE") or "en").strip().lower() == "en"
+    return "parakeet" if english and importlib.util.find_spec("nemo") is not None else "whisper"
+
+
+ASR_BACKEND = (os.getenv("ASR_BACKEND") or _default_asr()).strip().lower()
 PARAKEET_MODEL = os.getenv("PARAKEET_MODEL") or "nvidia/parakeet-tdt-0.6b-v2"
 PARAKEET_CHUNK_SEC = 60.0  # ASR_BACKEND=parakeet: longer audio is cut at pauses into chunks up to this long (on AMI
                            # meetings 30 s: 21.8% WER, 60 s: 21.1%, 120 s: 20.9% but 10% slower)
@@ -85,8 +141,11 @@ WHISPER_BATCH_SIZE = int(os.getenv("WHISPER_BATCH_SIZE") or (4 if torch.cuda.is_
 WORD_LEVEL_SPEAKERS = _env_flag("WORD_LEVEL_SPEAKERS", True)
 PYANNOTE_ALLOW_TF32 = _env_flag("PYANNOTE_ALLOW_TF32", True)
 CLUSTER_SPEAKERS = (os.getenv("SPEAKER_ASSIGNMENT") or "cluster").strip().lower() == "cluster"
-CLUSTER_SPEAKER_THRESHOLD = float(os.getenv("CLUSTER_SPEAKER_THRESHOLD") or 0.70)
+SPEAKER_EMBEDDING_MODEL = os.getenv("SPEAKER_EMBEDDING_MODEL") or "pyannote/wespeaker-voxceleb-resnet34-LM"
+CLUSTER_SPEAKER_THRESHOLD = float(os.getenv("CLUSTER_SPEAKER_THRESHOLD") or 0.60)
 SNAP_TO_TURNS = _env_flag("SNAP_TO_TURNS", True)
+OVERLAP_SEPARATION = _env_flag("OVERLAP_SEPARATION", False)
+LIVE_SPEAKER_TRACKING = _env_flag("LIVE_SPEAKER_TRACKING", True)
 DIARIZATION_BACKEND = (os.getenv("DIARIZATION_BACKEND") or "pyannote").strip().lower()
 SPLIT_PAUSE_SEC = 1.0      # WORD_LEVEL_SPEAKERS (and Parakeet's segments): a pause this long between words starts a new segment
 SPLIT_MAX_SEC = 30.0       # WORD_LEVEL_SPEAKERS (and Parakeet's segments): longest segment before a split at a word boundary
@@ -285,6 +344,15 @@ def _parakeet_segments(hyp, offset: float) -> List[Dict]:
     return segments
 
 
+def _whisper_segments(segments) -> List[Dict]:
+    """faster-whisper segments (transcribed while iterated) in the app's form: text, words with times and
+    probability, avg_logprob."""
+    return [{"start": seg.start, "end": seg.end, "text": seg.text.strip(),
+             "words": [{"word": w.word, "start": w.start, "end": w.end, "probability": w.probability}
+                       for w in (seg.words or [])],
+             "avg_logprob": seg.avg_logprob} for seg in segments]
+
+
 def _keep_tf32_on():
     """pyannote calls fix_reproducibility() on every inference, which switches TF32 off; make it a no-op."""
     import sys as _sys
@@ -374,8 +442,9 @@ def auto_enroll_unknown_speaker(embedding: np.ndarray, db_session, threshold: fl
     Auto-enroll unknown speaker with timestamp-based naming and clustering.
 
     CRITICAL: This is a FALLBACK for segments that didn't match in transcribe_with_diarization().
-    Checks ALL speakers (not just Unknown_*) with a slightly lower threshold as a second chance.
-    This prevents creating duplicate Unknown speakers for people who are already enrolled.
+    Checks the Unknown_* speakers with a slightly lower threshold as a second chance, so one stranger does not become a
+    new Unknown per segment. Named people are never matched here: a segment that did not reach the threshold for them
+    stays Unknown rather than risk a wrong name.
 
     Args:
         embedding: Numpy array of speaker embedding
@@ -391,7 +460,7 @@ def auto_enroll_unknown_speaker(embedding: np.ndarray, db_session, threshold: fl
     best_similarity = 0.0
 
     if embedding is not None:
-        all_speakers = db_session.query(Speaker).all()
+        all_speakers = db_session.query(Speaker).filter(Speaker.name.like("Unknown_%")).all()
         if all_speakers:
             logger.info(f"  🔍 Auto-enroll fallback: Checking {len(all_speakers)} speakers (fallback threshold: {fallback_threshold:.2%})")
             for speaker in all_speakers:
@@ -452,6 +521,7 @@ class SpeakerRecognitionEngine:
         """
         self.hf_token = hf_token or os.getenv("HF_TOKEN")
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        _ENGINES.add(self)
 
         # ConfigManager already handles persisted values plus non-empty env
         # overrides. Reading the raw Compose env here made CONTEXT_PADDING=""
@@ -465,6 +535,7 @@ class SpeakerRecognitionEngine:
         self._embedding_model = None
         self._whisper_model = None
         self._parakeet_model = None
+        self._separator = None
         self._emotion_model = None
         self._emotion_model_failed = False
 
@@ -641,14 +712,24 @@ class SpeakerRecognitionEngine:
             return self._embedding_model
         with self._model_lock:
             if self._embedding_model is None:
-                logger.info("Loading pyannote embedding model...")
+                logger.info(f"Loading speaker embedding model ({SPEAKER_EMBEDDING_MODEL})...")
                 if self.hf_token:
                     os.environ["HF_TOKEN"] = self.hf_token
-                model = Model.from_pretrained("pyannote/embedding")
+                model = Model.from_pretrained(SPEAKER_EMBEDDING_MODEL)
                 inference = Inference(model, window="whole")
                 inference.to(self.device)
                 self._embedding_model = inference
         return self._embedding_model
+
+    @property
+    def embedding_dim(self) -> int:
+        """Size of the voice embeddings SPEAKER_EMBEDDING_MODEL makes (measured once on a second of noise)."""
+        if getattr(self, "_embedding_dim", None) is None:
+            noise = np.random.default_rng(0).standard_normal(16000).astype(np.float32) * 0.01
+            with torch.no_grad():
+                self._embedding_dim = int(np.asarray(self.embedding_model(
+                    {"waveform": torch.from_numpy(noise)[None], "sample_rate": 16000})).size)
+        return self._embedding_dim
 
     @property
     def whisper_model(self):
@@ -708,6 +789,16 @@ class SpeakerRecognitionEngine:
                 self._parakeet_model = model
                 logger.info(f"Parakeet model '{PARAKEET_MODEL}' loaded")
         return self._parakeet_model
+
+    @property
+    def separator(self):
+        """Lazy load the two-voice separation model (thread-safe); only used when OVERLAP_SEPARATION is on."""
+        if self._separator is None:
+            with self._model_lock:
+                if self._separator is None:
+                    logger.info(f"Loading speech separation model ({overlap.SEPARATION_MODEL})...")
+                    self._separator = overlap.Separator(self.device)
+        return self._separator
 
     @property
     def asr_model(self):
@@ -788,28 +879,7 @@ class SpeakerRecognitionEngine:
             )
 
         logger.info(f"Detected language: {info.language} (probability: {info.language_probability:.2f})")
-
-        transcription_segments = []
-        # Convert generator to list - transcription happens during iteration
-        for segment in segments_generator:
-            # Extract word-level data if available
-            words_data = []
-            if hasattr(segment, 'words') and segment.words:
-                for word in segment.words:
-                    words_data.append({
-                        "word": word.word,
-                        "start": word.start,
-                        "end": word.end,
-                        "probability": word.probability  # Word-level confidence
-                    })
-
-            transcription_segments.append({
-                "start": segment.start,
-                "end": segment.end,
-                "text": segment.text.strip(),
-                "words": words_data,  # Include word-level data with confidence
-                "avg_logprob": segment.avg_logprob  # Segment-level confidence indicator
-            })
+        transcription_segments = _whisper_segments(segments_generator)
 
         # Explicit cleanup: delete generator and info objects
         del segments_generator, info
@@ -837,6 +907,24 @@ class SpeakerRecognitionEngine:
                     f"{len(transcription_segments)} segments")
         self.clear_gpu_cache_async("transcription")
         return transcription_segments
+
+    def transcribe_clips(self, clips: List[np.ndarray]) -> List[List[Dict]]:
+        """The words of short 16 kHz clips (times from each clip's start), by the ASR_BACKEND model."""
+        if not clips:
+            return []
+        if ASR_BACKEND == "parakeet":
+            with self._parakeet_lock:
+                hyps = self.parakeet_model.transcribe(list(clips), batch_size=PARAKEET_BATCH_SIZE, timestamps=True,
+                                                      verbose=False)
+            hyps = hyps[0] if isinstance(hyps, tuple) else hyps
+            return [[w for seg in _parakeet_segments(hyp, 0.0) for w in seg["words"]] for hyp in hyps]
+        language = os.getenv("WHISPER_LANGUAGE", "en")
+        out = []
+        for clip in clips:
+            segments, _ = self.whisper_model.transcribe(clip, language=None if language == "auto" else language,
+                                                        task="transcribe", beam_size=5, word_timestamps=True)
+            out.append([w for seg in _whisper_segments(segments) for w in seg["words"]])
+        return out
 
     def extract_embedding(self, audio_file: str) -> np.ndarray:
         """
@@ -1291,6 +1379,7 @@ class SpeakerRecognitionEngine:
         db_session = None,
         cluster_speakers: Optional[bool] = None,
         diarize: bool = True,
+        tracks: Optional[live_tracking.SessionTracks] = None,
     ) -> Dict:
         """
         Full pipeline: transcription + diarization + speaker recognition + personalized emotions
@@ -1304,6 +1393,8 @@ class SpeakerRecognitionEngine:
                 setting. Live chunks pass False: a few seconds of speech is too little for the cluster threshold.
             diarize: False skips speaker diarization (one person talking): every segment is one speaker, still
                 matched against the stored voices.
+            tracks: a live session's speaker tracks (app/live_tracking.py): each diarization speaker of this chunk is
+                named after its session track instead of segment by segment; a segment's "track" is its track.
 
         Returns:
             Dictionary with transcribed segments and speaker labels
@@ -1364,9 +1455,14 @@ class SpeakerRecognitionEngine:
         widened = _snap_to_turns(kept, diarization_result["segments"]) if SNAP_TO_TURNS else kept
         segments = [(out, out["speaker_label"], self._segment_embedding_or_none(audio, seg))
                     for seg, out in zip(kept, widened)]
+        if OVERLAP_SEPARATION and diarize:
+            segments = self._recover_overlapped_speech(audio, segments, diarization_result)
 
         # Pass 2: who is speaking in each segment.
-        if cluster_speakers:
+        if tracks is not None:
+            identities = self._identify_tracks(audio, segments, diarization_result, tracks, db_session)
+            speakers = [identities.get(label) or self._speaker("Unknown") for _, label, _ in segments]
+        elif cluster_speakers:
             identities = self._identify_clusters(audio, segments, diarization_result, known_speakers,
                                                  CLUSTER_SPEAKER_THRESHOLD, db_session)
             speakers = [identities[label] for _, label, _ in segments]
@@ -1416,8 +1512,10 @@ class SpeakerRecognitionEngine:
                 "words": trans_seg.get("words", []),  # Include word-level data
                 "avg_logprob": trans_seg.get("avg_logprob")  # Include segment confidence
             }
-            if who["speaker_id"] is not None:   # already resolved (SPEAKER_ASSIGNMENT=cluster)
+            if who["speaker_id"] is not None:   # already resolved (SPEAKER_ASSIGNMENT=cluster, live tracks)
                 segment_data["speaker_id"] = who["speaker_id"]
+            if who.get("track") is not None:
+                segment_data["track"] = who["track"]
 
             # Add emotion data if available (include embedding for caching)
             if emotion_data:
@@ -1511,28 +1609,21 @@ class SpeakerRecognitionEngine:
                            db_session) -> Dict[Optional[str], Dict]:
         """SPEAKER_ASSIGNMENT=cluster: one identity per diarization speaker, decided once from all of its speech.
 
-        A speaker's voice is the duration-weighted centroid of its segments' embeddings. Speakers are matched to the
-        stored people one-to-one (pyannote has already decided they are different people), above the threshold
-        (CLUSTER_SPEAKER_THRESHOLD) and no lower. A speaker that matches nobody becomes ONE new Unknown_* (auto-enrolled with the
+        A speaker's voice is the duration-weighted centroid of its segments' embeddings. It takes the name of the stored
+        person it matches best, above the threshold (CLUSTER_SPEAKER_THRESHOLD) and live_tracking.NAME_MARGIN above the
+        next person, never a second choice; two speakers may share a name only if their own voices are alike (pyannote
+        split one person). A speaker that matches nobody becomes ONE new Unknown_* (auto-enrolled with the
         centroid), so an unsure match stays unknown instead of being given someone else's name.
         """
-        groups: Dict[Optional[str], Tuple[List[np.ndarray], List[float]]] = {}
-        for seg, label, embedding in segments:
-            embeddings, weights = groups.setdefault(label, ([], []))
-            if embedding is not None:
-                embeddings.append(embedding)
-                weights.append(min(seg["end"] - seg["start"], CENTROID_MAX_WEIGHT_SEC))
-        labels = list(groups)   # order of first appearance
-        centroids = {label: _centroid(*groups[label]) for label in labels}
-        for label in labels:
-            if centroids[label] is None and label is not None:
-                centroids[label] = self._turns_centroid(audio_file, label, diarization_result["exclusive_segments"])
+        centroids = self._label_centroids(audio_file, segments, diarization_result["exclusive_segments"])
+        labels = list(centroids)   # order of first appearance
 
         # Candidate people: speaker_id -> (name, all their voice profiles: general + emotion-specific)
         people: Dict[Any, Tuple[str, List[np.ndarray]]] = {}
         if db_session:
             for p in self._all_profiles(db_session):
-                people.setdefault(p["speaker_id"], (p["speaker_name"], []))[1].append(p["embedding"])
+                if p["profile_type"] == "general":   # who someone is: their voice, not a per-emotion sample
+                    people.setdefault(p["speaker_id"], (p["speaker_name"], []))[1].append(p["embedding"])
         else:
             for speaker_id, name, embedding in known_speakers:
                 if not np.isnan(embedding).any():
@@ -1547,13 +1638,26 @@ class SpeakerRecognitionEngine:
             for label, row in zip(matchable, sims):
                 top = sorted(((s, people[i][0]) for s, i in zip(row, ids)), reverse=True)[:3]
                 logger.info(f"  Speaker {label}: best matches " + ", ".join(f"{n} {s:.3f}" for s, n in top))
-            from scipy.optimize import linear_sum_assignment
-            rows, cols = linear_sum_assignment(np.where(sims > threshold, -sims, 0.0))
-            for r, c in zip(rows, cols):
-                if sims[r, c] > threshold:
-                    label, speaker_id = matchable[r], ids[c]
-                    identities[label] = self._speaker(people[speaker_id][0], speaker_id, True, sims[r, c])
-                    logger.info(f"  ✅ Speaker {label} → {people[speaker_id][0]} ({sims[r, c]:.2%})")
+            # A speaker is named only after its own clear best match: above the threshold and NAME_MARGIN above its
+            # next person (a one-to-one assignment used to hand a second speaker its second-best person). Two speakers
+            # whose best is the same person (pyannote split one voice) both take the name if their voices are alike;
+            # otherwise only the closer one does.
+            order = np.argsort(-sims, axis=1)
+            claims: Dict[Any, List[Tuple[float, Optional[str]]]] = {}
+            for r, label in enumerate(matchable):
+                best = sims[r, order[r, 0]]
+                runner_up = sims[r, order[r, 1]] if len(ids) > 1 else -1.0
+                if best > threshold and best - runner_up >= live_tracking.NAME_MARGIN:
+                    claims.setdefault(ids[order[r, 0]], []).append((best, label))
+            for speaker_id, claimants in claims.items():
+                claimants.sort(key=lambda x: -x[0])
+                first = centroids[claimants[0][1]]
+                for sim, label in claimants:
+                    if label != claimants[0][1] and float(cosine_similarity(
+                            centroids[label].reshape(1, -1), first.reshape(1, -1))[0][0]) < threshold:
+                        continue
+                    identities[label] = self._speaker(people[speaker_id][0], speaker_id, True, sim)
+                    logger.info(f"  ✅ Speaker {label} → {people[speaker_id][0]} ({sim:.2%})")
 
         unknown_counter = 1
         for label in labels:
@@ -1569,6 +1673,130 @@ class SpeakerRecognitionEngine:
                 unknown_counter += 1
             logger.info(f"  ❔ Speaker {label} → {identities[label]['speaker']} (no stored voice above {threshold:.2%})")
         return identities
+
+    def _identify_tracks(self, audio_file, segments, diarization_result, tracks: live_tracking.SessionTracks,
+                         db_session) -> Dict[Optional[str], Dict]:
+        """Live sessions: each diarization speaker of this chunk joins the session track of its voice and is named
+        after it (live_tracking.SessionTracks.identify): a stored speaker its voice clearly matches, else another
+        track's Unknown of this session, else the track's own Unknown. Decides only: nothing is written here (the
+        live handler's persistence lease starts with a rollback), so a track that needs a new Unknown has no
+        speaker_id yet; the caller saves it (streaming_websocket._save_tracks), then relabels this session's segments
+        of a replaced Unknown (tracks.renames)."""
+        centroids = self._label_centroids(audio_file, segments, diarization_result["exclusive_segments"])
+        seconds: Dict[Optional[str], float] = {}
+        for seg, label, _ in segments:
+            seconds[label] = seconds.get(label, 0.0) + seg["end"] - seg["start"]
+        voices = {label: (c, seconds.get(label, 0.0)) for label, c in centroids.items()
+                  if label is not None and c is not None}
+        assigned = tracks.assign(voices)
+        stored: Dict[int, List[np.ndarray]] = {}
+        names: Dict[int, str] = {}
+        if db_session is not None:
+            for p in self._all_profiles(db_session):
+                names[p["speaker_id"]] = p["speaker_name"]
+                if p["profile_type"] == "general":   # who someone is: their voice, not a per-emotion sample
+                    stored.setdefault(p["speaker_id"], []).append(p["embedding"])
+        if db_session is not None:
+            self._follow_user(list(assigned.values()), db_session, names)
+        identities: Dict[Optional[str], Dict] = {}
+        # two voices in one chunk are two people: a speaker already carried by a track here is not given to another
+        taken: List[int] = [t.speaker_id for t in assigned.values() if t.speaker_id is not None and not t.own_unknown]
+        for label in sorted(assigned, key=lambda lb: -voices[lb][1]):
+            track = assigned[label]
+            similarity = 1.0
+            if track.speaker_id is None or track.own_unknown:
+                match = tracks.identify(track, stored, tuple(taken))
+                if match:
+                    tracks.adopt(track, match[0])
+                    similarity = match[1]
+                    logger.info(f"  ✅ Live track {track.id} ({track.seconds:.1f}s) → {names.get(match[0])} "
+                                f"({similarity:.2%})")
+            if track.speaker_id is not None and track.speaker_id not in taken:
+                taken.append(track.speaker_id)
+            name = names.get(track.speaker_id, "Unknown")
+            who = self._speaker(name, track.speaker_id, is_known=track.speaker_id is not None
+                                and not name.startswith("Unknown_"), confidence=similarity)
+            identities[label] = dict(who, track=track)
+        return identities
+
+    @staticmethod
+    def _follow_user(tracks: List[live_tracking.Track], db_session, names: Dict[int, str]) -> None:
+        """The user's word beats the voice match: a track whose latest saved segment now carries another speaker (the
+        user identified, merged or renamed it, mid-session) takes that speaker from then on; a track whose own Unknown
+        the user renamed to a person keeps it as a name. Read from the segments rather than trusting the stored id
+        alone, since SQLite can hand a deleted speaker's id to a new one."""
+        last = {t.segment_ids[-1]: t for t in tracks if t.segment_ids}
+        if not last:
+            return
+        rows = db_session.query(ConversationSegment.id, ConversationSegment.speaker_id).filter(
+            ConversationSegment.id.in_(list(last))).all()
+        for seg_id, speaker_id in rows:
+            track = last[seg_id]
+            if speaker_id != track.speaker_id:
+                track.speaker_id, track.own_unknown = (speaker_id if speaker_id in names else None), False
+            elif track.own_unknown and not names.get(speaker_id, "Unknown_").startswith("Unknown_"):
+                track.own_unknown = False
+
+    def save_track_voices(self, tracks: List[live_tracking.Track], db_session) -> None:
+        """Live: each track of this chunk without a speaker gets its own Unknown, created with the track's voice, once
+        it has live_tracking.PROVISIONAL_SECONDS of speech; a track's own Unknown takes the track's voice as it grows.
+        Called inside the handler's persistence lease."""
+        for track in tracks:
+            voice = track.voice.astype(np.float32)
+            if track.speaker_id is None:
+                if track.seconds < live_tracking.PROVISIONAL_SECONDS:
+                    continue
+                track.speaker_id, name = _create_unknown_speaker(voice, db_session)
+                track.own_unknown = True
+                self.add_speaker_to_cache(track.speaker_id, name, voice)
+            elif track.own_unknown:
+                speaker = db_session.query(Speaker).filter(Speaker.id == track.speaker_id).first()
+                if speaker is not None:
+                    speaker.set_embedding(voice)
+                    with self._cache_lock:
+                        for p in self._speaker_cache or []:
+                            if p["speaker_id"] == track.speaker_id and p["profile_type"] == "general":
+                                p["embedding"] = voice
+
+    def _label_centroids(self, audio_file, segments, turns: List[Dict],
+                         also: Tuple[str, ...] = ()) -> Dict[Optional[str], Optional[np.ndarray]]:
+        """Each diarization speaker's voice (in order of first appearance): the duration-weighted centroid of its
+        segments' embeddings, else of its longest turns. also: speakers to include that may have no segment."""
+        groups: Dict[Optional[str], Tuple[List[np.ndarray], List[float]]] = {}
+        for seg, label, embedding in segments:
+            embeddings, weights = groups.setdefault(label, ([], []))
+            if embedding is not None:
+                embeddings.append(embedding)
+                weights.append(min(seg["end"] - seg["start"], CENTROID_MAX_WEIGHT_SEC))
+        for label in also:
+            groups.setdefault(label, ([], []))
+        centroids = {label: _centroid(*group) for label, group in groups.items()}
+        for label in centroids:
+            if centroids[label] is None and label is not None:
+                centroids[label] = self._turns_centroid(audio_file, label, turns)
+        return centroids
+
+    def _recover_overlapped_speech(self, audio: Dict, segments, diarization_result: Dict):
+        """OVERLAP_SEPARATION: the segments with the words of overlapping voices added (app/overlap.py). On any
+        failure the segments are returned unchanged."""
+        turns = diarization_result["segments"]
+        if not overlap.overlap_regions(turns):
+            return segments
+        try:
+            centroids = self._label_centroids(audio, segments, diarization_result["exclusive_segments"],
+                                              tuple(dict.fromkeys(t["speaker"] for t in turns)))
+            voices = {label: c for label, c in centroids.items() if label is not None and c is not None}
+
+            def embed(wav: np.ndarray) -> Optional[np.ndarray]:
+                with torch.no_grad():
+                    emb = np.array(self.embedding_model({"waveform": torch.from_numpy(wav)[None], "sample_rate": 16000}))
+                return None if np.isnan(emb).any() else emb
+
+            return overlap.recover(segments, turns, audio["waveform"][0].numpy(), voices, self.separator,
+                                   self.transcribe_clips, embed, SPLIT_PAUSE_SEC)
+        except Exception as e:  # noqa: BLE001 - an optional accuracy step must not fail the request
+            logger.warning(f"Overlapping speech not recovered ({type(e).__name__}: {e})")
+            return segments
 
     def _turns_centroid(self, audio_file, label: str, turns: List[Dict]) -> Optional[np.ndarray]:
         """Centroid of a diarization speaker's longest turns (for a speaker none of whose segments could be embedded)."""

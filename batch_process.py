@@ -394,14 +394,25 @@ def find_already_processed(output_dir, input_dir):
 
 
 def load_known_speakers(db_path):
-    """Load speakers from SQLite (read-only). Returns list of (id, name, embedding_bytes)."""
+    """Load speakers from SQLite (read-only). Returns list of (id, name, embedding_bytes). Voices made by another
+    voice-embedding model than SPEAKER_EMBEDDING_MODEL cannot be compared: then none are loaded (starting the server
+    once rebuilds them for the current model)."""
     if not os.path.exists(db_path):
         print(f"Warning: Database not found at {db_path}")
         return []
+    current = os.getenv("SPEAKER_EMBEDDING_MODEL") or "pyannote/wespeaker-voxceleb-resnet34-LM"
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-    cursor = conn.execute("SELECT id, name, embedding FROM speakers")
-    speakers = [(row[0], row[1], row[2]) for row in cursor]
+    try:
+        row = conn.execute("SELECT value FROM app_metadata WHERE key = 'speaker_embedding_model'").fetchone()
+    except sqlite3.OperationalError:
+        row = None
+    speakers = [(r[0], r[1], r[2]) for r in conn.execute("SELECT id, name, embedding FROM speakers")]
     conn.close()
+    made_by = row[0] if row else ("pyannote/embedding" if speakers else current)
+    if made_by != current:
+        print(f"Warning: the stored voices were made by {made_by}, not {current}: start the server once to rebuild "
+              "them; processing without known speakers")
+        return []
     return speakers
 
 

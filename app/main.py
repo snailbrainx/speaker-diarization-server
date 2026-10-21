@@ -88,6 +88,20 @@ async def lifespan(app: FastAPI):
     diarization = engine.diarization_pipeline  # Loads diarization
     embedding = engine.embedding_model  # Loads embeddings
     emotion = engine.emotion_model  # Loads emotion2vec
+    # Stored voices made by another voice-embedding model are rebuilt with the current one (once)
+    from .database import SessionLocal
+    from .services import migrate_voice_embeddings
+    migration_db = SessionLocal()
+    try:
+        migrate_voice_embeddings(migration_db, engine)
+    finally:
+        migration_db.close()
+    from .diarization import OVERLAP_SEPARATION
+    if OVERLAP_SEPARATION:
+        try:
+            engine.separator  # MossFormer2, for voices talking over each other
+        except Exception as e:  # noqa: BLE001 - optional step; files are still processed without it
+            logger.warning(f"Speech separation unavailable ({type(e).__name__}: {e}); overlapping voices are not separated")
 
     # Force VRAM allocation by running a warmup pass (only on GPU)
     if torch.cuda.is_available():
@@ -129,7 +143,7 @@ async def lifespan(app: FastAPI):
             logger.info(f"  - Created {duration}s test audio file")
 
             # Create dummy speaker to exercise speaker matching code path
-            dummy_embedding = np.random.randn(512).astype(np.float32)
+            dummy_embedding = np.random.randn(engine.embedding_dim).astype(np.float32)
             dummy_speakers = [(1, "Warmup", dummy_embedding)]
 
             # Get threshold from settings

@@ -16,6 +16,11 @@ faster-whisper==1.2.1
 # NVIDIA NeMo for ASR_BACKEND=parakeet (Parakeet-TDT speech-to-text); resolves lightning to 2.4.x
 nemo_toolkit[asr]==3.0.0
 funasr==1.3.1
+# MossFormer2 speech separation (OVERLAP_SEPARATION): the model's own dependencies; the clearvoice package that
+# holds it is installed in the Dockerfile without its dependencies
+torchinfo==1.8.0
+rotary-embedding-torch==0.9.1
+einops>=0.8
 soundfile~=0.13.1
 
 # Database
