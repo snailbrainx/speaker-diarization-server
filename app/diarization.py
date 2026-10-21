@@ -69,6 +69,9 @@ def _env_flag(name: str, default: bool) -> bool:
 #                              Parakeet-TDT through NeMo, PARAKEET_MODEL; needs nemo_toolkit[asr]). Parakeet gives the
 #                              same segments with word timestamps and word confidences, so everything after it is
 #                              unchanged. parakeet-tdt-0.6b-v2 is English-only; -v3 covers 25 European languages.
+#   DIARIZATION_BACKEND=pyannote  speaker diarization runtime: pyannote (pyannote.audio) or speakrs (a Rust/CUDA
+#                              implementation of the same community-1 models and clustering: the same turns within
+#                              0.1 DER, ~6x faster on long recordings; built into the Docker image).
 #   SNAP_TO_TURNS=true         widen each segment to its speaker's diarization turn (never into the neighbouring
 #                              segments). Word timestamps cover only the voiced core of the words, so word-tight
 #                              segments left the speech around them unlabelled: most of the gap between the app's DER
@@ -84,6 +87,7 @@ PYANNOTE_ALLOW_TF32 = _env_flag("PYANNOTE_ALLOW_TF32", True)
 CLUSTER_SPEAKERS = (os.getenv("SPEAKER_ASSIGNMENT") or "cluster").strip().lower() == "cluster"
 CLUSTER_SPEAKER_THRESHOLD = float(os.getenv("CLUSTER_SPEAKER_THRESHOLD") or 0.70)
 SNAP_TO_TURNS = _env_flag("SNAP_TO_TURNS", True)
+DIARIZATION_BACKEND = (os.getenv("DIARIZATION_BACKEND") or "pyannote").strip().lower()
 SPLIT_PAUSE_SEC = 1.0      # WORD_LEVEL_SPEAKERS (and Parakeet's segments): a pause this long between words starts a new segment
 SPLIT_MAX_SEC = 30.0       # WORD_LEVEL_SPEAKERS (and Parakeet's segments): longest segment before a split at a word boundary
 CENTROID_MAX_WEIGHT_SEC = 10.0  # SPEAKER_ASSIGNMENT=cluster: a segment counts by its duration, up to this
@@ -471,6 +475,8 @@ class SpeakerRecognitionEngine:
         # NeMo's transcribe() switches the model's train/freeze state around each call, so calls from parallel
         # requests take turns (each is tens of milliseconds per chunk batch).
         self._parakeet_lock = threading.Lock()
+        # A speakrs pipeline handle runs one call at a time.
+        self._speakrs_lock = threading.Lock()
 
         # Speaker profile cache (reduces DB queries during streaming)
         self._speaker_cache = None
@@ -603,10 +609,19 @@ class SpeakerRecognitionEngine:
 
     @property
     def diarization_pipeline(self):
-        """Lazy load diarization pipeline (thread-safe)."""
+        """Lazy load diarization pipeline (thread-safe): pyannote's, or speakrs' (DIARIZATION_BACKEND)."""
         if self._diarization_pipeline is not None:
             return self._diarization_pipeline
         with self._model_lock:
+            if self._diarization_pipeline is None and DIARIZATION_BACKEND == "speakrs":
+                try:
+                    import speakrs
+                except ImportError as e:
+                    raise RuntimeError("DIARIZATION_BACKEND=speakrs needs the speakrs package (built into the "
+                                       "Docker image; see the README)") from e
+                logger.info("Loading speakrs diarization pipeline (pyannote community-1 models)...")
+                self._diarization_pipeline = speakrs.Pipeline.from_pretrained(
+                    "cuda" if self.device.type == "cuda" else "cpu")
             if self._diarization_pipeline is None:
                 logger.info("Loading pyannote diarization pipeline...")
                 if self.hf_token:
@@ -849,19 +864,27 @@ class SpeakerRecognitionEngine:
             Diarization result with speaker segments
         """
         logger.info(f"Running diarization on {audio_file}...")
-        with torch.no_grad():
-            output = self.diarization_pipeline(audio if audio is not None else audio_file)
+        # Both runtimes give the turns (overlapping where two people talk at once) and the exclusive turns (one
+        # speaker at a time, for aligning words).
+        if DIARIZATION_BACKEND == "speakrs":
+            samples = np.asarray((audio if audio is not None else _in_memory(audio_file))["waveform"][0])
+            with self._speakrs_lock:
+                output = self.diarization_pipeline.diarize_samples(samples)
+            overlapping = [(s.start, s.end, s.speaker) for s in output.segments]
+            exclusive = [(s.start, s.end, s.speaker) for s in output.exclusive_segments]
+        else:
+            with torch.no_grad():
+                output = self.diarization_pipeline(audio if audio is not None else audio_file)
+            overlapping = [(turn.start, turn.end, speaker) for turn, speaker in output.speaker_diarization]
+            exclusive = [(turn.start, turn.end, speaker) for turn, speaker in output.exclusive_speaker_diarization]
 
-        # Convert to dictionary format. In pyannote.audio 4.0+, speaker_diarization holds the turns (overlapping where
-        # two people talk at once); exclusive_speaker_diarization has one speaker at a time, for aligning words.
-        def turns(annotation):
-            return [{"start": turn.start, "end": turn.end, "speaker": speaker, "duration": turn.end - turn.start}
-                    for turn, speaker in annotation]
+        def turns(spans):
+            return [{"start": s, "end": e, "speaker": speaker, "duration": e - s} for s, e, speaker in spans]
 
-        segments = turns(output.speaker_diarization)
+        segments = turns(overlapping)
         result = {
             "segments": segments,
-            "exclusive_segments": turns(output.exclusive_speaker_diarization),
+            "exclusive_segments": turns(exclusive),
             "num_speakers": len(set(s["speaker"] for s in segments))
         }
 

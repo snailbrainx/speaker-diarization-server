@@ -42,7 +42,7 @@ The screenshots below are from an older version of the separate example
 
 | Component       | Implementation                                                              |
 |-----------------|-----------------------------------------------------------------------------|
-| Diarization     | `pyannote/speaker-diarization-community-1` (pyannote.audio 4.0.1)           |
+| Diarization     | `pyannote/speaker-diarization-community-1` (pyannote.audio 4.0.1; or the same models in [speakrs](https://github.com/avencera/speakrs), `DIARIZATION_BACKEND=speakrs`) |
 | Speaker embed   | `pyannote/embedding` (512-D)                                                |
 | Transcription   | faster-whisper 1.2.1 / CTranslate2, `large-v3` default; or Parakeet-TDT 0.6B v2 via NVIDIA NeMo 3.0 (`ASR_BACKEND=parakeet`) |
 | Emotion         | emotion2vec_plus_large via FunASR (1024-D, 9 categories)                    |
@@ -150,6 +150,7 @@ All configuration is environment variables (see `.env.example` for the curated l
 | `WHISPER_LANGUAGE`             | `en`                             | `auto` for 99-language detection, or ISO-639 code.  |
 | `ASR_BACKEND`                  | `whisper`                        | Speech-to-text engine: `whisper` or `parakeet` (see [Speech-to-text](#speech-to-text-whisper-or-parakeet)). |
 | `PARAKEET_MODEL`               | `nvidia/parakeet-tdt-0.6b-v2`    | `ASR_BACKEND=parakeet` model. v2 is English-only; `nvidia/parakeet-tdt-0.6b-v3` covers 25 European languages (detected automatically). |
+| `DIARIZATION_BACKEND`          | `pyannote`                       | Diarization runtime: `pyannote` or `speakrs`, the same community-1 models and clustering in Rust/CUDA (see [Diarization runtime](#diarization-runtime-pyannote-or-speakrs)). |
 | `EMOTION_MODEL`                | `iic/emotion2vec_plus_large`     | FunASR emotion model ID.                            |
 | `ENABLE_PERSONALIZED_EMOTIONS` | `true`                           | Use per-speaker voice profiles in emotion matching. |
 | `OFFLINE_MODE`                 | `false`                          | Force cached models only; never hit the hub.        |
@@ -232,6 +233,23 @@ pyannote itself is least sure; DER, which counts confusion, falls 3–8 points. 
 speech (mostly names and compound words) and leads on harder speech and meetings.
 
 ³ Of all their speech, in the identification test above; 2.0% / 2.2% was given another person's name.
+
+### Diarization runtime: pyannote or speakrs
+
+`DIARIZATION_BACKEND=speakrs` runs community-1's own models and clustering through
+[speakrs](https://github.com/avencera/speakrs), a Rust/CUDA implementation, instead of pyannote.audio. The speaker
+turns are the same: DER is within 0.05 points on every set below, held-out ones included. Diarization takes about a
+sixth of the time and a tenth of the CPU (a 17.5-minute meeting: 1.5 s instead of 9.3 s). The Docker image builds
+speakrs from a pinned commit, since it is not on PyPI; its models, converted from community-1, download from Hugging
+Face on first use. Measured as above, on the same GPU with each file sent to each server in turn:
+
+| | pyannote | speakrs |
+|---|---|---|
+| Speed, VoxConverse (Parakeet / Whisper) | 76× / 36× | **105× / 43×** |
+| Speed, AMI (Parakeet / Whisper) | 78× / 45× | **116× / 59×** |
+| DER, VoxConverse / AMI | 11.23% / 23.86% | 11.19% / 23.84% |
+| DER, held-out VoxConverse / AMI dev | 8.69% / 24.12% | 8.65% / 24.09% |
+| Enrolled speakers' speech in later meetings given their own name | 89.2% | 89.2% |
 
 ## How it Works
 
@@ -457,6 +475,8 @@ Docker bind-mounts `./volumes`, `./data`, `./backups`, and `./certs` (read-only)
 
 **"CUDA out of memory"** — switch `WHISPER_MODEL` to a smaller variant (`small` or `base`), or lower `CLEANUP_VRAM_THRESHOLD_GB` so cleanup runs more often. With `ASR_BACKEND=parakeet`, speech-to-text alone peaks at ~5.5 GB on long recordings.
 
+**`DIARIZATION_BACKEND=speakrs needs the speakrs package`** — the Docker image builds it; it is not on PyPI, so outside Docker build it from source with a Rust toolchain: `pip install maturin`, then `maturin build --release -m crates/speakrs-python/Cargo.toml` in a clone of [speakrs](https://github.com/avencera/speakrs) and `pip install` the wheel. Its models download from Hugging Face on first use.
+
 **`ASR_BACKEND=parakeet needs NVIDIA NeMo`** — the Docker image includes NeMo; outside Docker, `pip install 'nemo_toolkit[asr]==3.0.0'` (it is in `requirements.txt`). Parakeet v2 transcribes English only: for other languages use `PARAKEET_MODEL=nvidia/parakeet-tdt-0.6b-v3` (25 European languages) or `ASR_BACKEND=whisper`.
 
 **Speakers named before upgrading are recognised less often** — profiles auto-enrolled by the old per-segment
@@ -470,7 +490,7 @@ speaker once in a recent conversation (the profile is then rebuilt from all of t
 
 ## License
 
-MIT — see `LICENSE`. All bundled dependencies (pyannote.audio, faster-whisper, FastAPI, PyTorch, SQLAlchemy, Pydantic) are under MIT or BSD; NVIDIA NeMo is Apache-2.0. The pyannote **models** require HuggingFace account + token + terms acceptance; the software remains open-source. The Parakeet-TDT models (`ASR_BACKEND=parakeet`) are released by NVIDIA under CC-BY-4.0.
+MIT — see `LICENSE`. All bundled dependencies (pyannote.audio, faster-whisper, FastAPI, PyTorch, SQLAlchemy, Pydantic) are under MIT or BSD; NVIDIA NeMo and speakrs are Apache-2.0. The pyannote **models** require HuggingFace account + token + terms acceptance; the software remains open-source. The Parakeet-TDT models (`ASR_BACKEND=parakeet`) are released by NVIDIA under CC-BY-4.0.
 
 ## Credits
 
@@ -478,6 +498,7 @@ MIT — see `LICENSE`. All bundled dependencies (pyannote.audio, faster-whisper,
 - [faster-whisper](https://github.com/SYSTRAN/faster-whisper) — SYSTRAN
 - [Whisper](https://github.com/openai/whisper) — OpenAI
 - [NeMo](https://github.com/NVIDIA/NeMo) / [Parakeet-TDT](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2) — NVIDIA
+- [speakrs](https://github.com/avencera/speakrs) — a Rust/CUDA implementation of pyannote's community-1 pipeline
 - [emotion2vec](https://github.com/ddlBoJack/emotion2vec) / [FunASR](https://github.com/modelscope/FunASR) — ACL 2024
 - [FastAPI](https://github.com/tiangolo/fastapi) — Sebastián Ramírez
 

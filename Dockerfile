@@ -1,3 +1,10 @@
+# speakrs (DIARIZATION_BACKEND=speakrs) is not on PyPI: build its wheel from a pinned commit. It needs no CUDA toolkit,
+# only the driver at run time.
+FROM ghcr.io/pyo3/maturin:v1.15.0 AS speakrs
+ARG SPEAKRS_COMMIT=f444dd4567afc59a99f123981f82defa116b025a
+RUN git clone https://github.com/avencera/speakrs /speakrs && cd /speakrs && git checkout "$SPEAKRS_COMMIT" \
+ && maturin build --release --features cuda -m crates/speakrs-python/Cargo.toml -o /wheels
+
 # Lightweight Python base; CUDA libraries are pip-installed below.
 FROM python:3.11-slim
 
@@ -36,6 +43,8 @@ RUN echo "torch==2.10.0" > /tmp/constraints.txt && \
     echo "torchaudio==2.10.0" >> /tmp/constraints.txt && \
     echo "torchcodec==0.10.0" >> /tmp/constraints.txt && \
     pip install --no-cache-dir -c /tmp/constraints.txt -r requirements.txt
+COPY --from=speakrs /wheels /tmp/wheels
+RUN pip install --no-cache-dir /tmp/wheels/*.whl && rm -rf /tmp/wheels
 
 # Copy application code
 COPY app/ /app/app/
