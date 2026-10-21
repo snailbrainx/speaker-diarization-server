@@ -498,7 +498,7 @@ async def _handle_segment_processed(
                 "emotion_confidence": float(emotion_conf) if emotion_conf is not None else None,
                 "detector_breakdown": convert_numpy_to_native(detector_breakdown) if detector_breakdown else None,
                 "is_known": seg.get("is_known", False),
-                "words": seg.get("words", []),
+                "words": segment.words or [],
                 "avg_logprob": segment.avg_logprob
             })
 

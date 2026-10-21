@@ -113,7 +113,12 @@ def create_segment_from_result(
             )
             confidence = 1.0 if speaker_id else confidence
 
-    words_json = json.dumps(seg["words"]) if seg.get("words") else None
+    words = seg.get("words")
+    if words and start_offset_base:
+        # A live chunk's word times count from the chunk; stored like the segment's, from the conversation start
+        words = [dict(w, **{k: w[k] + start_offset_base for k in ("start", "end") if w.get(k) is not None})
+                 for w in words]
+    words_json = json.dumps(words) if words else None
 
     seg_start = start_offset_base + seg["start"]
     seg_end = start_offset_base + seg["end"]
