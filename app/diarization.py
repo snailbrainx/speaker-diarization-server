@@ -41,7 +41,7 @@ MIN_VOICE_SAMPLES = 3
 
 # Opt-in speed settings (all off by default; unset = the original behaviour).
 #   WHISPER_BATCH_SIZE=16      faster-whisper's BatchedInferencePipeline: VAD chunks transcribed 16 at a time.
-#                              ~8x faster transcription on a 3090 / CMP 170HX; returns ~30 s segments, so use it
+#                              ~8x faster transcription on an RTX 3090; returns ~30 s segments, so use it
 #                              together with WORD_LEVEL_SPEAKERS.
 #   WORD_LEVEL_SPEAKERS=true   give every word the diarization speaker at its midpoint and split segments where the
 #                              speaker changes (or after a pause / a long run), instead of one speaker per segment.
