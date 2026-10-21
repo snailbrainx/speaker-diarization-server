@@ -31,7 +31,7 @@ import weakref
 from sqlalchemy import event
 from sqlalchemy.orm import Session as OrmSession
 
-from . import live_tracking, overlap
+from . import emotion_calibration, live_tracking, overlap
 from .config import get_config
 from .models import ConversationSegment, Speaker, SpeakerEmotionProfile
 
@@ -366,9 +366,6 @@ def _keep_tf32_on():
     rep.fix_reproducibility = noop
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-DUAL_DETECTOR_AGREE_D1 = 0.70
-DUAL_DETECTOR_AGREE_D2 = 0.80
-VOICE_STRONG_THRESHOLD = 0.85
 MAX_EMOTION_DURATION_SEC = 30.0
 MIN_SEGMENT_DURATION_SEC = 0.5
 
@@ -1029,61 +1026,6 @@ class SpeakerRecognitionEngine:
 
         return best_match
 
-    def match_emotion_to_profile(
-        self,
-        emotion_embedding: np.ndarray,
-        speaker_emotion_profiles: List[Tuple[str, np.ndarray, Optional[float]]],
-        global_threshold: float = 0.6,
-        speaker_threshold: Optional[float] = None
-    ) -> Optional[Tuple[str, float]]:
-        """
-        Match emotion embedding to speaker's learned emotion profiles
-
-        Args:
-            emotion_embedding: Emotion embedding to match (1024-D from emotion2vec)
-            speaker_emotion_profiles: List of (emotion_category, profile_embedding, custom_threshold) tuples
-            global_threshold: Fallback threshold if no speaker/profile threshold set
-            speaker_threshold: Per-speaker emotion threshold (overrides global, overridden by per-emotion)
-
-        Returns:
-            (emotion_category, confidence) or None if no match above threshold
-        """
-        if not speaker_emotion_profiles:
-            return None
-
-        # Validate emotion embedding
-        if np.isnan(emotion_embedding).any():
-            logger.info(f"  ⚠️  Emotion embedding contains NaN - skipping personalized matching")
-            return None
-
-        best_match = None
-        best_similarity = 0.0
-
-        # Threshold hierarchy: per-emotion > per-speaker > global
-        default_threshold = speaker_threshold if speaker_threshold is not None else global_threshold
-
-        for emotion_cat, profile_emb, custom_threshold in speaker_emotion_profiles:
-            # Validate profile embedding
-            if np.isnan(profile_emb).any():
-                logger.info(f"  ⚠️  Emotion profile '{emotion_cat}' contains NaN - skipping")
-                continue
-
-            # Use custom threshold if set, otherwise use speaker/global threshold
-            threshold = custom_threshold if custom_threshold is not None else default_threshold
-
-            similarity = cosine_similarity(
-                emotion_embedding.reshape(1, -1),
-                profile_emb.reshape(1, -1)
-            )[0][0]
-
-            logger.info(f"  Emotion similarity with '{emotion_cat}' profile: {similarity:.4f} (threshold: {threshold:.4f})")
-
-            if similarity > threshold and similarity > best_similarity:
-                best_similarity = similarity
-                best_match = (emotion_cat, float(similarity))
-
-        return best_match
-
     def extract_segment_embedding(
         self,
         audio_file,
@@ -1434,7 +1376,6 @@ class SpeakerRecognitionEngine:
         # Hoist settings lookups out of the per-segment loops.
         settings = get_config().get_settings()
         filter_hallucinations = settings.filter_hallucinations
-        global_emotion_threshold = settings.emotion_threshold
         enable_personalized_emotions = os.getenv("ENABLE_PERSONALIZED_EMOTIONS", "true").lower() == "true"
 
         # Pass 1: drop hallucinations, give each segment its diarization speaker and its own voice embedding (from
@@ -1472,6 +1413,7 @@ class SpeakerRecognitionEngine:
         preloaded_emotion_audio = None
         emotion_preload_failed = False
         transcribed_with_speakers = []
+        calibrations: Dict[int, Optional[emotion_calibration.Calibration]] = {}   # per speaker, for this file / chunk
 
         for (trans_seg, speaker_label, embedding), who in zip(segments, speakers):
             if preloaded_emotion_audio is None and not emotion_preload_failed:
@@ -1490,12 +1432,15 @@ class SpeakerRecognitionEngine:
                 extract_embedding=enable_personalized_emotions,
                 preloaded_audio=preloaded_emotion_audio,
             )
-            if emotion_data:
-                if who["matched_emotion"] is not None:
-                    self._apply_voice_profile_emotion(emotion_data, who)
-                elif enable_personalized_emotions and who["is_known"] and db_session:
-                    self._apply_personalized_emotion(emotion_data, who["speaker"], embedding, db_session,
-                                                     global_emotion_threshold)
+            if emotion_data and enable_personalized_emotions and db_session is not None:
+                # The speaker's emotion corrections adjust how the model's scores are read for them
+                speaker_id = who.get("speaker_id")
+                if speaker_id is not None and speaker_id not in calibrations:
+                    calibrations[speaker_id] = self.speaker_emotion_calibration(speaker_id, db_session)
+                personal = self.calibrated_emotion(emotion_data.get("embedding"), calibrations.get(speaker_id))
+                if personal:
+                    emotion_data.update(emotion_category=personal["emotion"], emotion_confidence=personal["confidence"],
+                                        detector_breakdown=personal["breakdown"])
 
             segment_data = {
                 "start": trans_seg["start"],
@@ -1565,9 +1510,8 @@ class SpeakerRecognitionEngine:
         return embedding
 
     @staticmethod
-    def _speaker(name, speaker_id=None, is_known=False, confidence=0.0, matched_emotion=None) -> Dict:
-        return {"speaker": name, "speaker_id": speaker_id, "is_known": is_known, "confidence": confidence,
-                "matched_emotion": matched_emotion}
+    def _speaker(name, speaker_id=None, is_known=False, confidence=0.0) -> Dict:
+        return {"speaker": name, "speaker_id": speaker_id, "is_known": is_known, "confidence": confidence}
 
     def _identify_segments(self, segments, known_speakers, threshold, db_session) -> List[Dict]:
         """Default (SPEAKER_ASSIGNMENT=segment): match every segment's own embedding against the stored profiles.
@@ -1585,14 +1529,14 @@ class SpeakerRecognitionEngine:
                     # Enhanced matching against ALL voice profiles (general + emotion-specific)
                     match = self.match_speaker_with_all_profiles(embedding, db_session, threshold=threshold)
                     if match:
-                        who = self._speaker(match["speaker_name"], is_known=True, confidence=match["confidence"],
-                                            matched_emotion=match.get("matched_emotion"))
+                        who = self._speaker(match["speaker_name"], match["speaker_id"], is_known=True,
+                                            confidence=match["confidence"])
                 elif known_speakers:
                     # Fallback to old method if no db_session
                     match = self.match_speaker(embedding, known_speakers, threshold)
                     if match:
-                        _, name, confidence = match
-                        who = self._speaker(name, is_known=True, confidence=confidence)
+                        matched_id, name, confidence = match
+                        who = self._speaker(name, matched_id, is_known=True, confidence=confidence)
                         logger.info(f"Matched segment to {name} with confidence {confidence:.2%}")
             if not who["is_known"]:
                 # Consistent mapping from diarization label to Unknown_XX (no label: a generic unknown)
@@ -1811,77 +1755,58 @@ class SpeakerRecognitionEngine:
                 weights.append(min(turn["duration"], CENTROID_MAX_WEIGHT_SEC))
         return _centroid(embeddings, weights)
 
-    def _apply_voice_profile_emotion(self, emotion_data: Dict, who: Dict):
-        """The segment matched one of the speaker's emotion voice profiles: use that as the primary emotion signal."""
-        matched_emotion, confidence, speaker_name = who["matched_emotion"], who["confidence"], who["speaker"]
-        logger.info(f"  🎯 Voice profile match indicates emotion: {matched_emotion}")
+    def speaker_emotion_calibration(self, speaker_id: Optional[int], db_session) -> Optional[emotion_calibration.Calibration]:
+        """How a speaker's emotion corrections adjust the emotion model's scores for them (app/emotion_calibration.py),
+        fitted on their corrected segments now (no cache to go stale after a correction); None without corrections or
+        without the emotion model."""
+        head = self._emotion_head()
+        if speaker_id is None or db_session is None or head is None:
+            return None
+        rows = db_session.query(ConversationSegment.emotion_embedding, ConversationSegment.emotion_category).filter(
+            ConversationSegment.speaker_id == speaker_id,
+            ConversationSegment.emotion_corrected == True,   # noqa: E712
+            ConversationSegment.emotion_misidentified == False,   # noqa: E712 - "leave this correction out"
+            ConversationSegment.is_misidentified == False,   # noqa: E712 - not this speaker's line
+            ConversationSegment.emotion_embedding.isnot(None),
+        ).all()
+        logits, emotions = [], []
+        for blob, emotion in rows:
+            z = self.emotion_logits(np.frombuffer(blob, dtype=np.float32))
+            if z is not None:
+                logits.append(z)
+                emotions.append(emotion)
+        return emotion_calibration.fit(logits, emotions)
 
-        # Create detector breakdown showing voice match as primary
-        emotion_data['detector_breakdown'] = {
-            'emotion2vec_detector': {
-                'emotion': emotion_data['emotion_category'],
-                'confidence': float(emotion_data.get('emotion_confidence', 0.0))
-            },
-            'voice_profile_detector': {
-                'emotion': matched_emotion,
-                'confidence': float(confidence)  # Use speaker match confidence
-            },
-            'final_decision': {
-                'emotion': matched_emotion,
-                'confidence': float(confidence),
-                'reason': f'Matched {speaker_name}_{matched_emotion} voice profile',
-                'voice_profile_available': True
-            }
-        }
+    def emotion_logits(self, embedding) -> Optional[np.ndarray]:
+        """The emotion model's nine logits for a stored 1024-D utterance embedding (its scores are their softmax)."""
+        head = self._emotion_head()
+        if head is None or embedding is None:
+            return None
+        e = np.asarray(embedding, dtype=np.float64).ravel()
+        if e.shape[0] != head[0].shape[1] or not np.isfinite(e).all():
+            return None
+        return head[0] @ e + head[1]
 
-        # Override emotion with voice profile match
-        emotion_data['emotion_category'] = matched_emotion
-        emotion_data['emotion_confidence'] = float(confidence)  # Convert to Python float
+    def calibrated_emotion(self, embedding, calibration: Optional[emotion_calibration.Calibration]) -> Optional[Dict]:
+        """One line's emotion under its speaker's calibration: {"emotion", "confidence", "breakdown"}, or None."""
+        if calibration is None:
+            return None
+        z = self.emotion_logits(embedding)
+        return None if z is None else emotion_calibration.decide(z, calibration)
 
-        logger.info(f"  🔬 Enhanced Match Results:")
-        logger.info(f"     emotion2vec: {emotion_data['detector_breakdown']['emotion2vec_detector']['emotion']} ({emotion_data['detector_breakdown']['emotion2vec_detector']['confidence']:.2%})")
-        logger.info(f"     Voice profile: {matched_emotion} ({confidence:.2%})")
-        logger.info(f"     Final: {matched_emotion} - Matched emotion voice profile")
-
-    def _apply_personalized_emotion(self, emotion_data: Dict, speaker_name: str, voice_embedding, db_session,
-                                    global_emotion_threshold: float):
-        """Known speaker with learned emotion profiles: let the dual detector make the final emotion decision."""
-        emotion_embedding = emotion_data.get('embedding')
-        if emotion_embedding is None:
-            return
-        try:
-            speaker = db_session.query(Speaker).filter(Speaker.name == speaker_name).first()
-            if not (speaker and speaker.emotion_profiles):
-                return
-            dual_result = self.match_emotion_dual_detector(
-                emotion_embedding=emotion_embedding,
-                voice_embedding=voice_embedding,
-                speaker_emotion_profiles=speaker.emotion_profiles,
-                global_threshold=global_emotion_threshold,
-                speaker_threshold=speaker.emotion_threshold,
-                generic_emotion=emotion_data['emotion_category'],
-                generic_confidence=emotion_data['emotion_confidence'],
-            )
-
-            # Use final decision from dual-detector
-            final = dual_result['final_decision']
-            emotion_data['emotion_category'] = final['emotion']
-            emotion_data['emotion_confidence'] = final['confidence']
-
-            # Store detector breakdown for client display
-            emotion_data['detector_breakdown'] = dual_result
-
-            logger.info(f"  🔬 Dual-Detector Results:")
-            logger.info(f"     Detector 1 (emotion2vec): {dual_result['emotion2vec_detector']['emotion']} ({dual_result['emotion2vec_detector']['confidence']:.2%})")
-            if dual_result['voice_profile_detector']:
-                logger.info(f"     Detector 2 (voice profile): {dual_result['voice_profile_detector']['emotion']} ({dual_result['voice_profile_detector']['confidence']:.2%})")
-            else:
-                logger.info(f"     Detector 2 (voice profile): Not available")
-            logger.info(f"     Final: {final['emotion']} ({final['confidence']:.2%}) - {final['reason']}")
-
-        except Exception as e:
-            logger.info(f"  Warning: Personalized emotion matching failed: {e}")
-            # Fall back to generic emotion detection
+    def _emotion_head(self):
+        """(W, b) of the emotion model's scoring layer, or None if the model is not loaded or has another shape."""
+        head = getattr(self, "_emotion_head_cache", None)
+        if head is None:
+            model = self._emotion_model
+            proj = getattr(getattr(model, "model", None), "proj", None) if model is not None else None
+            weight = getattr(proj, "weight", None)
+            if weight is None or tuple(weight.shape)[0] != len(emotion_calibration.LABELS):
+                return None
+            head = (weight.detach().float().cpu().numpy().astype(np.float64),
+                    proj.bias.detach().float().cpu().numpy().astype(np.float64))
+            self._emotion_head_cache = head
+        return head
 
     def _all_profiles(self, db_session) -> List[Dict[str, Any]]:
         """Every voice profile (general + emotion-specific): the warm cache, else one DB scan (memoized)."""
@@ -1939,125 +1864,3 @@ class SpeakerRecognitionEngine:
             logger.info(f"  ❌ No match found above threshold {threshold:.2%}")
 
         return best_match
-
-    def match_emotion_dual_detector(
-        self,
-        emotion_embedding,
-        voice_embedding,
-        speaker_emotion_profiles,
-        global_threshold=0.6,
-        speaker_threshold=None,
-        generic_emotion="neutral",
-        generic_confidence=0.0
-    ):
-        """Dual-detector emotion matching using both emotion2vec and voice profiles"""
-
-
-        # Validate inputs
-        if np.isnan(emotion_embedding).any() or np.isnan(voice_embedding).any():
-            return {
-                "emotion2vec_detector": {"emotion": generic_emotion, "confidence": float(generic_confidence)},
-                "voice_profile_detector": None,
-                "final_decision": {"emotion": generic_emotion, "confidence": float(generic_confidence), "reason": "Invalid embeddings", "voice_profile_available": False}
-            }
-
-        if not speaker_emotion_profiles:
-            return {
-                "emotion2vec_detector": {"emotion": generic_emotion, "confidence": float(generic_confidence)},
-                "voice_profile_detector": None,
-                "final_decision": {"emotion": generic_emotion, "confidence": float(generic_confidence), "reason": "No profiles", "voice_profile_available": False}
-            }
-
-        # Get SPEAKER_THRESHOLD for voice profile matching (512-D embeddings)
-        default_speaker_threshold = get_config().get_settings().speaker_threshold
-
-        # DETECTOR 1: emotion2vec (uses EMOTION_THRESHOLD for 1024-D embeddings)
-        detector1_best = None
-        detector1_confidence = 0.0
-        default_emotion_threshold = speaker_threshold if speaker_threshold is not None else global_threshold
-        
-        for profile in speaker_emotion_profiles:
-            profile_emb = profile.get_embedding()
-            if profile_emb is None or np.isnan(profile_emb).any():
-                continue
-
-            threshold = profile.confidence_threshold if profile.confidence_threshold is not None else default_emotion_threshold
-            similarity = cosine_similarity(emotion_embedding.reshape(1, -1), profile_emb.reshape(1, -1))[0][0]
-
-            if similarity > threshold and similarity > detector1_confidence:
-                detector1_confidence = similarity
-                detector1_best = profile.emotion_category
-        
-        detector1_result = {
-            "emotion": detector1_best or generic_emotion,
-            "confidence": float(detector1_confidence) if detector1_best else float(generic_confidence)
-        }
-
-        # DETECTOR 2: Voice profile (uses SPEAKER_THRESHOLD for 512-D embeddings)
-        voice_matches = []
-        voice_best = None
-        voice_best_confidence = 0.0
-        # MIN_VOICE_SAMPLES defined at module level
-
-        for profile in speaker_emotion_profiles:
-            voice_emb = profile.get_voice_embedding()
-            if voice_emb is None or np.isnan(voice_emb).any() or profile.voice_sample_count < MIN_VOICE_SAMPLES:
-                continue
-
-            voice_threshold = profile.voice_threshold if profile.voice_threshold is not None else default_speaker_threshold
-            voice_sim = cosine_similarity(voice_embedding.reshape(1, -1), voice_emb.reshape(1, -1))[0][0]
-
-            voice_matches.append({
-                "emotion": profile.emotion_category,
-                "similarity": float(voice_sim),
-                "threshold": float(voice_threshold),
-                "samples": profile.voice_sample_count
-            })
-
-            if voice_sim > voice_threshold and voice_sim > voice_best_confidence:
-                voice_best_confidence = voice_sim
-                voice_best = profile.emotion_category
-
-        detector2_result = {
-            "emotion": voice_best,
-            "confidence": float(voice_best_confidence),
-            "matches": voice_matches
-        }
-        detector2_has_diagnostics = bool(voice_matches)
-        # detector2_available is True only when at least one voice profile had
-        # enough samples AND produced an above-threshold opinion. A missing
-        # detector-2 result must be treated as "no second opinion", not as a
-        # literal "neutral" prediction — otherwise the combiner neutralises
-        # every confident detector-1 label as soon as the speaker has fewer
-        # than MIN_VOICE_SAMPLES corrections.
-        detector2_available = voice_best is not None
-
-        # COMBINE
-        d1_emotion = detector1_result["emotion"]
-        d1_conf = detector1_result["confidence"]
-        d2_emotion = detector2_result["emotion"]
-        d2_conf = detector2_result["confidence"]
-
-        if d1_emotion == "neutral" or d1_emotion == "<unk>":
-            final = {"emotion": "neutral", "confidence": float(d1_conf), "reason": "emotion2vec neutral", "voice_profile_available": detector2_available}
-        elif not detector2_available:
-            final = {"emotion": d1_emotion, "confidence": float(d1_conf), "reason": "emotion2vec only (no voice profile match)", "voice_profile_available": False}
-        elif d1_emotion == d2_emotion and d1_conf > DUAL_DETECTOR_AGREE_D1 and d2_conf > DUAL_DETECTOR_AGREE_D2:
-            final = {"emotion": d1_emotion, "confidence": float((d1_conf + d2_conf) / 2), "reason": "Both agree", "voice_profile_available": True}
-        elif d2_conf > VOICE_STRONG_THRESHOLD:
-            final = {"emotion": d2_emotion, "confidence": float(d2_conf), "reason": f"Voice strong: {d2_emotion}", "voice_profile_available": True}
-        elif d1_emotion != d2_emotion:
-            final = {"emotion": "neutral", "confidence": float(max(d1_conf, d2_conf)), "reason": f"Disagree: {d1_emotion} vs {d2_emotion}", "voice_profile_available": True}
-        else:
-            final = {"emotion": d1_emotion, "confidence": float(d1_conf), "reason": "Agree low conf", "voice_profile_available": True}
-
-        return {
-            "emotion2vec_detector": detector1_result,
-            # Keep below-threshold similarities visible for diagnostics while
-            # still treating them as no second opinion in decision logic.
-            "voice_profile_detector": (
-                detector2_result if detector2_has_diagnostics else None
-            ),
-            "final_decision": final
-        }
-

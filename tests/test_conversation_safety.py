@@ -39,6 +39,9 @@ class FakeEngine:
     def clear_speaker_cache(self):
         return None
 
+    def speaker_emotion_calibration(self, *_args):
+        return None   # no emotion corrections
+
     def clear_gpu_cache(self):
         return None
 
@@ -386,6 +389,13 @@ def test_recalculate_emotions_decodes_conversation_once(db_session, tmp_path):
             self.extract_calls += 1
             return {"emotion_category": "happy", "emotion_confidence": 0.8}
 
+        def speaker_emotion_calibration(self, _speaker_id, _db):
+            return None   # no corrections: the model's emotion stands
+
+        def calibrated_emotion(self, _embedding, calibration):
+            assert calibration is None
+            return None
+
         def clear_gpu_cache(self):
             return None
 
@@ -526,7 +536,10 @@ def test_identify_retroactive_emotion_preloads_once_per_audio_path(
             self.extract_calls += 1
             return {"embedding": np.ones(4, dtype=np.float32)}
 
-        def match_emotion_to_profile(self, *_args, **_kwargs):
+        def speaker_emotion_calibration(self, _speaker_id, _db):
+            return object()   # the speaker has corrections: their lines' emotions are read again
+
+        def calibrated_emotion(self, *_args):
             return None
 
         def clear_gpu_cache(self):

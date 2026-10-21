@@ -74,12 +74,13 @@ class SpeakerEmotionProfile(Base):
 
     # Metadata
     sample_count = Column(Integer, default=1)  # How many corrections went into this
-    confidence_threshold = Column(Float, nullable=True)  # Per-speaker-per-emotion threshold (NULL = use speaker/global)
+    confidence_threshold = Column(Float, nullable=True)  # no longer used: emotions are read by calibration
     
-    # Voice embedding for this specific emotion (512-D from pyannote) - NEW for dual-detector system
+    # The speaker's voice over the lines corrected to this emotion: an extra voice sample of them for per-segment
+    # identification (SPEAKER_ASSIGNMENT=segment); it does not decide emotions
     voice_embedding = Column(LargeBinary, nullable=True)  # Voice signature when expressing THIS emotion
     voice_sample_count = Column(Integer, default=0)  # How many voice samples in this emotion profile
-    voice_threshold = Column(Float, nullable=True)  # Custom threshold for voice matching (NULL = use speaker/global)
+    voice_threshold = Column(Float, nullable=True)  # no longer used
 
     created_at = Column(DateTime, default=utc_now)
     updated_at = Column(DateTime, default=utc_now, onupdate=utc_now)
@@ -182,9 +183,9 @@ class ConversationSegment(Base):
     # Emotion correction tracking (for personalized learning)
     emotion_corrected = Column(Boolean, default=False, nullable=False)  # True if user manually corrected
     emotion_corrected_at = Column(DateTime, nullable=True)  # When correction was made
-    emotion_misidentified = Column(Boolean, default=False, nullable=False)  # True if emotion correction was wrong (exclude from profile)
+    emotion_misidentified = Column(Boolean, default=False, nullable=False)  # the correction is not learned from (marked wrong, or learn=false)
 
-    # Dual-detector breakdown (JSON string with both detector results)
+    # How the emotion was decided: emotion2vec's answer and the speaker's calibration (app/emotion_calibration.py)
     detector_breakdown = Column(Text, nullable=True)  # JSON string with detector breakdown for transparency
 
     # Word-level transcription data with confidence scores (JSON)

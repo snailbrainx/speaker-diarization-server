@@ -2,7 +2,7 @@
 
 The app imports torch/pyannote/faster-whisper at module level, but the defects
 under regression test (restore atomicity, streaming finalisation, config races,
-the dual-detector combiner, SQLite pragmas) live in plain Python + SQLAlchemy.
+emotion calibration, SQLite pragmas) live in plain Python + SQLAlchemy.
 When the heavy stack is absent we install minimal import-time stubs; when it is
 present the real modules are used unchanged.
 

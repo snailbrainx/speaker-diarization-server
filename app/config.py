@@ -34,7 +34,7 @@ class VoiceSettings(BaseModel):
     context_padding: float = Field(default=0.15, ge=0.05, le=2.0, description="Context padding for embeddings (seconds)")
     silence_duration: float = Field(default=0.5, ge=0.1, le=5.0, description="Silence duration for streaming (seconds)")
     filter_hallucinations: bool = Field(default=True, description="Filter common Whisper hallucinations")
-    emotion_threshold: float = Field(default=0.6, ge=0.3, le=1.0, description="Global emotion matching threshold (0.3-1.0)")
+    emotion_threshold: float = Field(default=0.6, ge=0.3, le=1.0, description="Unused since emotions are personalised by calibration; kept for compatibility")
 
 
 class ConfigManager:

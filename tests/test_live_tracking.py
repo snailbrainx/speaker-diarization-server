@@ -143,7 +143,8 @@ def test_provisional_segments_take_their_tracks_speaker_later(db):
             pass
 
     updates = _relabel_tracks(db, conv.id, lt.SessionTracks(), [{"track": track}], Eng())
-    assert updates == [{"segment_ids": [seg.id], "speaker_id": ann, "speaker_name": "Ann", "is_known": True}]
+    assert updates == [{"segment_ids": [seg.id], "speaker_id": ann, "speaker_name": "Ann", "is_known": True,
+                        "emotions": {}}]   # Ann has no emotion corrections: emotions stay as they were
     db.expire_all()
     assert db.get(ConversationSegment, seg.id).speaker_name == "Ann"
 

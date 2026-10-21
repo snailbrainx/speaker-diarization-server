@@ -53,7 +53,7 @@ The screenshots below are from an older version of the separate example
 - **Persistent speaker identity** — enroll a voice once, recognized across every future recording.
 - **Retroactive updates** — identify one segment and every past segment with that voice re-labels automatically.
 - **Transcription** — NVIDIA Parakeet-TDT (the default for English: faster, lower WER on meetings) or faster-whisper (`ASR_BACKEND=whisper`: `large-v3` or any Whisper variant, 99 languages), word-level timestamps.
-- **Dual-detector emotion recognition** — emotion2vec+ (general) combined with per-speaker voice profiles (personalized). 9 categories.
+- **Emotion recognition** — emotion2vec+ per segment, 9 categories, read for each speaker with their own corrections (personal calibration).
 - **Live streaming** — WebSocket audio cut at pauses by a speech detector (Silero VAD); each voice is tracked through the session and named from everything it has said, so strangers stay one `Unknown` and known people are recognised within seconds.
 - **Batch processing** — multi-GPU script for bulk ingest (`run_batch.sh`).
 - **Web interface** at `/ui/` — live recording, uploads, conversations, speakers, backups and settings in the browser (see [Web interface](#web-interface)).
@@ -178,7 +178,7 @@ All configuration is environment variables (see `.env.example` for the curated l
 | `CONTEXT_PADDING`        | `0.15`   | Seconds of audio added around a segment before embedding.      |
 | `SILENCE_DURATION`       | `0.5`    | Streaming: seconds without speech (Silero VAD) before a buffered chunk of at least 2.5 s is processed. |
 | `FILTER_HALLUCINATIONS`  | `true`   | Drop Whisper filler phrases ("thank you.", etc.).              |
-| `EMOTION_THRESHOLD`      | `0.6`    | Global emotion-match sensitivity. Higher → stricter.           |
+| `EMOTION_THRESHOLD`      | `0.6`    | No longer used (emotions are personalised by calibration); kept so existing settings load. |
 
 ### Models
 
@@ -191,7 +191,7 @@ All configuration is environment variables (see `.env.example` for the curated l
 | `SPEAKER_EMBEDDING_MODEL`      | `pyannote/wespeaker-voxceleb-resnet34-LM` | Voice-embedding model behind speaker identification (see [Voice embeddings](#voice-embeddings)). `pyannote/embedding` = the original. Stored voices are rebuilt automatically when it changes. |
 | `DIARIZATION_BACKEND`          | `pyannote`                       | Diarization runtime: `pyannote` or `speakrs`, the same community-1 models and clustering in Rust/CUDA (see [Diarization runtime](#diarization-runtime-pyannote-or-speakrs)). |
 | `EMOTION_MODEL`                | `iic/emotion2vec_plus_large`     | FunASR emotion model ID.                            |
-| `ENABLE_PERSONALIZED_EMOTIONS` | `true`                           | Use per-speaker voice profiles in emotion matching. |
+| `ENABLE_PERSONALIZED_EMOTIONS` | `true`                           | Read each speaker's emotions with their corrections (see [Personal calibration](#personal-calibration)); stores each segment's emotion embedding. |
 | `OFFLINE_MODE`                 | `false`                          | Force cached models only; never hit the hub.        |
 
 ### GPU
@@ -325,7 +325,8 @@ voice, a track's voice is the mean of everything it has said so far, and a track
 clearly matches one stored speaker (similarity ≥ 0.62 and 0.05 above the next; one short line can be enough). Until
 then it is one `Unknown` of its own, the same for all its lines, and stored at once: a voice heard in one session is
 the same `Unknown` in the next. When a track gets a name, its earlier lines are renamed and the client receives a
-`speaker_update` message (`segment_ids`, `speaker_id`, `speaker_name`, `is_known`). Identifying any one line of an
+`speaker_update` message (`segment_ids`, `speaker_id`, `speaker_name`, `is_known`, and `emotions`: the lines' emotions
+read again with the speaker's corrections, if they have any). Identifying any one line of an
 `Unknown` names all of them, in every conversation.
 
 Since every new voice is kept, stray ones (a word from the TV, a cough) collect as Unknowns too. The web interface's
@@ -419,7 +420,7 @@ upload / WS chunk (live: cut at pauses by Silero VAD)
         optional: overlapping voices separated and transcribed
                       │
                       ▼
-        emotion2vec (1024-D) + optional voice-profile emotion match
+        emotion2vec (9 emotions), read with the speaker's corrections
                       │
                       ▼
              ConversationSegment  →  SQLite (WAL)
@@ -437,8 +438,7 @@ Key behaviors:
 - **Auto-enrollment** — an unidentified voice gets one `Unknown_*` profile (per diarization speaker in a file, per track in a live session) so it accumulates samples. Identify one of its segments and every segment with that `Unknown_*` is relabelled.
 - **Cluster mode** (`SPEAKER_ASSIGNMENT=cluster`, the default for files) — instead of matching each segment's embedding on its own, each pyannote speaker is matched once from the centroid of all its segments, so one person gets one label per file (one `Unknown_N` if not enrolled) and a single identify names them everywhere.
 - **Misidentified-flag** — segments flagged `is_misidentified` are excluded from embedding averaging, keeping profiles clean.
-- **Dual-detector emotion** — emotion2vec always runs; if the speaker has ≥ 3 voice samples for an emotion, a voice-profile detector also runs. Best match wins with deterministic tie-break rules.
-- **Personalized learning** — user emotion corrections store both the 1024-D emotion embedding and the voice embedding, merged with weighted averaging into the speaker's profile.
+- **Personal emotion calibration** — a speaker's emotion corrections adjust how emotion2vec's scores are read for them (see [Personal calibration](#personal-calibration)).
 
 ## Emotion Recognition
 
@@ -448,53 +448,62 @@ emotion2vec+ large classifies each segment into one of these labels:
 
 `angry` · `disgusted` · `fearful` · `happy` · `neutral` · `other` · `sad` · `surprised` · `unknown`
 
-### Dual-detector decision
+### Personal calibration
 
-Every segment runs the emotion2vec base detector. If the speaker has **≥ 3 user-corrected samples** for any emotion, a second per-speaker voice-profile detector runs in parallel. The two scores are combined:
+emotion2vec+ reads each line on its own, and some voices sit where it hears the same emotion every time: an upbeat
+speaking voice is often called `happy` line after line. Correcting a few of a speaker's lines teaches the server how to
+read that speaker.
 
-| Case                                        | Final emotion                     |
-|---------------------------------------------|-----------------------------------|
-| Only emotion2vec has a confident match      | emotion2vec winner                |
-| emotion2vec returns `neutral` or `<unk>`    | `neutral`                         |
-| Both detectors agree                        | agreed emotion (higher confidence)|
-| Detectors disagree                          | `neutral` (conservative fallback) |
-| Voice-profile detector wins (≥ threshold)   | profile winner                    |
+emotion2vec's nine scores are a softmax over a linear layer applied to the 1024-D utterance embedding stored with every
+segment, so each corrected line gives the model's raw scores and the emotion it really was, without its audio. From a
+speaker's corrections the server fits one offset per emotion, pulled towards zero so that a few corrections move only
+the doubtful lines, and reads each later line of that speaker with those offsets: an emotion the model calls too often
+for them is turned down, one it misses is turned up. Clear emotions stay what they are.
 
-The server returns the raw scores from both detectors so clients can override the fallback if they want.
+1. Three of Ann's ordinary lines come back `happy`; correct them:
+   `POST /api/v1/conversations/{id}/segments/{sid}/correct-emotion?corrected_emotion=neutral`.
+2. Ann's later lines (and "Recalculate emotions" on earlier conversations) read her ordinary lines as `neutral`; her
+   angry, sad or surprised lines are unchanged.
+3. `learn=false` fixes one line without learning from it; `PATCH .../emotion-misidentified` leaves an existing
+   correction out of the learning; `DELETE /api/v1/conversations/speakers/{id}/emotion-profiles` forgets a speaker's
+   corrections (the lines keep their emotions). `GET .../emotion-profiles` shows what was learned.
 
-### Personalization flow
+Measured on RAVDESS (24 actors, 8 acted emotions, 1,433 clips): each actor's corrections, then their other clips read
+by the server, against emotion2vec on its own and against the per-emotion profiles used before (an emotion profile and
+a voice profile per emotion, compared by embedding similarity):
 
-1. User uploads audio → segment 7 is labeled `neutral` by emotion2vec with 0.94 confidence.
-2. User disagrees, `POST /api/v1/conversations/{id}/segments/7/correct-emotion` with `{"emotion_category": "surprised"}`.
-3. Server stores both the **1024-D emotion2vec embedding** and the **voice embedding** into the speaker's `surprised` profile, averaged with any previous samples (EWMA-style).
-4. Once that profile reaches 3 samples, the voice-profile detector activates for this speaker's future segments.
-5. When a later segment has similar vocal characteristics, the voice-profile detector returns `surprised` above threshold and wins over the emotion2vec guess.
+| Corrections per actor | emotion2vec alone | previous profiles | calibration |
+|---|---|---|---|
+| 3 clips corrected to neutral | 92.5% | 18.1% | **92.5%** |
+| 2 clips corrected per emotion | 93.5% | 88.6% | **93.4%** |
 
-Corrections also set `emotion_corrected=true` on the segment, so they are kept out of personalization training loops (no feedback contamination).
+One person's lines are alike whatever they feel, so the previous profiles matched nearly every line once three were
+corrected to neutral (angry clips recognised 96% → 6%). Acted clips are seldom misread the same way twice, so RAVDESS
+only shows that calibration costs nothing; its gain is on a voice the model misreads consistently. On conversational
+recordings of a speaker it called `happy` throughout, three ordinary lines corrected to neutral turned their other
+ordinary lines neutral and left their angry, disgusted, sad and surprised lines as they were.
 
-### Example — dual-detector output
-
-Segment from a laughing 10 s clip with no prior voice profile for this speaker:
+### Example — a line read with corrections
 
 ```json
 {
-  "text": "Oh my god that is funny. Oh wow. Oh that's brilliant.",
+  "text": "Is everything okay?",
   "emotion_category": "neutral",
-  "emotion_confidence": 0.937,
+  "emotion_confidence": 0.71,
   "detector_breakdown": {
-    "emotion2vec_detector": { "emotion": "surprised", "confidence": 0.937 },
-    "voice_profile_detector": null,
-    "final_decision": {
-      "emotion": "neutral",
-      "confidence": 0.937,
-      "reason": "Disagree: surprised vs neutral",
-      "voice_profile_available": false
-    }
+    "emotion2vec": { "emotion": "happy", "confidence": 0.67 },
+    "personal_calibration": {
+      "corrections": 3,
+      "offsets": { "angry": -0.02, "disgusted": -0.01, "fearful": -0.01, "happy": -0.62, "neutral": 0.69,
+                   "other": -0.01, "sad": -0.01, "surprised": -0.01, "<unk>": 0.0 }
+    },
+    "final_decision": { "emotion": "neutral", "confidence": 0.71,
+                        "reason": "emotion2vec read with 3 correction(s) of this speaker" }
   }
 }
 ```
 
-emotion2vec said *surprised* but the personalized detector is unavailable (no 3+ samples yet), so the server falls back to `neutral`. After three corrections to `surprised` for this speaker, the profile detector would agree and the final decision flips.
+Lines of a speaker without corrections carry emotion2vec's answer and no breakdown.
 
 ## REST API
 
@@ -503,7 +512,7 @@ Full interactive docs at `/docs` (Swagger UI). The OpenAPI JSON is at `/openapi.
 - `GET /api/v1/status` — health + GPU.
 - `GET /api/v1/speakers`, `POST /api/v1/speakers/enroll`, `PATCH /api/v1/speakers/{id}/rename`, `DELETE /api/v1/speakers/{id}`, `DELETE /api/v1/speakers/unknown/all` — list (with seconds of speech and when last heard), enroll, rename, delete (`?max_seconds=` deletes only Unknowns heard for at most that long).
 - `GET /api/v1/speakers/{id}/segments` — a speaker's segments, newest (`order=recent`) or longest first; `GET /api/v1/speakers/unknown/matches` — each Unknown with the closest enrolled person and the closest other Unknown.
-- `GET/DELETE /api/v1/conversations/speakers/{id}/emotion-profiles`, `GET/PATCH .../emotion-threshold`, `PATCH .../emotion-profiles/{emotion}/{threshold,voice-threshold}` — emotion profiles and thresholds.
+- `GET/DELETE /api/v1/conversations/speakers/{id}/emotion-profiles` — a speaker's emotion corrections and what was learned from them (`calibration`), or forget them. `GET/PATCH .../emotion-threshold` and `PATCH .../emotion-profiles/{emotion}/{threshold,voice-threshold}` are deprecated and have no effect.
 - `GET /api/v1/conversations`, `GET/PATCH/DELETE /api/v1/conversations/{id}` — list, read, rename, delete conversations.
 - `POST /api/v1/conversations/{id}/reprocess`, `POST /api/v1/conversations/{id}/recalculate-emotions` — re-run pipelines.
 - `POST /api/v1/conversations/{id}/segments/{sid}/{identify,correct-emotion}`, `PATCH .../{misidentified,emotion-misidentified}` — segment corrections.
@@ -564,10 +573,8 @@ curl -X POST http://localhost:8418/api/v1/conversations/42/segments/911/identify
   -H 'Content-Type: application/json' \
   -d '{"speaker_name": "Alice", "enroll": true}'
 
-# Correct an emotion (feeds personalization)
-curl -X POST http://localhost:8418/api/v1/conversations/42/segments/911/correct-emotion \
-  -H 'Content-Type: application/json' \
-  -d '{"emotion_category": "surprised"}'
+# Correct an emotion (the speaker's later lines are read with it)
+curl -X POST "http://localhost:8418/api/v1/conversations/42/segments/911/correct-emotion?corrected_emotion=surprised"
 ```
 
 ## MCP Server
