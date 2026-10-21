@@ -4,11 +4,34 @@
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![CUDA 12.8](https://img.shields.io/badge/CUDA-12.8-green.svg)](https://developer.nvidia.com/cuda-toolkit)
 
-GPU-accelerated speaker diarization, transcription, and emotion recognition with a REST API, WebSocket streaming, and an MCP server for AI agents. Combines pyannote.audio + faster-whisper or NVIDIA Parakeet + emotion2vec into one FastAPI service with persistent speaker identity across conversations.
+GPU-accelerated speaker diarization, transcription, and emotion recognition with a web interface, a REST API, WebSocket streaming, and an MCP server for AI agents. Combines pyannote.audio + faster-whisper or NVIDIA Parakeet + emotion2vec into one FastAPI service with persistent speaker identity across conversations.
 
-## Screenshots
+## Web interface
 
-The server itself is headless: everything goes through the REST API, the WebSocket stream and the MCP server.
+The server comes with a web interface at `/ui/` (opening the server's address in a browser goes there). It is plain
+HTML, CSS and JavaScript served by the server itself, with no build step and nothing loaded from the internet, and it
+only uses the public API, so it doubles as an example client.
+
+- **Live** — record from a microphone, or stream an audio file at real-time pace (or 2×/4×), and watch lines arrive
+  with their speakers and emotions; voices start as `Unknown`, are renamed as the session recognises them
+  (`speaker_update`), and can be named on the spot. Shows the delay from the end of speech to each line, and an event
+  log of the WebSocket messages.
+- **Transcribe a file** — upload a recording and see the result with the processing speed.
+- **Conversations** — every upload and live recording: the recording with a timeline of who spoke when, talk time
+  and emotions per speaker, and the transcript with words under 50% confidence underlined and the word being played
+  highlighted. Name a voice, move a line to someone else, leave a line out of a voice profile, correct an emotion,
+  recalculate emotions, reprocess, export (text, subtitles, JSON).
+- **Speakers** — enrol someone from a sample or a recording made in the browser, rename, delete, name or clear
+  `Unknown` voices, and tune each person's emotion profile.
+- **Backups** — save, restore, checkpoint, download and import profiles.
+- **Settings** — the runtime settings (`/api/v1/settings/voice`) and server status.
+
+Browsers only allow the microphone on HTTPS pages (or on `localhost`): to record from another machine, run
+`./generate_cert.sh` once to create a self-signed certificate in `certs/`, restart the server, open
+`https://<host>:8418/` and accept the certificate warning (see [Remote access](#remote-access)).
+
+### Screenshots
+
 The screenshots below are from an older version of the separate example
 [Next.js frontend](https://github.com/snailbrainx/speaker_identity_nextjs) and may not match the current API or features.
 
@@ -33,6 +56,7 @@ The screenshots below are from an older version of the separate example
 - **Dual-detector emotion recognition** — emotion2vec+ (general) combined with per-speaker voice profiles (personalized). 9 categories.
 - **Live streaming** — WebSocket audio cut at pauses by a speech detector (Silero VAD); each voice is tracked through the session and named from everything it has said, so strangers stay one `Unknown` and known people are recognised within seconds.
 - **Batch processing** — multi-GPU script for bulk ingest (`run_batch.sh`).
+- **Web interface** at `/ui/` — live recording, uploads, conversations, speakers, backups and settings in the browser (see [Web interface](#web-interface)).
 - **REST API** at `/api/v1/*` with interactive Swagger docs at `/docs`.
 - **MCP server** at `/mcp` (JSON-RPC 2.0 / HTTP) exposing 11 tools for Claude Desktop, Flowise, or any MCP client.
 - **Backup/restore** — export speakers + segments + settings as JSON profiles and checkpoints.
@@ -90,6 +114,7 @@ cp .env.example .env           # edit HF_TOKEN
 
 ### 4. Verify
 
+- Web interface: `http://<host>:8418/` (`https://` once a certificate is in `certs/`)
 - Swagger UI: `http://<host>:8418/docs`
 - Health: `curl http://<host>:8418/api/v1/status`
 - MCP: `http://<host>:8418/mcp`
@@ -103,6 +128,17 @@ ssh -L 8418:localhost:8418 user@host
 ```
 
 For network deployments put it behind a reverse proxy (nginx + HTTPS + auth). WebSocket microphone capture in browsers **requires HTTPS/WSS** — place `cert.pem`/`key.pem` in `certs/` and the server starts in HTTPS mode automatically.
+
+On a trusted local network a self-signed certificate is enough:
+
+```bash
+./generate_cert.sh                    # localhost, this machine's name and IP addresses
+./generate_cert.sh 192.168.1.20 nas   # or add names and addresses of your own
+docker compose restart
+```
+
+Browsers warn about a self-signed certificate once per address; accept it, or import `certs/cert.pem` as trusted on
+the devices you use. The key is readable only by its owner, and the container reads it as uid 1000.
 
 ## Configuration
 
@@ -458,6 +494,7 @@ Full interactive docs at `/docs` (Swagger UI). The OpenAPI JSON is at `/openapi.
 - `POST /api/v1/conversations/{id}/reprocess`, `POST /api/v1/conversations/{id}/recalculate-emotions` — re-run pipelines.
 - `POST /api/v1/conversations/{id}/segments/{sid}/{identify,correct-emotion}`, `PATCH .../{misidentified,emotion-misidentified}` — segment corrections.
 - `GET /api/v1/conversations/segments/{sid}/audio` — extract segment audio.
+- `GET /api/v1/conversations/{id}/audio` — the whole recording (an upload as processed, a live recording once finished); answers range requests, so players can seek.
 - `POST /api/v1/process` — upload and process a whole file (form field `diarize=false` skips speaker diarization when one person is talking: faster, one speaker, still matched against the stored voices).
 - `GET/POST /api/v1/settings/voice`, `POST /api/v1/settings/voice/reset` — runtime-tunable voice settings.
 - `GET/POST /api/v1/profiles`, checkpoints, download, import, restore — backup/restore.
@@ -583,7 +620,7 @@ speaker once in a recent conversation (the profile is then rebuilt from all of t
 
 **Speaker not recognized** — enroll with 10–30 s of clean audio. In cluster mode the threshold is `CLUSTER_SPEAKER_THRESHOLD` (0.60), live it is the track threshold (0.70, after 2 s of speech); speakers with only a few seconds of enrolled speech may stay `Unknown` until identified in more recordings. With per-segment matching (`SPEAKER_ASSIGNMENT=segment`), lower `SPEAKER_THRESHOLD` to ~0.20 for challenging audio (movies, music).
 
-**Browser microphone not working** — WebSocket mic capture requires HTTPS. Generate or drop a cert/key into `certs/`.
+**Browser microphone not working** — browsers allow the microphone only on HTTPS pages or `localhost`. Run `./generate_cert.sh` (or drop your own `cert.pem`/`key.pem` into `certs/`), restart, open `https://<host>:8418/` and accept the certificate warning. The web interface can still stream an audio file without a microphone.
 
 ## License
 
