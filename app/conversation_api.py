@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 from typing import Optional
 import asyncio
 import json
+import mimetypes
 import os
 
 from .database import get_db, utc_now
@@ -117,6 +118,26 @@ async def get_conversation(conversation_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Conversation not found")
 
     return conversation
+
+
+@router.get("/{conversation_id}/audio")
+async def get_conversation_audio(conversation_id: int, db: Session = Depends(get_db)):
+    """The conversation's whole recording: an upload as it was processed, a live recording once it has finished.
+    Answers HTTP range requests, so a player can seek in a long recording without downloading all of it."""
+    conversation = db.query(Conversation).filter(
+        Conversation.id == conversation_id
+    ).first()
+    if not conversation:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    if not conversation.audio_path or not os.path.exists(conversation.audio_path):
+        raise HTTPException(status_code=404, detail="Audio file not found")
+    ext = os.path.splitext(conversation.audio_path)[1].lower()
+    return FileResponse(
+        path=conversation.audio_path,
+        media_type=mimetypes.guess_type(conversation.audio_path)[0] or "application/octet-stream",
+        filename=f"conversation_{conversation_id}{ext}",
+        content_disposition_type="inline",
+    )
 
 
 @router.patch("/{conversation_id}", response_model=ConversationResponse)

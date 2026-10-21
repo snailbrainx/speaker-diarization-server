@@ -54,6 +54,7 @@ class ConversationSegmentResponse(BaseModel):
     words: Optional[List[Word]] = None
     avg_logprob: Optional[float] = None
     is_misidentified: bool = False
+    is_overlap: bool = False  # words recovered from a second voice talking over someone (OVERLAP_SEPARATION)
 
     @field_validator('detector_breakdown', mode='before')
     @classmethod

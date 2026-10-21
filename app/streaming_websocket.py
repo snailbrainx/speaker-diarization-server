@@ -489,6 +489,7 @@ async def _handle_segment_processed(
 
             segments_data.append({
                 "segment_id": segment.id,
+                "speaker_id": segment.speaker_id,
                 "speaker_name": segment.speaker_name,
                 "text": segment.text,
                 "start_offset": float(segment.start_offset),
