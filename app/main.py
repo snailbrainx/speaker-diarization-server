@@ -1,4 +1,5 @@
 import warnings
+import gc
 import os
 import logging
 
@@ -83,7 +84,7 @@ async def lifespan(app: FastAPI):
     engine = get_engine()
 
     # Load models (this loads into CPU/RAM but may not allocate VRAM yet)
-    whisper = engine.whisper_model  # Loads Whisper
+    asr = engine.asr_model  # Loads Whisper or Parakeet (ASR_BACKEND)
     diarization = engine.diarization_pipeline  # Loads diarization
     embedding = engine.embedding_model  # Loads embeddings
     emotion = engine.emotion_model  # Loads emotion2vec
@@ -137,7 +138,7 @@ async def lifespan(app: FastAPI):
             settings = config.get_settings()
 
             # Warmup: full pipeline with speaker matching
-            logger.info("  - Warming up models (diarization, embedding, whisper, matching)...")
+            logger.info("  - Warming up models (diarization, embedding, speech-to-text, matching)...")
             with torch.no_grad():
                 _ = engine.transcribe_with_diarization(
                     test_audio_path,
@@ -163,6 +164,10 @@ async def lifespan(app: FastAPI):
             if os.path.exists(test_audio_path):
                 os.unlink(test_audio_path)
 
+    # The loaded models leave ~860k Python objects that every full garbage collection walks (~0.2 s each, and the
+    # request paths collect explicitly); move them out of the collector's view.
+    gc.collect()
+    gc.freeze()
     logger.info("=== All models loaded and ready! ===\n")
 
     yield

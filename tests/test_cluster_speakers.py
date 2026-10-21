@@ -212,7 +212,17 @@ def test_live_chunks_never_use_cluster_mode(tmp_path, monkeypatch):
                         lambda: SimpleNamespace(get_settings=lambda: SimpleNamespace(speaker_threshold=0.30)))
     asyncio.run(streaming_websocket._handle_segment_processed(
         FakeSocket(), conv_id, "tok", {"segment_file": str(chunk), "start_offset": 0.0}, FakeEngine()))
-    assert seen.get("cluster_speakers") is False
+    assert seen.get("cluster_speakers") is False and seen.get("diarize") is True
+
+
+def test_segment_embedding_crops_the_audio_in_memory(eng):
+    seen = []
+    eng._embedding_model = lambda x: seen.append(x) or np.ones(4, dtype=np.float32)
+    audio = {"waveform": np.zeros((1, 10 * 16000), dtype=np.float32), "sample_rate": 16000}
+    assert eng.extract_segment_embedding(audio, 2.0, 3.0, context_padding=0.15).shape == (4,)
+    eng.extract_segment_embedding(audio, 9.8, 10.0, context_padding=0.15)  # clamped: 9.5 s to 10 ms before the end
+    assert [x["waveform"].shape for x in seen] == [(1, int(1.3 * 16000)), (1, round(9.99 * 16000) - 9.5 * 16000)]
+    assert all(x["sample_rate"] == 16000 for x in seen)
 
 
 def test_env_flags_default_on_and_can_be_switched_off(monkeypatch):

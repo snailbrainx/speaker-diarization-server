@@ -258,12 +258,14 @@ async def delete_all_unknown_speakers(db: Session = Depends(get_db)):
 @router.post("/process", response_model=ConversationResponse)
 async def process_audio(
     audio_file: UploadFile = File(...),
+    diarize: bool = Form(True),
     db: Session = Depends(get_db),
     engine: SpeakerRecognitionEngine = Depends(get_engine)
 ):
     """
     Process uploaded audio file with speaker diarization and recognition.
-    Creates a new Conversation with segments.
+    Creates a new Conversation with segments. diarize=false skips speaker diarization when one person is talking
+    (faster; the whole file is one speaker, still matched against the stored voices).
     """
     # Save audio file
     recordings_dir = os.path.join(data_path(), "recordings")
@@ -324,7 +326,8 @@ async def process_audio(
             file_path,
             known_speakers,
             threshold=threshold,
-            db_session=db
+            db_session=db,
+            diarize=diarize,
         )
 
         for seg in result["segments"]:

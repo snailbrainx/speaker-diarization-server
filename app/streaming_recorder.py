@@ -27,17 +27,26 @@ class ConcatenationResult:
     error: Optional[str] = None
 
 
-def _max_stream_buffer_seconds() -> float:
-    raw = os.getenv("MAX_STREAM_BUFFER_SECONDS") or "120"
+def _env_seconds(name: str, default: float, allow_zero: bool = False) -> float:
+    """A duration setting from the environment; an invalid value falls back to the default."""
+    raw = os.getenv(name) or str(default)
     try:
         value = float(raw)
     except ValueError:
-        logger.warning("Invalid MAX_STREAM_BUFFER_SECONDS=%r; using 120", raw)
-        return 120.0
-    if not np.isfinite(value) or value <= 0:
-        logger.warning("MAX_STREAM_BUFFER_SECONDS must be finite and > 0; using 120")
-        return 120.0
+        value = float("nan")
+    if not np.isfinite(value) or value < 0 or (value == 0 and not allow_zero):
+        logger.warning("Invalid %s=%r; using %s", name, raw, default)
+        return default
     return value
+
+
+def _quietest_point(audio: np.ndarray, sample_rate: int, window_sec: float = 0.2) -> int:
+    """Sample index in the middle of the quietest window_sec stretch of the second half of audio."""
+    win = max(1, int(window_sec * sample_rate))
+    cum = np.concatenate(([0.0], np.cumsum(np.square(audio, dtype=np.float64))))
+    energy = cum[win:] - cum[:-win]  # energy of the window starting at each sample
+    lo = len(audio) // 2
+    return lo + int(np.argmin(energy[lo:])) + win // 2
 
 
 class StreamingRecorder:
@@ -90,7 +99,10 @@ class StreamingRecorder:
         # pausing grows this list without bound (RAM), and the buffer is only
         # ever flushed on silence. At 48 kHz mono float32 this is ~23 MB/s, so
         # cap at ~2 minutes of audio; a longer utterance flushes in pieces.
-        self.MAX_BUFFER_SECONDS = _max_stream_buffer_seconds()
+        self.MAX_BUFFER_SECONDS = _env_seconds("MAX_STREAM_BUFFER_SECONDS", 120.0)
+        # Speech with no pause this long (noisy rooms and crosstalk never drop below the silence threshold) is cut at
+        # its quietest point and the part before it processed, instead of waiting for a pause. 0 = off.
+        self.LONG_TURN_SECONDS = _env_seconds("STREAM_LONG_TURN_SECONDS", 15.0, allow_zero=True)
         # Guards current_buffer, total_segments, segments_queued, segment_paths,
         # cumulative_offset, and last_speech_time against concurrent flushes
         # (process_audio_chunk from the WS thread vs. stop_recording's tail flush).
@@ -236,6 +248,8 @@ class StreamingRecorder:
             if buffered_seconds >= self.MAX_BUFFER_SECONDS:
                 logger.info(f"Buffer cap reached ({buffered_seconds:.0f}s) — flushing")
                 self._flush_locked()
+            elif self.LONG_TURN_SECONDS and buffered_seconds >= self.LONG_TURN_SECONDS:
+                self._flush_locked(at_quietest_point=True)
 
             buffer_size = len(self.current_buffer)
             cumulative_offset = self.cumulative_offset
@@ -250,16 +264,21 @@ class StreamingRecorder:
             "cumulative_offset": cumulative_offset,
         }
 
-    def _flush_locked(self):
-        """Flush current_buffer to a segment file. Caller must hold self._lock."""
+    def _flush_locked(self, at_quietest_point: bool = False):
+        """Flush current_buffer to a segment file (only the part before its quietest point in the second half if
+        at_quietest_point; the rest stays buffered). Caller must hold self._lock."""
         if not self.current_buffer:
             return
 
         segment_audio = np.concatenate(self.current_buffer)
+        rest = segment_audio[:0]
+        if at_quietest_point:
+            cut = _quietest_point(segment_audio, self.sample_rate)
+            segment_audio, rest = segment_audio[:cut], segment_audio[cut:]
         # Always clear the buffer and reset the silence clock — even if we
         # decide not to flush, so pure-silence clients don't spin.
-        self.current_buffer = []
-        self._buffered_samples = 0
+        self.current_buffer = [rest] if len(rest) else []
+        self._buffered_samples = len(rest)
         self.last_speech_time = time.time()
 
         duration = len(segment_audio) / self.sample_rate

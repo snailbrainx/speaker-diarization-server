@@ -1,3 +1,4 @@
+import bisect
 import os
 
 # Fix for PyTorch 2.6+ weights_only=True breaking change
@@ -64,13 +65,27 @@ def _env_flag(name: str, default: bool) -> bool:
 #                              segments). On the AMI test meetings, right person 0.75-0.92, a different person up to
 #                              0.62: at 0.30 a visitor who was never enrolled got an enrolled person's name 89% of the
 #                              time, at 0.65-0.75 never, while 95.5% of enrolled people's speech was still recognised.
+#   ASR_BACKEND=whisper        speech-to-text engine: whisper (faster-whisper, WHISPER_MODEL) or parakeet (NVIDIA
+#                              Parakeet-TDT through NeMo, PARAKEET_MODEL; needs nemo_toolkit[asr]). Parakeet gives the
+#                              same segments with word timestamps and word confidences, so everything after it is
+#                              unchanged. parakeet-tdt-0.6b-v2 is English-only; -v3 covers 25 European languages.
+#   SNAP_TO_TURNS=true         widen each segment to its speaker's diarization turn (never into the neighbouring
+#                              segments). Word timestamps cover only the voiced core of the words, so word-tight
+#                              segments left the speech around them unlabelled: most of the gap between the app's DER
+#                              and pyannote's own. false = segments span first to last word, the original behaviour.
+ASR_BACKEND = (os.getenv("ASR_BACKEND") or "whisper").strip().lower()
+PARAKEET_MODEL = os.getenv("PARAKEET_MODEL") or "nvidia/parakeet-tdt-0.6b-v2"
+PARAKEET_CHUNK_SEC = 60.0  # ASR_BACKEND=parakeet: longer audio is cut at pauses into chunks up to this long (on AMI
+                           # meetings 30 s: 21.8% WER, 60 s: 21.1%, 120 s: 20.9% but 10% slower)
+PARAKEET_BATCH_SIZE = 8    # ASR_BACKEND=parakeet: chunks per batch (16 is no faster and doubles the VRAM)
 WHISPER_BATCH_SIZE = int(os.getenv("WHISPER_BATCH_SIZE") or (4 if torch.cuda.is_available() else 0))
 WORD_LEVEL_SPEAKERS = _env_flag("WORD_LEVEL_SPEAKERS", True)
 PYANNOTE_ALLOW_TF32 = _env_flag("PYANNOTE_ALLOW_TF32", True)
 CLUSTER_SPEAKERS = (os.getenv("SPEAKER_ASSIGNMENT") or "cluster").strip().lower() == "cluster"
 CLUSTER_SPEAKER_THRESHOLD = float(os.getenv("CLUSTER_SPEAKER_THRESHOLD") or 0.70)
-SPLIT_PAUSE_SEC = 1.0      # WORD_LEVEL_SPEAKERS: a pause this long between words starts a new segment
-SPLIT_MAX_SEC = 30.0       # WORD_LEVEL_SPEAKERS: longest segment before a forced split at a word boundary
+SNAP_TO_TURNS = _env_flag("SNAP_TO_TURNS", True)
+SPLIT_PAUSE_SEC = 1.0      # WORD_LEVEL_SPEAKERS (and Parakeet's segments): a pause this long between words starts a new segment
+SPLIT_MAX_SEC = 30.0       # WORD_LEVEL_SPEAKERS (and Parakeet's segments): longest segment before a split at a word boundary
 CENTROID_MAX_WEIGHT_SEC = 10.0  # SPEAKER_ASSIGNMENT=cluster: a segment counts by its duration, up to this
 CENTROID_FALLBACK_TURNS = 3     # cluster with no embeddable segment: embed its longest diarization turns instead
 
@@ -117,6 +132,26 @@ def _piece(seg: Dict, words: List[Dict], speaker_label: Optional[str]) -> Dict:
             "avg_logprob": seg.get("avg_logprob"), "speaker_label": speaker_label}
 
 
+def _snap_to_turns(segments: List[Dict], diar_segments: List[Dict]) -> List[Dict]:
+    """Segments (in time order, each with its speaker_label) widened to the diarization turn of their own speaker that
+    contains their first / last word, never into the previous or the next segment."""
+    turns: Dict[str, List[Tuple[float, float]]] = {}
+    for d in diar_segments:
+        turns.setdefault(d["speaker"], []).append((d["start"], d["end"]))
+    out = []
+    for i, seg in enumerate(segments):
+        start, end = seg["start"], seg["end"]
+        lo = min(start, out[-1]["end"]) if out else 0.0
+        hi = max(end, segments[i + 1]["start"]) if i + 1 < len(segments) else float("inf")
+        for b, e in turns.get(seg.get("speaker_label"), ()):
+            if b <= seg["start"] <= e:
+                start = max(b, lo)
+            if b <= seg["end"] <= e:
+                end = min(e, hi)
+        out.append(dict(seg, start=start, end=end))
+    return out
+
+
 def _label_at_midpoint(seg: Dict, diar_segments: List[Dict]) -> Optional[str]:
     """Diarization speaker at the segment's midpoint, else the speaker of the turn whose midpoint is closest."""
     mid_time = (seg["start"] + seg["end"]) / 2
@@ -129,6 +164,13 @@ def _label_at_midpoint(seg: Dict, diar_segments: List[Dict]) -> Optional[str]:
         if distance < min_distance:
             min_distance, label = distance, diar_seg["speaker"]
     return label
+
+
+def _one_speaker(transcription_segments: List[Dict]) -> Dict:
+    """Diarization result for diarize=False: one speaker, whose turns are the transcription segments."""
+    turns = [{"start": s["start"], "end": s["end"], "speaker": "SPEAKER_00", "duration": s["end"] - s["start"]}
+             for s in transcription_segments]
+    return {"segments": turns, "exclusive_segments": turns, "num_speakers": 1 if turns else 0}
 
 
 def _float_samples(segment: "AudioSegment") -> np.ndarray:
@@ -147,6 +189,98 @@ def _centroid(embeddings: List[np.ndarray], weights: List[float]) -> Optional[np
     return np.average(np.stack(unit), axis=0, weights=weights).astype(np.float32)
 
 
+def _load_audio_16k(audio_file: str) -> np.ndarray:
+    """Mono float32 samples at 16 kHz. soundfile + torchaudio resampling; faster-whisper's ffmpeg decoder is the
+    fallback for formats libsndfile cannot read (it forces a gc.collect() per call, ~0.2 s with these models loaded)."""
+    try:
+        data, sr = sf.read(audio_file, dtype="float32", always_2d=True)
+    except Exception:  # noqa: BLE001 - any format libsndfile cannot read goes through ffmpeg
+        from faster_whisper import decode_audio
+        return decode_audio(audio_file, sampling_rate=16000)
+    audio = data.mean(axis=1)
+    if sr != 16000:
+        import torchaudio.functional as F
+        audio = F.resample(torch.from_numpy(audio), sr, 16000).numpy()
+    return np.ascontiguousarray(audio, dtype=np.float32)
+
+
+def _in_memory(audio_file: str) -> Dict:
+    """The file decoded once (mono, 16 kHz) in pyannote's in-memory form ({"waveform", "sample_rate"}), for every model
+    that reads it: pyannote crops each window and each segment from it instead of reading the file again."""
+    return {"waveform": torch.from_numpy(_load_audio_16k(audio_file))[None], "sample_rate": 16000}
+
+
+def _chunks_at_pauses(audio: np.ndarray, max_sec: float, sr: int = 16000) -> List[Tuple[int, int]]:
+    """(start, end) sample ranges of up to max_sec that cover the whole clip, cut in the middle of pauses (Silero VAD).
+    Nothing is dropped: Parakeet also transcribes quiet speech the VAD misses (dropping non-speech cost ~1 point of
+    WER on meetings)."""
+    n, max_n = len(audio), int(max_sec * sr)
+    if n <= max_n:
+        return [(0, n)] if n else []
+    from faster_whisper.vad import VadOptions, get_speech_timestamps
+    regions = get_speech_timestamps(audio, VadOptions(max_speech_duration_s=max_sec, min_silence_duration_ms=160))
+    cuts = [(a["end"] + b["start"]) // 2 for a, b in zip(regions, regions[1:])]
+    chunks, start = [], 0
+    while n - start > max_n:
+        i = bisect.bisect_right(cuts, start + max_n) - 1
+        cut = cuts[i] if i >= 0 and cuts[i] > start else start + max_n  # no pause within reach: cut at the limit
+        chunks.append((start, cut))
+        start = cut
+    return chunks + [(start, n)]
+
+
+def _parakeet_word_confidence(hyp, words: List[Dict]) -> List[Optional[float]]:
+    """Mean probability of each word's tokens, the counterpart of Whisper's word probability. Tokens are matched to
+    words by frame. (NeMo's own word-confidence aggregation raises on some tokens, e.g. "sense'cause".)"""
+    steps = [int(t) for t in (hyp.timestamp.get("timestep") or [])]
+    token_conf = hyp.token_confidence
+    if token_conf is None or len(token_conf) != len(steps):
+        return [None] * len(words)
+    out = []
+    for w in words:
+        lo = bisect.bisect_left(steps, w["start_offset"])
+        hi = bisect.bisect_left(steps, max(w["end_offset"], w["start_offset"] + 1))
+        out.append(float(np.mean([float(c) for c in token_conf[lo:hi]])) if hi > lo else None)
+    return out
+
+
+def _parakeet_segments(hyp, offset: float) -> List[Dict]:
+    """A NeMo hypothesis as transcription segments in the Whisper path's format. NeMo ends a segment at every sentence;
+    consecutive sentences are joined unless a pause of SPLIT_PAUSE_SEC or more separates them or the segment would pass
+    SPLIT_MAX_SEC (a segment per sentence made them half as long as Whisper's: weaker voice embeddings and an emotion
+    pass per sentence). Words keep a leading space like Whisper's, word confidence is their probability, and the mean
+    log word confidence is avg_logprob."""
+    words = hyp.timestamp.get("word") or []
+    conf = _parakeet_word_confidence(hyp, words)
+    sizes = [len(s["segment"].split()) for s in hyp.timestamp.get("segment") or []]
+    if sum(sizes) != len(words):  # keep every word if the sentence split does not line up
+        sizes = [len(words)]
+    groups, i = [], 0
+    for n in sizes:
+        sentence = [{"word": " " + w["word"], "start": offset + w["start"], "end": offset + w["end"],
+                     "probability": None if c is None else float(c)}
+                    for w, c in zip(words[i:i + n], conf[i:i + n])]
+        i += n
+        if not sentence:
+            continue
+        if groups and (sentence[0]["start"] - groups[-1][-1]["end"] < SPLIT_PAUSE_SEC
+                       and sentence[-1]["end"] - groups[-1][0]["start"] <= SPLIT_MAX_SEC):
+            groups[-1] += sentence
+        else:
+            groups.append(sentence)
+    segments = []
+    for seg_words in groups:
+        probs = [w["probability"] for w in seg_words if w["probability"] is not None]
+        segments.append({
+            "start": seg_words[0]["start"],
+            "end": seg_words[-1]["end"],
+            "text": "".join(w["word"] for w in seg_words).strip(),
+            "words": seg_words,
+            "avg_logprob": float(np.mean(np.log(np.clip(probs, 1e-6, 1.0)))) if probs else None,
+        })
+    return segments
+
+
 def _keep_tf32_on():
     """pyannote calls fix_reproducibility() on every inference, which switches TF32 off; make it a no-op."""
     import sys as _sys
@@ -154,7 +288,8 @@ def _keep_tf32_on():
     original = rep.fix_reproducibility
     noop = lambda device: None  # noqa: E731
     for mod in list(_sys.modules.values()):
-        if getattr(mod, "fix_reproducibility", None) is original:
+        # the module's own attributes only: a lazily imported module would import itself on getattr
+        if getattr(mod, "__dict__", {}).get("fix_reproducibility") is original:
             mod.fix_reproducibility = noop
     rep.fix_reproducibility = noop
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -325,6 +460,7 @@ class SpeakerRecognitionEngine:
         self._diarization_pipeline = None
         self._embedding_model = None
         self._whisper_model = None
+        self._parakeet_model = None
         self._emotion_model = None
         self._emotion_model_failed = False
 
@@ -332,6 +468,9 @@ class SpeakerRecognitionEngine:
         # populates them, so on hot paths this is uncontended — but if warmup
         # is removed, two parallel requests must not both construct a model.
         self._model_lock = threading.Lock()
+        # NeMo's transcribe() switches the model's train/freeze state around each call, so calls from parallel
+        # requests take turns (each is tens of milliseconds per chunk batch).
+        self._parakeet_lock = threading.Lock()
 
         # Speaker profile cache (reduces DB queries during streaming)
         self._speaker_cache = None
@@ -524,6 +663,43 @@ class SpeakerRecognitionEngine:
         return self._batched_whisper
 
     @property
+    def parakeet_model(self):
+        """Lazy load the NeMo Parakeet model (thread-safe); only used when ASR_BACKEND=parakeet."""
+        if self._parakeet_model is not None:
+            return self._parakeet_model
+        with self._model_lock:
+            if self._parakeet_model is None:
+                try:
+                    import nemo.collections.asr as nemo_asr
+                    from nemo.utils import logging as nemo_logging
+                    from omegaconf import open_dict
+                except ImportError as e:
+                    raise RuntimeError("ASR_BACKEND=parakeet needs NVIDIA NeMo: pip install 'nemo_toolkit[asr]'") from e
+                nemo_logging.setLevel(logging.WARNING)
+                logger.info(f"Loading Parakeet model ({PARAKEET_MODEL}) via NeMo on {self.device}...")
+                model = nemo_asr.models.ASRModel.from_pretrained(PARAKEET_MODEL, map_location=self.device)
+                model.eval()
+                decoding = model.cfg.decoding
+                with open_dict(decoding):
+                    decoding.compute_timestamps = True
+                    # No CUDA graphs in the greedy decoder: NeMo captures them while other threads keep using the
+                    # GPU (pyannote runs alongside), and a graph captured that way can fail on replay with an
+                    # illegal memory access that leaves the CUDA context unusable for every later request.
+                    decoding.greedy.use_cuda_graph_decoder = False
+                    # Token probabilities; _parakeet_word_confidence turns them into word probabilities.
+                    decoding.confidence_cfg = {"preserve_token_confidence": True, "exclude_blank": True,
+                                               "method_cfg": {"name": "max_prob"}}
+                model.change_decoding_strategy(decoding, verbose=False)
+                self._parakeet_model = model
+                logger.info(f"Parakeet model '{PARAKEET_MODEL}' loaded")
+        return self._parakeet_model
+
+    @property
+    def asr_model(self):
+        """The speech-to-text model ASR_BACKEND selects (loads it on first use)."""
+        return self.parakeet_model if ASR_BACKEND == "parakeet" else self.whisper_model
+
+    @property
     def emotion_model(self):
         """Lazy load emotion2vec via FunASR. Sentinel-caches load failures so one
         transient error doesn't cause every segment to retry the full download."""
@@ -558,17 +734,20 @@ class SpeakerRecognitionEngine:
                 return None
         return self._emotion_model
 
-    def transcribe(self, audio_file: str) -> List[Dict]:
+    def transcribe(self, audio_file: str, audio: Optional[Dict] = None) -> List[Dict]:
         """
         Transcribe audio file with timestamps
 
         Args:
             audio_file: Path to audio file
+            audio: the file already in memory (_in_memory), used by Parakeet; Whisper decodes the file itself
 
         Returns:
             List of transcription segments with timestamps
         """
         logger.info(f"Transcribing {audio_file}...")
+        if ASR_BACKEND == "parakeet":
+            return self._transcribe_parakeet(audio_file, audio)
         # Get language from environment variable (default: "en")
         # Use "auto" for auto-detection, or specify language code (e.g., "es", "fr", "de")
         language = os.getenv("WHISPER_LANGUAGE", "en")
@@ -624,6 +803,26 @@ class SpeakerRecognitionEngine:
 
         return transcription_segments
 
+    def _transcribe_parakeet(self, audio_file: str, audio: Optional[Dict] = None) -> List[Dict]:
+        """ASR_BACKEND=parakeet: the same segments as the Whisper path (text, words with times and probability,
+        avg_logprob). Long audio is cut at pauses into chunks of up to PARAKEET_CHUNK_SEC, transcribed in batches."""
+        model = self.parakeet_model
+        audio = audio["waveform"][0].numpy() if audio is not None else _load_audio_16k(audio_file)
+        chunks = _chunks_at_pauses(audio, PARAKEET_CHUNK_SEC)
+        transcription_segments = []
+        if chunks:
+            with self._parakeet_lock:
+                hyps = model.transcribe([audio[s:e] for s, e in chunks], batch_size=PARAKEET_BATCH_SIZE,
+                                        timestamps=True, verbose=False)
+            if isinstance(hyps, tuple):  # older NeMo: (best, all)
+                hyps = hyps[0]
+            for (start, _), hyp in zip(chunks, hyps):
+                transcription_segments += _parakeet_segments(hyp, start / 16000)
+        logger.info(f"Parakeet: {len(audio) / 16000:.1f}s audio in {len(chunks)} chunk(s) -> "
+                    f"{len(transcription_segments)} segments")
+        self.clear_gpu_cache_async("transcription")
+        return transcription_segments
+
     def extract_embedding(self, audio_file: str) -> np.ndarray:
         """
         Extract speaker embedding from audio file
@@ -638,19 +837,20 @@ class SpeakerRecognitionEngine:
             embedding = self.embedding_model(audio_file)
         return np.array(embedding)
 
-    def diarize(self, audio_file: str) -> Dict:
+    def diarize(self, audio_file: str, audio: Optional[Dict] = None) -> Dict:
         """
         Perform speaker diarization on audio file
 
         Args:
             audio_file: Path to audio file (WAV format)
+            audio: the file already in memory (_in_memory): the same turns, faster (no file read per window)
 
         Returns:
             Diarization result with speaker segments
         """
         logger.info(f"Running diarization on {audio_file}...")
         with torch.no_grad():
-            output = self.diarization_pipeline(audio_file)
+            output = self.diarization_pipeline(audio if audio is not None else audio_file)
 
         # Convert to dictionary format. In pyannote.audio 4.0+, speaker_diarization holds the turns (overlapping where
         # two people talk at once); exclusive_speaker_diarization has one speaker at a time, for aligning words.
@@ -778,7 +978,7 @@ class SpeakerRecognitionEngine:
 
     def extract_segment_embedding(
         self,
-        audio_file: str,
+        audio_file,
         start_time: float,
         end_time: float,
         context_padding: float = None
@@ -787,7 +987,8 @@ class SpeakerRecognitionEngine:
         Extract embedding from a specific segment of audio with context padding
 
         Args:
-            audio_file: Path to audio file
+            audio_file: Path to audio file, or the file already in memory ({"waveform": 1 x samples tensor,
+                "sample_rate": ...}, as _in_memory makes it): cropped there, ~25x faster than reading the file
             start_time: Start time in seconds
             end_time: End time in seconds
             context_padding: Seconds to include before/after for more reliable embeddings (default: 0.15s)
@@ -805,9 +1006,12 @@ class SpeakerRecognitionEngine:
             self.context_padding = context_padding
 
         # Get actual audio duration to prevent out-of-bounds
+        in_memory = isinstance(audio_file, dict)
         try:
-            info = sf.info(audio_file)
-            duration = info.duration
+            if in_memory:
+                duration = audio_file["waveform"].shape[-1] / audio_file["sample_rate"]
+            else:
+                duration = sf.info(audio_file).duration
 
             # Add context padding for more reliable embeddings
             padded_start = start_time - context_padding
@@ -830,9 +1034,13 @@ class SpeakerRecognitionEngine:
         except Exception as e:
             logger.warning(f"Could not get audio duration, using original times: {e}")
 
-        segment = Segment(start_time, end_time)
         with torch.no_grad():
-            embedding = self.embedding_model.crop(audio_file, segment)
+            if in_memory:
+                sr = audio_file["sample_rate"]
+                crop = audio_file["waveform"][:, int(round(start_time * sr)):int(round(end_time * sr))]
+                embedding = self.embedding_model({"waveform": crop, "sample_rate": sr})
+            else:
+                embedding = self.embedding_model.crop(audio_file, Segment(start_time, end_time))
         return np.array(embedding)
 
     def extract_segment_embeddings_batch(
@@ -1059,6 +1267,7 @@ class SpeakerRecognitionEngine:
         threshold: float = 0.7,
         db_session = None,
         cluster_speakers: Optional[bool] = None,
+        diarize: bool = True,
     ) -> Dict:
         """
         Full pipeline: transcription + diarization + speaker recognition + personalized emotions
@@ -1070,6 +1279,8 @@ class SpeakerRecognitionEngine:
             db_session: Optional database session for personalized emotion matching
             cluster_speakers: identify each diarization speaker once (SPEAKER_ASSIGNMENT=cluster); None = the
                 setting. Live chunks pass False: a few seconds of speech is too little for the cluster threshold.
+            diarize: False skips speaker diarization (one person talking): every segment is one speaker, still
+                matched against the stored voices.
 
         Returns:
             Dictionary with transcribed segments and speaker labels
@@ -1083,14 +1294,15 @@ class SpeakerRecognitionEngine:
         logger.info("Running transcription and diarization in parallel...")
         start_time = time.time()
 
+        audio = _in_memory(audio_file)  # decoded once for Parakeet, pyannote and the voice embeddings
         with ThreadPoolExecutor(max_workers=2) as executor:
             # Submit both tasks to run concurrently
-            transcription_future = executor.submit(self.transcribe, audio_file)
-            diarization_future = executor.submit(self.diarize, audio_file)
+            transcription_future = executor.submit(self.transcribe, audio_file, audio)
+            diarization_future = executor.submit(self.diarize, audio_file, audio) if diarize else None
 
             # Wait for both to complete
             transcription_segments = transcription_future.result()
-            diarization_result = diarization_future.result()
+            diarization_result = diarization_future.result() if diarize else _one_speaker(transcription_segments)
 
         elapsed = time.time() - start_time
         logger.info(f"Parallel processing completed in {elapsed:.2f}s")
@@ -1114,21 +1326,25 @@ class SpeakerRecognitionEngine:
         global_emotion_threshold = settings.emotion_threshold
         enable_personalized_emotions = os.getenv("ENABLE_PERSONALIZED_EMOTIONS", "true").lower() == "true"
 
-        # Pass 1: drop hallucinations, give each segment its diarization speaker and its own voice embedding.
-        # The cheap text-only filter runs BEFORE any embedding or emotion extraction so Whisper's
-        # "thank you for watching" ghosts don't cost us a GPU pass each.
-        segments = []
+        # Pass 1: drop hallucinations, give each segment its diarization speaker and its own voice embedding (from
+        # its words' span, the surest speech), then widen it to that speaker's turn. The cheap text-only filter runs
+        # BEFORE any embedding or emotion extraction so Whisper's "thank you for watching" ghosts don't cost us a
+        # GPU pass each.
+        kept = []
         for trans_seg in transcription_segments:
             if filter_hallucinations and _is_hallucination(
                     trans_seg["text"], trans_seg["end"] - trans_seg["start"], trans_seg.get("avg_logprob")):
                 logger.info(f"⏭️ Skipping hallucination: '{trans_seg['text'][:60]}'")
                 continue
             label = trans_seg.get("speaker_label") or _label_at_midpoint(trans_seg, diarization_result["segments"])
-            segments.append((trans_seg, label, self._segment_embedding_or_none(audio_file, trans_seg)))
+            kept.append(dict(trans_seg, speaker_label=label))
+        widened = _snap_to_turns(kept, diarization_result["segments"]) if SNAP_TO_TURNS else kept
+        segments = [(out, out["speaker_label"], self._segment_embedding_or_none(audio, seg))
+                    for seg, out in zip(kept, widened)]
 
         # Pass 2: who is speaking in each segment.
         if cluster_speakers:
-            identities = self._identify_clusters(audio_file, segments, diarization_result, known_speakers,
+            identities = self._identify_clusters(audio, segments, diarization_result, known_speakers,
                                                  CLUSTER_SPEAKER_THRESHOLD, db_session)
             speakers = [identities[label] for _, label, _ in segments]
         else:
@@ -1197,8 +1413,9 @@ class SpeakerRecognitionEngine:
             "num_speakers": diarization_result["num_speakers"]
         }
 
-    def _segment_embedding_or_none(self, audio_file: str, seg: Dict) -> Optional[np.ndarray]:
-        """Voice embedding of one segment, or None if it is too short, at a file boundary or NaN."""
+    def _segment_embedding_or_none(self, audio_file, seg: Dict) -> Optional[np.ndarray]:
+        """Voice embedding of one segment (audio_file: a path or the file in memory, see extract_segment_embedding),
+        or None if it is too short, at a file boundary or NaN."""
         segment_duration = seg["end"] - seg["start"]
         if segment_duration < MIN_SEGMENT_DURATION_SEC:
             logger.info(f"⏭️ Skipping embedding extraction (segment too short: {segment_duration:.2f}s)")
@@ -1330,7 +1547,7 @@ class SpeakerRecognitionEngine:
             logger.info(f"  ❔ Speaker {label} → {identities[label]['speaker']} (no stored voice above {threshold:.2%})")
         return identities
 
-    def _turns_centroid(self, audio_file: str, label: str, turns: List[Dict]) -> Optional[np.ndarray]:
+    def _turns_centroid(self, audio_file, label: str, turns: List[Dict]) -> Optional[np.ndarray]:
         """Centroid of a diarization speaker's longest turns (for a speaker none of whose segments could be embedded)."""
         longest = sorted((t for t in turns if t["speaker"] == label), key=lambda t: t["duration"], reverse=True)
         embeddings, weights = [], []
