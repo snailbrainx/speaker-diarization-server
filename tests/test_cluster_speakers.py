@@ -154,3 +154,62 @@ def test_cluster_mode_profile_skips_short_segments_and_weights_by_duration(db_se
     assert services.recalculate_speaker_embedding(speaker, db_session, None) == 2   # the 0.3 s segment is left out
     expected = _centroid([_vec(1, 0.2), _vec(1, -0.2)], [2.0, 6.0])
     assert np.allclose(speaker.get_embedding(), expected, atol=1e-5)
+
+
+def test_saving_a_segment_uses_the_speaker_resolved_for_its_cluster(db_session):
+    from datetime import datetime, timezone
+    from app.models import Conversation
+    from app.services import create_segment_from_result
+    unknown_id = _enroll(db_session, "Unknown_123", _vec(1, 0))
+    conv = Conversation(title="t", start_time=datetime.now(timezone.utc), status="processing", audio_path=None)
+    db_session.add(conv)
+    db_session.flush()
+    seg = {"start": 0.0, "end": 2.0, "text": "hi", "speaker": "Unknown_123", "speaker_id": unknown_id,
+           "is_known": False, "confidence": 1.0, "embedding": _vec(0, 1), "words": []}
+    saved = create_segment_from_result(seg, conv.id, conv.start_time, db_session, threshold=0.30)
+    assert saved.speaker_id == unknown_id and saved.speaker_name == "Unknown_123"
+    assert db_session.query(Speaker).count() == 1   # not auto-enrolled again from the segment's own embedding
+
+
+def test_live_chunks_never_use_cluster_mode(tmp_path, monkeypatch):
+    import asyncio
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+    from app import streaming_websocket
+    from app.models import Conversation
+    engine_db = create_engine(f"sqlite:///{tmp_path}/live.db")
+    Base.metadata.create_all(engine_db)
+    Session = sessionmaker(bind=engine_db)
+    db = Session()
+    db.add(Conversation(title="live", start_time=datetime.now(timezone.utc), status="recording", processing_token="tok"))
+    db.commit()
+    conv_id = db.query(Conversation).first().id
+    db.close()
+    chunk = tmp_path / "chunk.wav"
+    chunk.write_bytes(b"RIFF")
+    seen = {}
+
+    class FakeEngine:
+        def transcribe_with_diarization(self, *_args, **kwargs):
+            seen.update(kwargs)
+            return {"segments": [], "num_speakers": 0}
+
+        def clear_gpu_cache_async(self, _reason):
+            return None
+
+        def clear_speaker_cache(self):
+            return None
+
+    class FakeSocket:
+        async def send_json(self, _data):
+            return None
+
+        async def send_text(self, _data):
+            return None
+
+    monkeypatch.setattr(streaming_websocket, "SessionLocal", Session)
+    monkeypatch.setattr(streaming_websocket, "get_config",
+                        lambda: SimpleNamespace(get_settings=lambda: SimpleNamespace(speaker_threshold=0.30)))
+    asyncio.run(streaming_websocket._handle_segment_processed(
+        FakeSocket(), conv_id, "tok", {"segment_file": str(chunk), "start_offset": 0.0}, FakeEngine()))
+    assert seen.get("cluster_speakers") is False
