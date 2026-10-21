@@ -4,7 +4,7 @@
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![CUDA 12.8](https://img.shields.io/badge/CUDA-12.8-green.svg)](https://developer.nvidia.com/cuda-toolkit)
 
-GPU-accelerated speaker diarization, transcription, and emotion recognition with a REST API, WebSocket streaming, and an MCP server for AI agents. Combines pyannote.audio + faster-whisper + emotion2vec into one FastAPI service with persistent speaker identity across conversations.
+GPU-accelerated speaker diarization, transcription, and emotion recognition with a REST API, WebSocket streaming, and an MCP server for AI agents. Combines pyannote.audio + faster-whisper or NVIDIA Parakeet + emotion2vec into one FastAPI service with persistent speaker identity across conversations.
 
 ## Screenshots
 
@@ -29,7 +29,7 @@ The screenshots below are from an older version of the separate example
 
 - **Persistent speaker identity** — enroll a voice once, recognized across every future recording.
 - **Retroactive updates** — identify one segment and every past segment with that voice re-labels automatically.
-- **Transcription** — faster-whisper (`large-v3` default, any Whisper variant), word-level timestamps, 99 languages.
+- **Transcription** — faster-whisper (`large-v3` default, any Whisper variant, 99 languages) or NVIDIA Parakeet-TDT (`ASR_BACKEND=parakeet`: English, ~4× faster speech-to-text, lower WER on meetings), word-level timestamps.
 - **Dual-detector emotion recognition** — emotion2vec+ (general) combined with per-speaker voice profiles (personalized). 9 categories.
 - **Live streaming** — WebSocket audio ingestion with VAD-gated segment flushing.
 - **Batch processing** — multi-GPU script for bulk ingest (`run_batch.sh`).
@@ -44,7 +44,7 @@ The screenshots below are from an older version of the separate example
 |-----------------|-----------------------------------------------------------------------------|
 | Diarization     | `pyannote/speaker-diarization-community-1` (pyannote.audio 4.0.1)           |
 | Speaker embed   | `pyannote/embedding` (512-D)                                                |
-| Transcription   | faster-whisper 1.2.1 / CTranslate2, `large-v3` default                |
+| Transcription   | faster-whisper 1.2.1 / CTranslate2, `large-v3` default; or Parakeet-TDT 0.6B v2 via NVIDIA NeMo 3.0 (`ASR_BACKEND=parakeet`) |
 | Emotion         | emotion2vec_plus_large via FunASR (1024-D, 9 categories)                    |
 | API             | FastAPI 0.141.1 + WebSockets + uvicorn                                      |
 | DB              | SQLAlchemy 2.0 / SQLite (WAL)                                               |
@@ -128,6 +128,7 @@ All configuration is environment variables (see `.env.example` for the curated l
 | Variable                          | Default                          | Purpose                                                   |
 |-----------------------------------|----------------------------------|-----------------------------------------------------------|
 | `MAX_STREAM_BUFFER_SECONDS`       | `120` (`300` in docker-compose)  | Longest speech buffered before a segment is force-flushed. |
+| `STREAM_LONG_TURN_SECONDS`        | `15`                             | Speech with no pause this long (noisy rooms, crosstalk) is cut at its quietest point and processed instead of waiting for a pause. `0` = wait for a pause. |
 | `SEGMENT_HANDLER_TIMEOUT_SECONDS` | `600`                            | How long a live segment may take to process.              |
 | `WS_SEND_TIMEOUT_SECONDS`         | `10` (`5` in docker-compose)     | Timeout for sending a message to a WebSocket client.      |
 
@@ -147,6 +148,8 @@ All configuration is environment variables (see `.env.example` for the curated l
 |--------------------------------|----------------------------------|-----------------------------------------------------|
 | `WHISPER_MODEL`                | `large-v3`                 | Any faster-whisper model ID. See `.env.example`.    |
 | `WHISPER_LANGUAGE`             | `en`                             | `auto` for 99-language detection, or ISO-639 code.  |
+| `ASR_BACKEND`                  | `whisper`                        | Speech-to-text engine: `whisper` or `parakeet` (see [Speech-to-text](#speech-to-text-whisper-or-parakeet)). |
+| `PARAKEET_MODEL`               | `nvidia/parakeet-tdt-0.6b-v2`    | `ASR_BACKEND=parakeet` model. v2 is English-only; `nvidia/parakeet-tdt-0.6b-v3` covers 25 European languages (detected automatically). |
 | `EMOTION_MODEL`                | `iic/emotion2vec_plus_large`     | FunASR emotion model ID.                            |
 | `ENABLE_PERSONALIZED_EMOTIONS` | `true`                           | Use per-speaker voice profiles in emotion matching. |
 | `OFFLINE_MODE`                 | `false`                          | Force cached models only; never hit the hub.        |
@@ -162,7 +165,7 @@ All configuration is environment variables (see `.env.example` for the curated l
 ### Speed & speaker assignment
 
 On by default. To get the original behaviour back, set `WHISPER_BATCH_SIZE=0`, `WORD_LEVEL_SPEAKERS=false`,
-`PYANNOTE_ALLOW_TF32=false` and `SPEAKER_ASSIGNMENT=segment`.
+`PYANNOTE_ALLOW_TF32=false`, `SPEAKER_ASSIGNMENT=segment` and `SNAP_TO_TURNS=false`.
 
 | Variable                    | Default   | Purpose                                                                                     |
 |-----------------------------|-----------|---------------------------------------------------------------------------------------------|
@@ -171,6 +174,7 @@ On by default. To get the original behaviour back, set `WHISPER_BATCH_SIZE=0`, `
 | `PYANNOTE_ALLOW_TF32`       | `true`    | Keep TF32 on for pyannote (it disables it for reproducibility). Faster on Ampere and newer.   |
 | `SPEAKER_ASSIGNMENT`        | `cluster` | `cluster`: identify each diarization speaker **once per file** from all of its speech, one-to-one against stored speakers; an unmatched speaker becomes one `Unknown_*`. Uploaded/reprocessed files only; live chunks keep per-segment matching. `segment` = match every segment on its own (original). |
 | `CLUSTER_SPEAKER_THRESHOLD` | `0.70`    | Cluster mode's match threshold (used instead of `SPEAKER_THRESHOLD`, which is tuned for single segments). Higher → stricter. |
+| `SNAP_TO_TURNS`             | `true`    | Widen each segment to its speaker's diarization turn, never into the neighbouring segments. Word timestamps cover only the voiced core of each word, so segments that span first to last word leave the speech around them unlabelled. `false` = first to last word (original). |
 
 Measured on public test sets (RTX 3090; AMI = 16 test meetings, VoxConverse = 40 dev clips):
 
@@ -191,6 +195,44 @@ Measured on public test sets (RTX 3090; AMI = 16 test meetings, VoxConverse = 40
 identify endpoint, then the other three meetings were processed; a meeting from another series stood in for
 unenrolled speakers.
 
+### Speech-to-text: Whisper or Parakeet
+
+`ASR_BACKEND=parakeet` runs NVIDIA's [Parakeet-TDT 0.6B v2](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2)
+through NeMo instead of faster-whisper. It returns the same segments (text, word timestamps, word confidences), so
+speaker assignment, emotion and storage are unchanged. Long recordings are cut at pauses into chunks of up to 60 s that
+cover the whole file, transcribed 8 at a time; sentences are joined into segments like Whisper's. v2 is English-only
+(`PARAKEET_MODEL=nvidia/parakeet-tdt-0.6b-v3` covers 25 European languages); Whisper stays the default for its 99
+languages.
+
+This release against the previous one, on the same GPU. Speed is server-side processing time, with each file sent to
+each version in turn; LibriSpeech = 40 test-clean clips, VoxConverse = 40 dev clips, AMI = the 16 test meetings (9.1 h).
+
+| | previous release | this release, Whisper | this release, Parakeet |
+|---|---|---|---|
+| Speed, LibriSpeech (median per clip) | 9.2× (0.83 s) | 19.7× (0.34 s) | **52.8× (0.12 s)** |
+| Speed, VoxConverse | 32× | 36× | **76×** |
+| Speed, AMI | 27× | 45× | **79×** |
+| WER, LibriSpeech test-clean | **1.0%** | **1.0%** | 1.4% |
+| WER, AMI | 24.7% | 24.7% | **21.2%** |
+| DER, VoxConverse | 14.9% | 11.7% | **11.2%** |
+| DER, AMI | 31.8% | 25.0% | **23.9%** |
+| Speaker confusion, VoxConverse / AMI | **2.6% / 2.1%** | 2.9% / 2.6% | 3.0% / 2.3% |
+| AMI words in a segment of the right speaker, of all words | 79.1% | 83.8% | **83.9%** |
+| Enrolled speakers' speech in later meetings given their own name³ | 82.4% | – | **89.2%** |
+
+Held-out sets, never used to choose a setting (previous release / this release with Parakeet): WER on 200
+LibriSpeech test-clean clips 1.69% / 1.94%, on 200 test-other clips 3.24% / **2.76%**, on the 18 AMI dev meetings
+23.7% / **21.8%**; DER on 40 other VoxConverse clips 12.5% / **8.7%**, on AMI dev 30.6% / **24.1%**.
+
+Live, six 150 s VoxConverse clips with 3–5 speakers streamed in real time: median delay from speech to a labelled line
+17.6 s → **4.5 s**, worst 116 s → **15 s**; DER 23.2% → **21.7%**, speaker confusion 12.6% → 15.2%.
+
+Speaker confusion rises a little because turn edges label ~8 points more of the speech, and those edges are where
+pyannote itself is least sure; DER, which counts confusion, falls 3–8 points. Parakeet trails Whisper on clean read
+speech (mostly names and compound words) and leads on harder speech and meetings.
+
+³ Of all their speech, in the identification test above; 2.0% / 2.2% was given another person's name.
+
 ## How it Works
 
 ```
@@ -198,7 +240,7 @@ upload / WS chunk
       │
       ▼
 ┌─────────────────┐   ┌──────────────────┐
-│ Whisper         │   │ pyannote         │
+│ Whisper/Parakeet│   │ pyannote         │
 │ transcription   │   │ diarization      │   run in parallel
 │ (text + words)  │   │ (speaker turns)  │   (ThreadPoolExecutor)
 └────────┬────────┘   └────────┬─────────┘
@@ -226,7 +268,11 @@ upload / WS chunk
 
 Key behaviors:
 
-- **Parallel Whisper + pyannote** — ~2× faster than sequential.
+- **Parallel speech-to-text + pyannote** — ~2× faster than sequential.
+- **Decoded once** — each file is decoded and resampled to 16 kHz once, and Parakeet, pyannote and the voice embeddings all work on that copy in memory. Given a file path, pyannote re-reads the file for every window it embeds: 2.3× slower on a 17-minute meeting, with identical results.
+- **Turn edges** (`SNAP_TO_TURNS`) — a segment's start and end are widened to its speaker's diarization turn (word timestamps cover only the voiced core of the words). Voice embeddings still come from the words' own span, so this changes timing only, never who is identified.
+- **One-speaker mode** — `diarize=false` (upload form field, or the live start message) skips pyannote when one person is talking; the speech is still matched against stored voices.
+- **Live turns** — speech is processed at each pause; a turn with no pause for `STREAM_LONG_TURN_SECONDS` (noisy rooms, crosstalk) is cut at its quietest point instead of being held until the speakers stop.
 - **Context padding** — 0.15 s of audio on each side of a segment makes the embedding robust to background noise.
 - **Auto-enrollment** — unidentified voices get an `Unknown_N` profile immediately so they accumulate samples. Rename/identify and every past `Unknown_N` segment re-labels.
 - **Cluster mode** (`SPEAKER_ASSIGNMENT=cluster`, the default for files) — instead of matching each segment's embedding on its own, each pyannote speaker is matched once from the centroid of all its segments, so one person gets one label per file (one `Unknown_N` if not enrolled) and a single identify names them everywhere.
@@ -301,10 +347,10 @@ Full interactive docs at `/docs` (Swagger UI). The OpenAPI JSON is at `/openapi.
 - `POST /api/v1/conversations/{id}/reprocess`, `POST /api/v1/conversations/{id}/recalculate-emotions` — re-run pipelines.
 - `POST /api/v1/conversations/{id}/segments/{sid}/{identify,correct-emotion}`, `PATCH .../{misidentified,emotion-misidentified}` — segment corrections.
 - `GET /api/v1/conversations/segments/{sid}/audio` — extract segment audio.
-- `POST /api/v1/process` — upload and process a whole file.
+- `POST /api/v1/process` — upload and process a whole file (form field `diarize=false` skips speaker diarization when one person is talking: faster, one speaker, still matched against the stored voices).
 - `GET/POST /api/v1/settings/voice`, `POST /api/v1/settings/voice/reset` — runtime-tunable voice settings.
 - `GET/POST /api/v1/profiles`, checkpoints, download, import, restore — backup/restore.
-- `WS /api/v1/streaming/ws` — live audio ingestion.
+- `WS /api/v1/streaming/ws` — live audio ingestion: a `{"type": "start"}` message, then binary PCM chunks (48 kHz float32 by default; `"sample_rate": 16000, "format": "int16"` in the start message is a sixth of the bandwidth; `"diarize": false` skips diarization per chunk), then `{"type": "stop"}`. Speech is processed at each pause, and a turn that runs 15 s without one is cut at its quietest point.
 
 ### Example — upload + process
 
@@ -409,7 +455,9 @@ Docker bind-mounts `./volumes`, `./data`, `./backups`, and `./certs` (read-only)
 
 **Wrong GPU selected** — set `CUDA_VISIBLE_DEVICES` to match the `nvidia-smi` index you want; `CUDA_DEVICE_ORDER=PCI_BUS_ID` is already pinned for you.
 
-**"CUDA out of memory"** — switch `WHISPER_MODEL` to a smaller variant (`small` or `base`) or raise `CLEANUP_VRAM_THRESHOLD_GB` so cleanup runs more often.
+**"CUDA out of memory"** — switch `WHISPER_MODEL` to a smaller variant (`small` or `base`), or lower `CLEANUP_VRAM_THRESHOLD_GB` so cleanup runs more often. With `ASR_BACKEND=parakeet`, speech-to-text alone peaks at ~5.5 GB on long recordings.
+
+**`ASR_BACKEND=parakeet needs NVIDIA NeMo`** — the Docker image includes NeMo; outside Docker, `pip install 'nemo_toolkit[asr]==3.0.0'` (it is in `requirements.txt`). Parakeet v2 transcribes English only: for other languages use `PARAKEET_MODEL=nvidia/parakeet-tdt-0.6b-v3` (25 European languages) or `ASR_BACKEND=whisper`.
 
 **Speakers named before upgrading are recognised less often** — profiles auto-enrolled by the old per-segment
 matching are often built from a single short segment, which may not reach `CLUSTER_SPEAKER_THRESHOLD`. Identify the
@@ -422,13 +470,14 @@ speaker once in a recent conversation (the profile is then rebuilt from all of t
 
 ## License
 
-MIT — see `LICENSE`. All bundled dependencies (pyannote.audio, faster-whisper, FastAPI, PyTorch, SQLAlchemy, Pydantic) are under MIT or BSD. The pyannote **models** require HuggingFace account + token + terms acceptance; the software remains open-source.
+MIT — see `LICENSE`. All bundled dependencies (pyannote.audio, faster-whisper, FastAPI, PyTorch, SQLAlchemy, Pydantic) are under MIT or BSD; NVIDIA NeMo is Apache-2.0. The pyannote **models** require HuggingFace account + token + terms acceptance; the software remains open-source. The Parakeet-TDT models (`ASR_BACKEND=parakeet`) are released by NVIDIA under CC-BY-4.0.
 
 ## Credits
 
 - [pyannote.audio](https://github.com/pyannote/pyannote-audio) — Hervé Bredin et al.
 - [faster-whisper](https://github.com/SYSTRAN/faster-whisper) — SYSTRAN
 - [Whisper](https://github.com/openai/whisper) — OpenAI
+- [NeMo](https://github.com/NVIDIA/NeMo) / [Parakeet-TDT](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2) — NVIDIA
 - [emotion2vec](https://github.com/ddlBoJack/emotion2vec) / [FunASR](https://github.com/modelscope/FunASR) — ACL 2024
 - [FastAPI](https://github.com/tiangolo/fastapi) — Sebastián Ramírez
 
