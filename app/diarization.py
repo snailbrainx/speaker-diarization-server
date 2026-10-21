@@ -39,27 +39,35 @@ UNKNOWN_NAME_MAX_ATTEMPTS = 5
 # Emotion detection constants
 MIN_VOICE_SAMPLES = 3
 
-# Opt-in speed settings (all off by default; unset = the original behaviour).
-#   WHISPER_BATCH_SIZE=16      faster-whisper's BatchedInferencePipeline: VAD chunks transcribed 16 at a time.
-#                              ~8x faster transcription on an RTX 3090; returns ~30 s segments, so use it
-#                              together with WORD_LEVEL_SPEAKERS.
+
+def _env_flag(name: str, default: bool) -> bool:
+    value = (os.getenv(name) or "").strip().lower()
+    return default if not value else value in ("1", "true", "yes", "on")
+
+
+# Processing settings. On by default; each can be switched back to the original behaviour.
+#   WHISPER_BATCH_SIZE=4       faster-whisper's BatchedInferencePipeline: VAD chunks transcribed 4 at a time (default
+#                              on a GPU; 0 = sequential decoding, the original behaviour, and the default on CPU).
+#                              ~8x faster transcription on long audio and no end-of-file repeat hallucination; larger
+#                              batches use more VRAM without being faster here (pyannote is the slower half).
 #   WORD_LEVEL_SPEAKERS=true   give every word the diarization speaker at its midpoint and split segments where the
 #                              speaker changes (or after a pause / a long run), instead of one speaker per segment.
+#                              false = one speaker per Whisper segment.
 #   PYANNOTE_ALLOW_TF32=true   keep TF32 matmuls on for pyannote (it turns them off for bit-reproducibility).
 #   SPEAKER_ASSIGNMENT=cluster identify each diarization speaker once per file, from all of that speaker's segments,
 #                              instead of each segment on its own (a short segment's embedding is too noisy: one
 #                              person ends up as several Unknown_* speakers). Words get their speaker from pyannote's
 #                              exclusive (non-overlapping) diarization. Implies word-level speakers. Uploaded and
-#                              reprocessed files only: live chunks keep per-segment matching.
+#                              reprocessed files only: live chunks keep per-segment matching. segment = the original.
 #   CLUSTER_SPEAKER_THRESHOLD=0.70  cosine similarity a speaker's centroid needs to be given a stored person's name in
 #                              cluster mode (used instead of the Settings speaker_threshold, which is tuned for single
 #                              segments). On the AMI test meetings, right person 0.75-0.92, a different person up to
 #                              0.62: at 0.30 a visitor who was never enrolled got an enrolled person's name 89% of the
 #                              time, at 0.65-0.75 never, while 95.5% of enrolled people's speech was still recognised.
-WHISPER_BATCH_SIZE = int(os.getenv("WHISPER_BATCH_SIZE", "0") or 0)
-WORD_LEVEL_SPEAKERS = os.getenv("WORD_LEVEL_SPEAKERS", "false").lower() == "true"
-PYANNOTE_ALLOW_TF32 = os.getenv("PYANNOTE_ALLOW_TF32", "false").lower() == "true"
-CLUSTER_SPEAKERS = os.getenv("SPEAKER_ASSIGNMENT", "segment").lower() == "cluster"
+WHISPER_BATCH_SIZE = int(os.getenv("WHISPER_BATCH_SIZE") or (4 if torch.cuda.is_available() else 0))
+WORD_LEVEL_SPEAKERS = _env_flag("WORD_LEVEL_SPEAKERS", True)
+PYANNOTE_ALLOW_TF32 = _env_flag("PYANNOTE_ALLOW_TF32", True)
+CLUSTER_SPEAKERS = (os.getenv("SPEAKER_ASSIGNMENT") or "cluster").strip().lower() == "cluster"
 CLUSTER_SPEAKER_THRESHOLD = float(os.getenv("CLUSTER_SPEAKER_THRESHOLD") or 0.70)
 SPLIT_PAUSE_SEC = 1.0      # WORD_LEVEL_SPEAKERS: a pause this long between words starts a new segment
 SPLIT_MAX_SEC = 30.0       # WORD_LEVEL_SPEAKERS: longest segment before a forced split at a word boundary

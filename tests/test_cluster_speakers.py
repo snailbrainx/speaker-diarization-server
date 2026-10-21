@@ -213,3 +213,15 @@ def test_live_chunks_never_use_cluster_mode(tmp_path, monkeypatch):
     asyncio.run(streaming_websocket._handle_segment_processed(
         FakeSocket(), conv_id, "tok", {"segment_file": str(chunk), "start_offset": 0.0}, FakeEngine()))
     assert seen.get("cluster_speakers") is False
+
+
+def test_env_flags_default_on_and_can_be_switched_off(monkeypatch):
+    from app.diarization import _env_flag
+    monkeypatch.delenv("X_FLAG", raising=False)
+    assert _env_flag("X_FLAG", True) is True
+    monkeypatch.setenv("X_FLAG", "")          # docker-compose passes empty values through
+    assert _env_flag("X_FLAG", True) is True
+    monkeypatch.setenv("X_FLAG", "false")
+    assert _env_flag("X_FLAG", True) is False
+    monkeypatch.setenv("X_FLAG", "TRUE")
+    assert _env_flag("X_FLAG", False) is True
