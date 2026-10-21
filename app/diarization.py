@@ -1701,7 +1701,7 @@ class SpeakerRecognitionEngine:
                 if p["profile_type"] == "general":   # who someone is: their voice, not a per-emotion sample
                     stored.setdefault(p["speaker_id"], []).append(p["embedding"])
         if db_session is not None:
-            self._follow_user(list(assigned.values()), db_session, names)
+            self._follow_user(list(assigned.values()), db_session, names, tracks.conversation_id)
         identities: Dict[Optional[str], Dict] = {}
         # two voices in one chunk are two people: a speaker already carried by a track here is not given to another
         taken: List[int] = [t.speaker_id for t in assigned.values() if t.speaker_id is not None and not t.own_unknown]
@@ -1724,16 +1724,21 @@ class SpeakerRecognitionEngine:
         return identities
 
     @staticmethod
-    def _follow_user(tracks: List[live_tracking.Track], db_session, names: Dict[int, str]) -> None:
+    def _follow_user(tracks: List[live_tracking.Track], db_session, names: Dict[int, str],
+                     conversation_id: Optional[int] = None) -> None:
         """The user's word beats the voice match: a track whose latest saved segment now carries another speaker (the
         user identified, merged or renamed it, mid-session) takes that speaker from then on; a track whose own Unknown
         the user renamed to a person keeps it as a name. Read from the segments rather than trusting the stored id
-        alone, since SQLite can hand a deleted speaker's id to a new one."""
+        alone, since SQLite can hand a deleted speaker's id to a new one (and a deleted segment's id to a segment of
+        another conversation: only the session's own are read)."""
         last = {t.segment_ids[-1]: t for t in tracks if t.segment_ids}
         if not last:
             return
-        rows = db_session.query(ConversationSegment.id, ConversationSegment.speaker_id).filter(
-            ConversationSegment.id.in_(list(last))).all()
+        query = db_session.query(ConversationSegment.id, ConversationSegment.speaker_id).filter(
+            ConversationSegment.id.in_(list(last)))
+        if conversation_id is not None:
+            query = query.filter(ConversationSegment.conversation_id == conversation_id)
+        rows = query.all()
         for seg_id, speaker_id in rows:
             track = last[seg_id]
             if speaker_id != track.speaker_id:

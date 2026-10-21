@@ -14,7 +14,7 @@ track per voice:
   track gets a speaker, its earlier segments follow; when an Unknown of this session gets a name, every segment that
   carries it follows (SessionTracks.renames, applied by the caller).
 """
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -76,9 +76,20 @@ def best_speaker(voice: np.ndarray, seconds: float, people: Dict[int, List[np.nd
 class SessionTracks:
     """The tracks of one live session (chunks are processed one at a time, in order)."""
 
-    def __init__(self):
+    def __init__(self, conversation_id: Optional[int] = None):
+        self.conversation_id = conversation_id     # the session's conversation: its segments are the only ones read
         self.tracks: List[Track] = []
         self.renames: List[Tuple[int, int]] = []   # (Unknown of this session, speaker it became), for the caller
+
+    def snapshot(self):
+        """The tracks as they are, for restore() if the chunk about to change them is not saved: its segment ids, new
+        Unknowns and renames are rolled back with it, and SQLite can give those ids to other rows."""
+        return [replace(t, voice_sum=t.voice_sum.copy(), segment_ids=list(t.segment_ids)) for t in self.tracks], \
+            list(self.renames)
+
+    def restore(self, state):
+        tracks, renames = state
+        self.tracks, self.renames = tracks, renames
 
     def assign(self, voices: Dict[str, Tuple[np.ndarray, float]]) -> Dict[str, Track]:
         """{chunk speaker label: (voice, seconds of speech)} -> {label: its track}, one-to-one: the most similar
