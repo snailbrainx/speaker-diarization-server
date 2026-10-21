@@ -747,17 +747,13 @@ class SpeakerRecognitionEngine:
                 logger.info(f"faster-whisper model '{model_name}' loaded")
         return self._whisper_model
 
-    @property
     def batched_whisper(self):
-        """faster-whisper BatchedInferencePipeline over the same model (only used when WHISPER_BATCH_SIZE > 0)."""
-        if getattr(self, "_batched_whisper", None) is None:
-            model = self.whisper_model
-            with self._model_lock:
-                if getattr(self, "_batched_whisper", None) is None:
-                    from faster_whisper import BatchedInferencePipeline
-                    self._batched_whisper = BatchedInferencePipeline(model=model)
-                    logger.info(f"faster-whisper batched pipeline on (batch size {WHISPER_BATCH_SIZE})")
-        return self._batched_whisper
+        """A faster-whisper BatchedInferencePipeline over the shared model (only used when WHISPER_BATCH_SIZE > 0), new
+        for each transcription: the pipeline keeps the last word's end time between its batches (to place the next
+        word after a pause), so one shared by concurrent requests timed one file's words from another's. It holds
+        nothing else; the model is loaded once."""
+        from faster_whisper import BatchedInferencePipeline
+        return BatchedInferencePipeline(model=self.whisper_model)
 
     @property
     def parakeet_model(self):
@@ -861,7 +857,7 @@ class SpeakerRecognitionEngine:
         # faster-whisper transcription with word-level timestamps and confidence
         if WHISPER_BATCH_SIZE > 0:
             # Batched pipeline (VAD-chunked, always filters non-speech); see WHISPER_BATCH_SIZE above.
-            segments_generator, info = self.batched_whisper.transcribe(
+            segments_generator, info = self.batched_whisper().transcribe(
                 audio_file,
                 language=None if language == "auto" else language,
                 task="transcribe",
