@@ -65,9 +65,11 @@ def convert_numpy_to_native(obj):
     else:
         return obj
 
-# WebSocket streams use 48 kHz float32 PCM — same rate as the browser's
-# MediaRecorder default. The StreamingRecorder resamples internally.
+# WebSocket streams use 48 kHz float32 PCM by default — same rate as the browser's
+# MediaRecorder default. The start message may pick another: {"sample_rate": 16000,
+# "format": "int16"} is a sixth of the bandwidth. The models resample internally.
 WS_SAMPLE_RATE = 48000
+WS_FORMATS = {"float32": np.float32, "int16": np.int16}
 # Noise floor below which a frame is treated as silence. Tuned against typical
 # near-field microphones on a quiet channel; adjust in StreamingRecorder config
 # if you need different behaviour per-deployment.
@@ -148,6 +150,7 @@ def _make_segment_callback(
     conversation_id: int,
     processing_token: str,
     loop,
+    diarize: bool = True,
 ):
     """Bridge the recorder worker to the async handler with a hard deadline."""
     def segment_callback(seg_info):
@@ -157,6 +160,7 @@ def _make_segment_callback(
             processing_token,
             seg_info,
             get_engine(),
+            diarize=diarize,
         )
         try:
             future = asyncio.run_coroutine_threadsafe(coroutine, loop)
@@ -226,6 +230,14 @@ async def websocket_endpoint(
             )
             await _close_websocket_bounded(websocket)
             return
+        sample_rate = init_message.get("sample_rate") or WS_SAMPLE_RATE
+        sample_dtype = WS_FORMATS.get(init_message.get("format") or "float32")
+        if sample_dtype is None or not isinstance(sample_rate, int) or not 8000 <= sample_rate <= 48000:
+            await _send_message_bounded(websocket, "error", {
+                "message": "Unsupported audio: format must be float32 or int16, sample_rate 8000-48000"})
+            await _close_websocket_bounded(websocket)
+            return
+        sample_size = np.dtype(sample_dtype).itemsize
 
         # Create conversation
         processing_token = new_processing_token()
@@ -247,7 +259,7 @@ async def websocket_endpoint(
         settings = config.get_settings()
 
         recorder = StreamingRecorder(
-            sample_rate=WS_SAMPLE_RATE,
+            sample_rate=sample_rate,
             silence_threshold=WS_SILENCE_THRESHOLD,
             silence_duration=settings.silence_duration,
         )
@@ -257,8 +269,9 @@ async def websocket_endpoint(
 
         # Block until persistence completes, but through a bounded bridge so a
         # stalled client or engine cannot hang finalisation forever.
+        # "diarize": false in the start message: one person talking, no speaker diarization per chunk
         recorder.on_segment_processed = _make_segment_callback(
-            websocket, conversation_id, processing_token, loop
+            websocket, conversation_id, processing_token, loop, diarize=bool(init_message.get("diarize", True))
         )
 
         recorder.start_recording(conversation_id)
@@ -271,7 +284,7 @@ async def websocket_endpoint(
         # Send confirmation
         started_sent = await _send_message_bounded(websocket, "started", {
             "conversation_id": conversation_id,
-            "sample_rate": WS_SAMPLE_RATE,
+            "sample_rate": sample_rate,
             "message": "Recording started"
         })
         if not started_sent:
@@ -287,20 +300,20 @@ async def websocket_endpoint(
                 message = await websocket.receive()
 
                 if "bytes" in message:
-                    # Binary audio chunk (float32 PCM, 4 bytes/sample)
+                    # Binary audio chunk (PCM in the start message's format)
                     audio_bytes = message["bytes"]
                     logger.info(f"📦 Received audio chunk: {len(audio_bytes)} bytes")
 
                     # Clients occasionally send truncated frames — skip instead of crashing.
-                    if len(audio_bytes) % 4 != 0:
+                    if len(audio_bytes) % sample_size != 0:
                         logger.info(f"⚠️ Dropping misaligned audio chunk ({len(audio_bytes)} bytes)")
                         continue
 
-                    audio_array = np.frombuffer(audio_bytes, dtype=np.float32)
+                    audio_array = np.frombuffer(audio_bytes, dtype=sample_dtype)
                     logger.info(f"🔊 Converted to audio array: {len(audio_array)} samples")
 
                     # Process chunk (StreamingRecorder expects tuple of (sample_rate, audio_data))
-                    result = recorder.process_audio_chunk((WS_SAMPLE_RATE, audio_array))
+                    result = recorder.process_audio_chunk((sample_rate, audio_array))
                     logger.info(f"📊 VAD: {result['speech_detected']}, Level: {result['audio_level']:.3f}")
 
                     # Send status update
@@ -370,7 +383,8 @@ async def _handle_segment_processed(
     conversation_id: int,
     processing_token: str,
     segment_info: dict,
-    engine
+    engine,
+    diarize: bool = True,
 ):
     """
     Callback when StreamingRecorder finishes processing a segment.
@@ -417,6 +431,7 @@ async def _handle_segment_processed(
             db_session=db,
             # A live chunk holds a few seconds of speech: per-segment matching as before, never cluster mode.
             cluster_speakers=False,
+            diarize=diarize,
         )
 
         # Timeout only stops the recorder waiting; inference can still finish

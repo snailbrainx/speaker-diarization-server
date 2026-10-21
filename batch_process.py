@@ -149,8 +149,10 @@ def worker_main(gpu_id, file_queue, result_queue, known_speakers_raw,
     load_start = time.time()
     _ = engine.diarization_pipeline
     _ = engine.embedding_model
-    _ = engine.whisper_model
+    _ = engine.asr_model  # Whisper or Parakeet (ASR_BACKEND)
     _ = engine.emotion_model
+    gc.collect()
+    gc.freeze()  # keep the models' objects out of every later gc.collect() (~0.2 s each)
     load_time = time.time() - load_start
     print(f"[GPU {gpu_id}] All models loaded in {load_time:.1f}s")
 
