@@ -5,7 +5,6 @@ import logging
 import numpy as np
 import os
 import threading
-import time
 import wave
 from concurrent.futures import ThreadPoolExecutor, wait as futures_wait
 from contextlib import ExitStack
@@ -40,6 +39,47 @@ def _env_seconds(name: str, default: float, allow_zero: bool = False) -> float:
     return value
 
 
+class _SileroSpeech:
+    """Speech or not, per incoming packet, by Silero VAD (the ONNX copy inside faster-whisper, 32 ms frames at
+    16 kHz, ~1 ms of CPU per packet): unlike a fixed loudness threshold it works for quiet microphones (whose speech
+    stays under the threshold, so it was dropped as silence) and noisy rooms (never quiet enough to end a turn)."""
+    FRAME = 512
+    THRESHOLD = 0.5
+
+    def __init__(self, sample_rate: int):
+        from math import gcd
+        from faster_whisper.vad import get_vad_model
+        self.model = get_vad_model()
+        g = gcd(sample_rate, 16000)
+        self.up, self.down = 16000 // g, sample_rate // g
+        self.pending = np.zeros(0, np.float32)      # 16 kHz samples not yet a whole frame
+        self.context = np.zeros(self.FRAME, np.float32)
+        self.last = 0.0
+
+    def __call__(self, audio: np.ndarray) -> bool:
+        if self.up != self.down:
+            from scipy.signal import resample_poly
+            audio = resample_poly(audio, self.up, self.down)
+        x = np.concatenate([self.pending, audio.astype(np.float32)])
+        n = len(x) // self.FRAME * self.FRAME
+        self.pending = x[n:]
+        if n:
+            # the previous frame goes first so the first new frame has its real context; its output is dropped
+            probs = np.ravel(self.model(np.concatenate([self.context, x[:n]])))[1:]
+            self.context = x[n - self.FRAME:n]
+            self.last = float(probs.max())
+        return self.last >= self.THRESHOLD
+
+
+def _speech_detector(sample_rate: int, energy_threshold: float) -> Callable[[np.ndarray], bool]:
+    """Silero VAD if available, else the original loudness test (RMS above energy_threshold)."""
+    try:
+        return _SileroSpeech(sample_rate)
+    except Exception as e:  # noqa: BLE001 - no onnxruntime / model: fall back
+        logger.warning(f"Silero VAD unavailable ({e}); live speech detection by loudness")
+        return lambda audio: float(np.sqrt(np.mean(np.square(audio, dtype=np.float64)))) > energy_threshold
+
+
 def _quietest_point(audio: np.ndarray, sample_rate: int, window_sec: float = 0.2) -> int:
     """Sample index in the middle of the quietest window_sec stretch of the second half of audio."""
     win = max(1, int(window_sec * sample_rate))
@@ -53,6 +93,8 @@ class StreamingRecorder:
     """Handles continuous audio streaming with background processing."""
 
     MIN_SEGMENT_SECONDS = 0.5
+    MIN_FLUSH_SECONDS = 2.5   # a pause flushes only once this much audio is buffered (fewer, fuller chunks)
+    MIN_SPEECH_SECONDS = 0.25  # a chunk with less speech than this is not processed
     LONG_SEGMENT_WARN_SECONDS = 60.0
 
     def __init__(
@@ -86,7 +128,10 @@ class StreamingRecorder:
         # Audio buffering
         self.current_buffer: List[np.ndarray] = []
         self._buffered_samples = 0
-        self.last_speech_time = time.time()
+        self._silent_samples = 0  # audio received since the last chunk with speech: the clock is the audio, not the
+                                  # wall, so packets arriving in bursts neither cut nor delay segments
+        self._speech_samples = 0  # audio in the buffer that was speech (a buffer without enough is not processed)
+        self._is_speech = _speech_detector(sample_rate, silence_threshold)
         self.chunk_count = 0
         self.speech_detected = False
 
@@ -104,7 +149,7 @@ class StreamingRecorder:
         # its quietest point and the part before it processed, instead of waiting for a pause. 0 = off.
         self.LONG_TURN_SECONDS = _env_seconds("STREAM_LONG_TURN_SECONDS", 15.0, allow_zero=True)
         # Guards current_buffer, total_segments, segments_queued, segment_paths,
-        # cumulative_offset, and last_speech_time against concurrent flushes
+        # cumulative_offset, and _silent_samples against concurrent flushes
         # (process_audio_chunk from the WS thread vs. stop_recording's tail flush).
         self._lock = threading.Lock()
 
@@ -118,8 +163,9 @@ class StreamingRecorder:
         self.segments_processed = 0
         self.segments_failed = 0
 
-        # Paths of flushed segments (for later concatenation)
+        # Paths of flushed segments (for later concatenation) and where each starts in the session
         self.segment_paths: List[str] = []
+        self.segment_offsets: Dict[str, float] = {}
 
     def _segments_dir(self) -> str:
         return os.path.join(data_path(), "stream_segments", f"conv_{self.conversation_id}")
@@ -134,13 +180,14 @@ class StreamingRecorder:
         self.conversation_id = conversation_id
         self.current_buffer = []
         self._buffered_samples = 0
-        self.last_speech_time = time.time()
+        self._silent_samples = 0
         self.chunk_count = 0
         self.total_segments = 0
         self.segments_processed = 0
         self.segments_failed = 0
         self.segments_queued = 0
         self.segment_paths = []
+        self.segment_offsets = {}
         self.cumulative_offset = 0.0
         self.processing_futures = []
 
@@ -233,13 +280,15 @@ class StreamingRecorder:
             self._buffered_samples += len(audio_data)
             self.chunk_count += 1
 
-            if energy > self.silence_threshold:
-                self.last_speech_time = time.time()
+            if self._is_speech(audio_data):
+                self._silent_samples = 0
+                self._speech_samples += len(audio_data)
                 self.speech_detected = True
             else:
                 self.speech_detected = False
-                silence_elapsed = time.time() - self.last_speech_time
-                if silence_elapsed >= self.silence_duration and len(self.current_buffer) > 10:
+                self._silent_samples += len(audio_data)
+                if (self._silent_samples >= self.silence_duration * self.sample_rate
+                        and self._buffered_samples >= self.MIN_FLUSH_SECONDS * self.sample_rate):
                     self._flush_locked()
 
             # Bound RAM: force-flush if the unflushed buffer exceeds the cap
@@ -279,20 +328,24 @@ class StreamingRecorder:
         # decide not to flush, so pure-silence clients don't spin.
         self.current_buffer = [rest] if len(rest) else []
         self._buffered_samples = len(rest)
-        self.last_speech_time = time.time()
+        self._silent_samples = 0
+        speech_seconds = (self._speech_samples - min(self._speech_samples, len(rest))) / self.sample_rate
+        self._speech_samples = min(self._speech_samples, len(rest))
 
         duration = len(segment_audio) / self.sample_rate
+        # The session clock counts skipped audio too, so segment times are real times (and the full recording gets
+        # silence in their place): a skipped silent stretch used to shift every later segment earlier.
+        start_offset = self.cumulative_offset
+        self.cumulative_offset += duration
+        end_offset = self.cumulative_offset
         if duration < self.MIN_SEGMENT_SECONDS:
             logger.info(f"⏭️ Skipping segment (too short: {duration:.2f}s)")
             return
         if duration > self.LONG_SEGMENT_WARN_SECONDS:
             logger.info(f"⚠️ Long segment detected: {duration:.1f}s - processing may take longer")
 
-        avg_energy = float(np.sqrt(
-            np.mean(np.square(segment_audio, dtype=np.float64))
-        ))
-        if avg_energy < self.silence_threshold * 2:
-            logger.info(f"⏭️ Skipping segment (mostly silence, energy: {avg_energy:.4f})")
+        if speech_seconds < self.MIN_SPEECH_SECONDS:
+            logger.info(f"⏭️ Skipping segment (no speech: {speech_seconds:.2f}s of {duration:.1f}s)")
             return
 
         # Normalize
@@ -309,10 +362,6 @@ class StreamingRecorder:
             wf.setframerate(self.sample_rate)
             wf.writeframes((segment_audio * 32767).astype(np.int16).tobytes())
 
-        start_offset = self.cumulative_offset
-        end_offset = self.cumulative_offset + duration
-        self.cumulative_offset = end_offset
-
         segment_info = {
             "id": segment_id,
             "path": segment_path,
@@ -325,6 +374,7 @@ class StreamingRecorder:
         }
 
         self.segment_paths.append(segment_path)
+        self.segment_offsets[segment_path] = start_offset
         self.total_segments += 1
         self.segments_queued += 1
 
@@ -437,6 +487,15 @@ class StreamingRecorder:
 
                             if out_wf is None:
                                 raise RuntimeError("concatenation output was not initialised")
+                            # silence where audio was skipped, so the recording's times are the segments' times
+                            start = self.segment_offsets.get(seg_path)
+                            gap = int(round(start * sample_rate)) - total_frames if start is not None else 0
+                            silence = bytes(segment_format[0] * segment_format[1] * min(max(gap, 0), sample_rate))
+                            while gap > 0:
+                                n = min(gap, sample_rate)
+                                out_wf.writeframes(silence[:n * segment_format[0] * segment_format[1]])
+                                total_frames += n
+                                gap -= n
                             out_wf.writeframes(frames)
                             total_frames += frame_count
                             readable_segments += 1

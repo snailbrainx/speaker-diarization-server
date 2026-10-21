@@ -20,10 +20,13 @@ from app.streaming_recorder import StreamingRecorder
 
 @pytest.fixture(autouse=True)
 def _stub_services(tmp_path, monkeypatch):
-    """Stable temp data dir for the recorder (never the real ./data)."""
+    """Stable temp data dir for the recorder (never the real ./data); these tests drive it with steady tones, so
+    speech is detected by loudness here (the VAD's own tests are in test_live_recorder.py)."""
     from app import services, streaming_recorder
     monkeypatch.setattr(services, "data_path", lambda: str(tmp_path))
     monkeypatch.setattr(streaming_recorder, "data_path", lambda: str(tmp_path))
+    monkeypatch.setattr(streaming_recorder, "_speech_detector",
+                        lambda sr, threshold: lambda audio: float(np.abs(audio).mean()) > threshold)
     yield
 
 

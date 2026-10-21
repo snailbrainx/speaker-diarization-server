@@ -36,6 +36,8 @@ from .models import (
     SpeakerEmotionProfile,
 )
 from .config import VoiceSettings, get_config
+from .diarization import SPEAKER_EMBEDDING_MODEL
+from .services import LEGACY_VOICE_MODEL, VOICE_MODEL_KEY, migrate_voice_embeddings
 
 router = APIRouter(prefix="/profiles", tags=["Voice Profiles"])
 
@@ -285,6 +287,7 @@ def save_current_state(profile_name: str, description: str, db: Session, allow_o
         "description": description,
         "type": "profile",
         "settings": _tunable_settings(settings),
+        "voice_model": SPEAKER_EMBEDDING_MODEL,
         "speakers": speakers,
         "segments": segments,
     }
@@ -475,6 +478,7 @@ async def create_checkpoint(profile_name: str, db: Session = Depends(get_db)):
             "description": description,
             "type": "checkpoint",
             "settings": _tunable_settings(settings),
+            "voice_model": SPEAKER_EMBEDDING_MODEL,
             "speakers": speakers,
             "segments": segments,
         }
@@ -798,6 +802,16 @@ async def restore_from_file(filename: str, db: Session = Depends(get_db)):
         except Exception:  # noqa: BLE001 - model/cache availability must not undo a committed restore
             logger.info("Speaker cache invalidation skipped after restore")
 
+        # Voices from a backup made with another voice-embedding model (older backups: pyannote/embedding) are
+        # rebuilt from their recordings with the current one, as at startup.
+        voice_profiles_rebuilt = None
+        backup_voice_model = data.get("voice_model") or LEGACY_VOICE_MODEL
+        if backup_voice_model != SPEAKER_EMBEDDING_MODEL:
+            db.merge(AppMetadata(key=VOICE_MODEL_KEY, value=backup_voice_model))
+            db.commit()
+            from .api import get_engine
+            voice_profiles_rebuilt = migrate_voice_embeddings(db, get_engine())
+
         # A JSON settings file and SQLite cannot share one transaction. The DB
         # restore is already committed, so a later settings I/O failure must be
         # reported as explicit partial success rather than a false 500.
@@ -838,6 +852,7 @@ async def restore_from_file(filename: str, db: Session = Depends(get_db)):
             "legacy_restore_warning": legacy_warning,
             "settings_restored": settings_restored,
             "settings_warning": settings_warning,
+            "voice_profiles_rebuilt": voice_profiles_rebuilt,
         }
 
     try:

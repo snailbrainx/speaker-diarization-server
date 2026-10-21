@@ -40,8 +40,9 @@ async def update_voice_settings(updates: SettingsUpdateRequest):
     Note: Some settings may require restarting active streams or reprocessing.
 
     **Parameters:**
-    - **speaker_threshold**: Speaker similarity threshold (0.0-1.0). Lower = stricter matching.
-      - 0.30: Normal home usage (default)
+    - **speaker_threshold**: Speaker similarity threshold (0.1-0.9) for per-segment matching
+      (SPEAKER_ASSIGNMENT=segment, LIVE_SPEAKER_TRACKING=false). Higher = stricter matching.
+      - 0.30: Original default
       - 0.20: Noisy environments (movies, background noise)
     - **emotion_threshold**: Global emotion matching threshold (0.3-1.0). Higher = stricter matching.
       - 0.60: Balanced (default)

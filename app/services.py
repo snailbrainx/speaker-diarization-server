@@ -7,13 +7,13 @@ import json
 import logging
 import numpy as np
 from datetime import timedelta
-from typing import Any, Optional, Tuple, List
+from typing import Any, Dict, List, Optional, Tuple
 from sqlalchemy import exists
 from sqlalchemy.orm import Session, joinedload
 
-from .models import Speaker, ConversationSegment, SpeakerEmotionProfile
-from .diarization import (CENTROID_MAX_WEIGHT_SEC, CLUSTER_SPEAKERS, MIN_SEGMENT_DURATION_SEC, _centroid,
-                          auto_enroll_unknown_speaker)
+from .models import AppMetadata, Speaker, ConversationSegment, SpeakerEmotionProfile
+from .diarization import (CENTROID_MAX_WEIGHT_SEC, CLUSTER_SPEAKERS, MIN_SEGMENT_DURATION_SEC,
+                          SPEAKER_EMBEDDING_MODEL, _centroid, _in_memory, auto_enroll_unknown_speaker)
 
 logger = logging.getLogger(__name__)
 
@@ -248,6 +248,7 @@ def recalculate_emotion_profile(
         .options(joinedload(ConversationSegment.conversation))
         .filter(
             ConversationSegment.speaker_id == speaker_id,
+            ConversationSegment.is_misidentified == False,   # not this speaker's voice: never in their profiles
             ConversationSegment.emotion_corrected == True,
             ConversationSegment.emotion_misidentified == False,
             ConversationSegment.emotion_category == emotion_category,
@@ -392,6 +393,79 @@ def delete_unknown_speakers(db: Session, engine=None) -> Tuple[int, List[str]]:
         db.delete(speaker)
 
     return len(unknowns), names
+
+
+VOICE_MODEL_KEY = "speaker_embedding_model"
+LEGACY_VOICE_MODEL = "pyannote/embedding"
+
+
+def migrate_voice_embeddings(db: Session, engine) -> Optional[Dict[str, Any]]:
+    """Stored voices made by another voice-embedding model (SPEAKER_EMBEDDING_MODEL changed, or a database from before
+    the setting, made with pyannote/embedding) cannot be compared with new ones. Once: every segment of a speaker is
+    embedded again from its recording, then each speaker's voice, and the voice part of each emotion profile, is
+    rebuilt from those segments (emotion2vec embeddings do not depend on the voice model and are kept). A speaker
+    whose recordings are gone keeps their name and segments but has no voice (NaN, skipped by matching) until they
+    are identified again; their names are logged. Returns counts, or None when the stored voices are current."""
+    row = db.get(AppMetadata, VOICE_MODEL_KEY)
+    has_voices = (db.query(Speaker.id).first() is not None
+                  or db.query(ConversationSegment.id).filter(ConversationSegment.speaker_embedding.isnot(None)).first())
+    made_by = row.value if row else (LEGACY_VOICE_MODEL if has_voices else SPEAKER_EMBEDDING_MODEL)
+    if made_by == SPEAKER_EMBEDDING_MODEL:
+        if row is None:
+            db.add(AppMetadata(key=VOICE_MODEL_KEY, value=SPEAKER_EMBEDDING_MODEL))
+            db.commit()
+        return None
+    logger.info(f"Voice profiles were made by {made_by}; rebuilding them with {SPEAKER_EMBEDDING_MODEL}...")
+    db.query(ConversationSegment).update({ConversationSegment.speaker_embedding: None}, synchronize_session=False)
+    counts: Dict[str, Any] = {"segments": 0, "speakers_rebuilt": 0, "speakers_without_audio": []}
+    by_conversation: Dict[int, List[ConversationSegment]] = {}
+    for seg in db.query(ConversationSegment).filter(ConversationSegment.speaker_id.isnot(None)).all():
+        by_conversation.setdefault(seg.conversation_id, []).append(seg)
+    for segments in by_conversation.values():
+        path = resolve_audio_path(segments[0].conversation)
+        if not path or uses_segment_audio_fallback(segments[0].conversation, segments[0], path):
+            continue
+        try:
+            audio = _in_memory(path)
+        except Exception as e:  # noqa: BLE001 - one unreadable recording must not stop the others (or startup)
+            logger.warning(f"Voice rebuild: cannot read {path} ({e}); its segments are skipped")
+            continue
+        duration = audio["waveform"].shape[-1] / audio["sample_rate"]
+        for seg in segments:
+            if seg.end_offset > duration:   # past the end of the recording: no audio of its own
+                continue
+            emb = engine._segment_embedding_or_none(audio, {"start": seg.start_offset, "end": seg.end_offset})
+            seg.set_speaker_embedding(emb)
+            counts["segments"] += emb is not None
+    db.flush()
+    for speaker in db.query(Speaker).all():
+        if recalculate_speaker_embedding(speaker, db, engine):
+            counts["speakers_rebuilt"] += 1
+        else:
+            speaker.set_embedding(np.full(engine.embedding_dim, np.nan, dtype=np.float32))
+            counts["speakers_without_audio"].append(speaker.name)
+        for profile in speaker.emotion_profiles:
+            if profile.voice_embedding is None:
+                continue
+            voices = [v for (v,) in db.query(ConversationSegment.speaker_embedding).filter(
+                ConversationSegment.speaker_id == speaker.id, ConversationSegment.is_misidentified == False,  # noqa: E712
+                ConversationSegment.emotion_corrected == True, ConversationSegment.emotion_misidentified == False,  # noqa: E712
+                ConversationSegment.emotion_category == profile.emotion_category,
+                ConversationSegment.speaker_embedding.isnot(None)).all()]
+            embs = [np.frombuffer(v, dtype=np.float32) for v in voices]
+            profile.set_voice_embedding(np.mean(embs, axis=0) if embs else None)
+            profile.voice_sample_count = len(embs)
+    if row is None:
+        db.add(AppMetadata(key=VOICE_MODEL_KEY, value=SPEAKER_EMBEDDING_MODEL))
+    else:
+        row.value = SPEAKER_EMBEDDING_MODEL
+    db.commit()
+    _invalidate_speaker_cache(engine)
+    if counts["speakers_without_audio"]:
+        logger.warning(f"Voice rebuild: no recordings left for {', '.join(counts['speakers_without_audio'])}: "
+                       "identify each of them once in a new recording to recognise them again")
+    logger.info(f"Voice profiles rebuilt: {counts['speakers_rebuilt']} speakers from {counts['segments']} segments")
+    return counts
 
 
 def cleanup_orphaned_unknowns(db: Session, engine=None) -> List[str]:

@@ -40,6 +40,7 @@ services:
       - SPEAKER_ASSIGNMENT=${SPEAKER_ASSIGNMENT:-}
       - CLUSTER_SPEAKER_THRESHOLD=${CLUSTER_SPEAKER_THRESHOLD:-}
       - SNAP_TO_TURNS=${SNAP_TO_TURNS:-}
+      - OVERLAP_SEPARATION=${OVERLAP_SEPARATION:-}
     # Match the `app` user baked into the image (uid 1000) so bind-mounted
     # volumes stay writable without chown gymnastics on the host.
     user: "1000:1000"

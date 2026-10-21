@@ -43,6 +43,9 @@ RUN echo "torch==2.10.0" > /tmp/constraints.txt && \
     echo "torchaudio==2.10.0" >> /tmp/constraints.txt && \
     echo "torchcodec==0.10.0" >> /tmp/constraints.txt && \
     pip install --no-cache-dir -c /tmp/constraints.txt -r requirements.txt
+# clearvoice holds the MossFormer2 separation model (OVERLAP_SEPARATION). Its own pins (numpy<2, opencv, librosa)
+# are for its other models, so it goes in alone; the model's dependencies are in requirements.txt.
+RUN pip install --no-cache-dir --no-deps clearvoice==0.1.2
 COPY --from=speakrs /wheels /tmp/wheels
 RUN pip install --no-cache-dir /tmp/wheels/*.whl && rm -rf /tmp/wheels
 

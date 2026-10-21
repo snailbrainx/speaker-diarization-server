@@ -15,7 +15,9 @@ from datetime import datetime
 from typing import Optional
 
 from .database import SessionLocal, get_db, utc_now
-from .models import Conversation, ConversationSegment
+from .diarization import LIVE_SPEAKER_TRACKING
+from .live_tracking import SessionTracks
+from .models import Conversation, ConversationSegment, Speaker
 from .streaming_recorder import StreamingRecorder
 from .config import get_config
 from .conversation_lifecycle import (
@@ -151,6 +153,7 @@ def _make_segment_callback(
     processing_token: str,
     loop,
     diarize: bool = True,
+    tracks: Optional[SessionTracks] = None,
 ):
     """Bridge the recorder worker to the async handler with a hard deadline."""
     def segment_callback(seg_info):
@@ -161,6 +164,7 @@ def _make_segment_callback(
             seg_info,
             get_engine(),
             diarize=diarize,
+            tracks=tracks,
         )
         try:
             future = asyncio.run_coroutine_threadsafe(coroutine, loop)
@@ -270,8 +274,10 @@ async def websocket_endpoint(
         # Block until persistence completes, but through a bounded bridge so a
         # stalled client or engine cannot hang finalisation forever.
         # "diarize": false in the start message: one person talking, no speaker diarization per chunk
+        # LIVE_SPEAKER_TRACKING: the session's speakers are tracked across chunks and named from all their speech
         recorder.on_segment_processed = _make_segment_callback(
-            websocket, conversation_id, processing_token, loop, diarize=bool(init_message.get("diarize", True))
+            websocket, conversation_id, processing_token, loop, diarize=bool(init_message.get("diarize", True)),
+            tracks=SessionTracks() if LIVE_SPEAKER_TRACKING else None,
         )
 
         recorder.start_recording(conversation_id)
@@ -385,10 +391,13 @@ async def _handle_segment_processed(
     segment_info: dict,
     engine,
     diarize: bool = True,
+    tracks: Optional[SessionTracks] = None,
 ):
     """
     Callback when StreamingRecorder finishes processing a segment.
     Runs diarization + transcription (off the event loop), saves to DB, sends to client.
+    With tracks (LIVE_SPEAKER_TRACKING), a track that has just been named has its earlier segments relabelled and
+    the client is told with a "speaker_update" message.
 
     Owns its own DB session: the request-scoped session held by the WebSocket
     handler is not safe to share with this thread-scheduled coroutine, and the
@@ -429,9 +438,11 @@ async def _handle_segment_processed(
             known_speakers,
             threshold=threshold,
             db_session=db,
-            # A live chunk holds a few seconds of speech: per-segment matching as before, never cluster mode.
+            # A live chunk holds a few seconds of speech: never cluster mode; the session's tracks (if on) name
+            # each voice from all its speech so far, else every segment is matched on its own.
             cluster_speakers=False,
             diarize=diarize,
+            tracks=tracks,
         )
 
         # Timeout only stops the recorder waiting; inference can still finish
@@ -449,6 +460,7 @@ async def _handle_segment_processed(
         # Save segments to database
         conv_start = conversation.start_time
         segments_data = []
+        _save_tracks(db, result["segments"], engine)
 
         logger.info(f"📝 Processing {len(result['segments'])} segment(s) from transcription")
 
@@ -464,6 +476,8 @@ async def _handle_segment_processed(
                 engine=engine,
             )
             db.flush()
+            if seg.get("track") is not None:
+                seg["track"].segment_ids.append(segment.id)
 
             # Build response data from the created segment object
             emotion_conf = segment.emotion_confidence
@@ -484,6 +498,9 @@ async def _handle_segment_processed(
                 "avg_logprob": segment.avg_logprob
             })
 
+        # after this chunk's segments exist, so cleaning up orphaned Unknowns cannot take a new track's Unknown
+        speaker_updates = _relabel_tracks(db, conversation_id, tracks, result["segments"], engine)
+
         # Update conversation stats with an atomic SQL increment. A
         # read-modify-write on the ORM object across independent sessions
         # loses concurrent increments (two segment handlers → stored value 1).
@@ -499,6 +516,8 @@ async def _handle_segment_processed(
         # Send segments to client with bounded backpressure. Persistence is
         # already committed; a stuck browser must not pin recorder shutdown.
         logger.info(f"📤 Sending {len(segments_data)} segment(s) to client")
+        for update in speaker_updates:
+            await _send_message_bounded(websocket, "speaker_update", update)
         for seg_data in segments_data:
             logger.info(f"   → Segment: {seg_data['speaker_name']}: {seg_data['text'][:50]}...")
             await _send_message_bounded(websocket, "segment", seg_data)
@@ -516,6 +535,72 @@ async def _handle_segment_processed(
         raise
     finally:
         db.close()
+
+
+def _save_tracks(db: Session, segments: list, engine) -> None:
+    """Live tracks of this chunk: new voices get their Unknown and own Unknowns their grown voice (saved here, inside
+    the persistence lease, never during processing), and every segment takes its track's speaker."""
+    tracks = list({id(s["track"]): s["track"] for s in segments if s.get("track") is not None}.values())
+    if not tracks:
+        return
+    names = dict(db.query(Speaker.id, Speaker.name).filter(Speaker.id.in_([t.speaker_id for t in tracks])).all())
+    for track in tracks:
+        if track.speaker_id is not None and track.speaker_id not in names:   # deleted while this chunk ran
+            track.speaker_id, track.own_unknown = None, False
+    engine.save_track_voices(tracks, db)
+    db.flush()
+    names = dict(db.query(Speaker.id, Speaker.name).filter(Speaker.id.in_([t.speaker_id for t in tracks])).all())
+    for seg in segments:
+        track = seg.get("track")
+        if track is None:
+            continue
+        if track.speaker_id in names:
+            seg["speaker_id"], seg["speaker"] = track.speaker_id, names[track.speaker_id]
+            seg["is_known"] = not seg["speaker"].startswith("Unknown_")
+        else:   # provisional: a plain Unknown for now
+            seg.pop("speaker_id", None)
+            seg["speaker"], seg["is_known"] = "Unknown", False
+
+
+def _relabel_tracks(db: Session, conversation_id: int, tracks: Optional[SessionTracks], segments: list,
+                    engine) -> list:
+    """Live tracks of this chunk that now have a speaker take their earlier plain-"Unknown" (provisional) segments;
+    Unknowns of this session that have just become a named or matched speaker (tracks.renames) take this session's
+    segments that carry them, and the Unknown, left without segments, is deleted. Returns one "speaker_update"
+    message per change: {segment_ids, speaker_id, speaker_name, is_known}."""
+    updates = []
+    for track in {id(s["track"]): s["track"] for s in segments if s.get("track") is not None}.values():
+        if track.speaker_id is None or not track.segment_ids:
+            continue
+        rows = db.query(ConversationSegment).filter(ConversationSegment.id.in_(track.segment_ids),
+                                                    ConversationSegment.speaker_id.is_(None),
+                                                    ConversationSegment.speaker_name == "Unknown")
+        ids = [r.id for r in rows]
+        if ids:
+            speaker = db.query(Speaker).filter(Speaker.id == track.speaker_id).first()
+            rows.update({"speaker_id": speaker.id, "speaker_name": speaker.name}, synchronize_session=False)
+            updates.append({"segment_ids": ids, "speaker_id": speaker.id, "speaker_name": speaker.name,
+                            "is_known": not speaker.name.startswith("Unknown_")})
+    while tracks is not None and tracks.renames:
+        old, new = tracks.renames.pop(0)
+        speaker = db.query(Speaker).filter(Speaker.id == new).first()
+        if speaker is None:
+            continue
+        rows = db.query(ConversationSegment).filter(ConversationSegment.conversation_id == conversation_id,
+                                                    ConversationSegment.speaker_id == old)
+        ids = [r.id for r in rows]
+        rows.update({"speaker_id": speaker.id, "speaker_name": speaker.name}, synchronize_session=False)
+        db.flush()
+        if not db.query(ConversationSegment.id).filter(ConversationSegment.speaker_id == old).first():
+            db.query(Speaker).filter(Speaker.id == old, Speaker.name.like("Unknown_%")).delete(synchronize_session=False)
+        if ids:
+            updates.append({"segment_ids": ids, "speaker_id": speaker.id, "speaker_name": speaker.name,
+                            "is_known": not speaker.name.startswith("Unknown_")})
+        logger.info(f"🔁 Live session: {len(ids)} earlier segment(s) relabelled to {speaker.name}")
+    if updates:
+        db.flush()
+        engine.clear_speaker_cache()
+    return updates
 
 
 async def _finalize_recording(

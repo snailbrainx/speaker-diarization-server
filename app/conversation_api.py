@@ -498,9 +498,18 @@ async def identify_speaker_in_segment(
     old_speaker_name = segment.speaker_name
     old_speaker_id = segment.speaker_id
 
-    # Extract embedding FIRST if enrolling (needed for new speakers, off the event loop)
+    # An existing speaker (by id or name) needs no audio: their voice is rebuilt from their segments below
+    existing = (db.query(Speaker).filter(Speaker.id == speaker_id).first() if speaker_id
+                else db.query(Speaker).filter(Speaker.name == speaker_name).first() if speaker_name else None)
+
+    # Extract embedding FIRST if enrolling a new speaker (off the event loop). During a live recording there is no
+    # full recording yet, but the segment's own embedding was stored when it was saved.
     embedding = None
-    if enroll:
+    cached = segment.get_speaker_embedding()
+    if enroll and existing is None and conversation.status in {"recording", "processing"} \
+            and cached is not None and not np.isnan(cached).any():
+        embedding = cached
+    elif enroll and existing is None:
         audio_file = resolve_audio_path(conversation, segment)
         if not audio_file:
             raise HTTPException(
@@ -1193,21 +1202,9 @@ async def correct_emotion_in_segment(
                     logger.info(f"  → Added first voice sample for '{corrected_emotion}' profile")
 
                 voice_samples = profile.voice_sample_count
-
-                # Also update generic speaker profile (keeps it current)
-                speaker = db.query(Speaker).filter(Speaker.id == segment.speaker_id).first()
-                if speaker:
-                    existing_speaker_emb = speaker.get_embedding()
-                    # Get all non-misidentified segments for this speaker
-                    all_segments = db.query(ConversationSegment).filter(
-                        ConversationSegment.speaker_id == speaker.id,
-                        ConversationSegment.is_misidentified == False
-                    ).count()
-
-                    if all_segments > 0:
-                        speaker_weight = (all_segments - 1) / all_segments
-                        merged_speaker = (existing_speaker_emb * speaker_weight) + (voice_emb * (1 - speaker_weight))
-                        speaker.set_embedding(merged_speaker)
+                # The speaker's own voice profile is not touched: an emotion correction says how they sounded, not
+                # who they are (blending this segment's raw embedding in skewed the profile towards it, and towards
+                # whoever the segment really was if it carried the wrong speaker).
 
             merge_msg = f" (emotion: {sample_count} samples, voice: {voice_samples} samples)"
 
