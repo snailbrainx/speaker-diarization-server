@@ -105,12 +105,6 @@ export const api = {
 
   // per-speaker emotion profiles
   emotionProfiles: (speakerId) => call("GET", `/conversations/speakers/${speakerId}/emotion-profiles`),
-  setEmotionThreshold: (speakerId, threshold) =>
-    call("PATCH", `/conversations/speakers/${speakerId}/emotion-threshold`, { query: { threshold } }),
-  setProfileThreshold: (speakerId, cat, threshold) =>
-    call("PATCH", `/conversations/speakers/${speakerId}/emotion-profiles/${encodeURIComponent(cat)}/threshold`, { query: { threshold } }),
-  setProfileVoiceThreshold: (speakerId, cat, threshold) =>
-    call("PATCH", `/conversations/speakers/${speakerId}/emotion-profiles/${encodeURIComponent(cat)}/voice-threshold`, { query: { threshold } }),
   resetEmotionProfiles: (speakerId, cat) =>
     call("DELETE", `/conversations/speakers/${speakerId}/emotion-profiles`, { query: { emotion_category: cat } }),
 

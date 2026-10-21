@@ -6,7 +6,7 @@ import { MicCapture, encodeWav, rms, meterLevel, micAvailable } from "../audio.j
 import {
   h, clear, icon, button, toast, toastError, modal, confirmDialog, promptDialog, loading, emptyState, segmented,
   fmtRelative, fmtClock, fmtDuration, pct, count, isUnknown, isDeleted, displayName, initials, idColor, speakerChip,
-  emotionChip,
+  emotionChip, EMOTIONS,
 } from "../ui.js";
 import { identifyDialog } from "../viewer.js";
 
@@ -273,66 +273,52 @@ export function render(root) {
     setTimeout(() => name.focus(), 30);
   }
 
+  // What their emotion corrections taught: how much each emotion's score is raised or lowered for them
   async function emotionProfiles(s) {
-    let data, globalThreshold = 0.6;
-    try {
-      [data, { emotion_threshold: globalThreshold }] = await Promise.all([api.emotionProfiles(s.id), api.settings()]);
-    } catch (e) { return toastError(e); }
+    let data;
+    try { data = await api.emotionProfiles(s.id); } catch (e) { return toastError(e); }
     const bodyEl = h("div", { class: "stack" });
     const draw = () => {
       clear(bodyEl);
-      const custom = data.emotion_threshold != null;
-      const value = h("span", { class: "mono" }, (data.emotion_threshold ?? globalThreshold).toFixed(2));
-      const slider = h("input", { type: "range", min: 0.3, max: 1, step: 0.01, value: String(data.emotion_threshold ?? globalThreshold), disabled: !custom,
-        oninput: (e) => { value.textContent = Number(e.target.value).toFixed(2); },
-        onchange: async (e) => {
-          try { await api.setEmotionThreshold(s.id, Number(e.target.value)); data.emotion_threshold = Number(e.target.value); toast("Threshold saved", "ok", 1500); } catch (err) { toastError(err); }
-        } });
-      const useGlobal = h("label", { class: "switch" }, h("input", { type: "checkbox", checked: !custom, onchange: async (e) => {
-        try {
-          const t = e.target.checked ? null : globalThreshold;
-          await api.setEmotionThreshold(s.id, t);
-          data.emotion_threshold = t;
-          draw();
-        } catch (err) { toastError(err); }
-      } }), h("span", null, `Use the global threshold (${globalThreshold.toFixed(2)})`,
-        h("span", { class: "desc" }, "How closely a line must match one of their emotion profiles to take it over the generic detector.")));
-      bodyEl.append(h("div", { class: "field" }, useGlobal, h("div", { class: "row", style: { flexWrap: "nowrap" } }, slider, value)));
-      bodyEl.append(h("div", { class: "divider" }));
-      if (!data.profiles.length) {
-        bodyEl.append(h("div", { class: "empty", style: { padding: "20px" } }, icon("smile"), h("h3", null, "No emotion profile yet"),
-          h("p", null, `Correct the emotion of some of ${s.name}'s lines (with “learn” on) and their personal profile builds up here.`)));
+      const cal = data.calibration;
+      const counts = Object.fromEntries(data.profiles.map((p) => [p.emotion_category, p.sample_count]));
+      bodyEl.append(h("p", { class: "muted" },
+        `When the emotion detector gets one of ${s.name}'s lines wrong, correct it (with “learn” on). Their corrections adjust how `,
+        "the detector's scores are read for them: an emotion it calls too often for them is turned down, one it misses is turned up. ",
+        "A few corrections move the doubtful lines; clear emotions stay what they are."));
+      if (!cal) {
+        bodyEl.append(h("div", { class: "empty", style: { padding: "20px" } }, icon("smile"), h("h3", null, "Nothing learned yet"),
+          h("p", null, `Correct a few of ${s.name}'s lines: three or four are enough to stop an emotion being called for their ordinary voice.`)));
         return;
       }
-      const numInput = (val, min, max, save) => h("input", { class: "input sm", type: "number", step: 0.01, min, max, placeholder: "default",
-        value: val == null ? "" : String(val), style: { width: "90px" },
-        onchange: async (e) => {
-          const v = e.target.value === "" ? null : Number(e.target.value);
-          try { await save(v); toast("Saved", "ok", 1200); } catch (err) { toastError(err); }
-        } });
-      bodyEl.append(h("div", { class: "table-wrap" }, h("table", { class: "table" },
-        h("thead", null, h("tr", null, ["Emotion", "Learned from", "Match threshold", "Voice threshold", ""].map((t) => h("th", null, t)))),
-        h("tbody", null, data.profiles.map((p) => h("tr", null,
-          h("td", null, emotionChip(p.emotion_category, null) || p.emotion_category),
-          h("td", { class: "num" }, count(p.sample_count, "line"), p.voice_sample_count != null ? h("div", { class: "small muted" }, `${p.voice_sample_count} voice samples`) : null),
-          h("td", null, numInput(p.confidence_threshold, 0.3, 1, (v) => api.setProfileThreshold(s.id, p.emotion_category, v))),
-          h("td", null, numInput(p.voice_threshold, 0, 1, (v) => api.setProfileVoiceThreshold(s.id, p.emotion_category, v))),
-          h("td", { style: { textAlign: "right" } }, button("", { size: "sm", kind: "ghost", icon: "trash", title: "Forget this emotion",
-            onClick: async () => {
-              try { await api.resetEmotionProfiles(s.id, p.emotion_category); data = await api.emotionProfiles(s.id); draw(); } catch (e) { toastError(e); }
-            } }))))))));
+      const max = Math.max(1, ...Object.values(cal.offsets).map(Math.abs));
+      const SMALL = 0.25;   // a shift too small to change a line's emotion
+      const rows = Object.entries(cal.offsets).filter(([e, v]) => EMOTIONS[e] && (Math.abs(v) >= SMALL || counts[e]));
+      bodyEl.append(h("div", { class: "small muted" }, `Learned from ${count(cal.corrections, "correction")}.`),
+        h("div", { class: "table-wrap" }, h("table", { class: "table" },
+          h("thead", null, h("tr", null, ["Emotion", "Corrected to it", "For them it is", ""].map((t) => h("th", null, t)))),
+          h("tbody", null, rows.sort((a, b) => b[1] - a[1]).map(([emotion, v]) => h("tr", null,
+            h("td", null, emotionChip(emotion, null)),
+            h("td", { class: "num" }, counts[emotion] ? count(counts[emotion], "line") : "–"),
+            h("td", null, h("div", { class: "shift", title: `Offset ${v > 0 ? "+" : ""}${v.toFixed(2)} on the detector's score` },
+              h("span", { class: "shift-bar" }, h("i", { class: v < 0 ? "down" : "up", style: { width: `${(Math.abs(v) / max) * 50}%` } })),
+              h("span", { class: "small muted" }, Math.abs(v) < SMALL ? "unchanged" : v > 0 ? "more likely" : "less likely"))),
+            h("td", { style: { textAlign: "right" } }, counts[emotion] ? button("", { size: "sm", kind: "ghost", icon: "trash", title: `Forget the corrections to ${emotion}`,
+              onClick: async () => {
+                try { await api.resetEmotionProfiles(s.id, emotion); data = await api.emotionProfiles(s.id); draw(); } catch (e) { toastError(e); }
+              } }) : null)))))));
     };
     draw();
     modal({
-      title: `${s.name}: emotion profile`, wide: true, cancelLabel: "Close", body: bodyEl,
+      title: `${s.name}: emotions`, wide: true, cancelLabel: "Close", body: bodyEl,
       actions: [{
         label: "Forget all", kind: "danger", icon: "trash",
         onClick: async () => {
-          if (!data.profiles.length) return false;
+          if (!data.calibration) return false;
           await api.resetEmotionProfiles(s.id);
           data = await api.emotionProfiles(s.id);
           draw();
-          toast("Emotion profile cleared", "ok");
+          toast("Their corrections are no longer learned from", "ok");
           return false;
         },
       }],

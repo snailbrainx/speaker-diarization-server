@@ -171,13 +171,13 @@ export async function emotionDialog(conversationId, seg) {
   draw();
   const canLearn = seg.speaker_id != null;
   const learn = h("label", { class: "switch" }, h("input", { type: "checkbox", checked: canLearn, disabled: !canLearn }),
-    h("span", null, `Learn how ${displayName(seg.speaker_name, seg.speaker_id)} sounds when ${chosen ? "like this" : "feeling this"}`,
+    h("span", null, `Learn from this for ${displayName(seg.speaker_name, seg.speaker_id)}`,
       h("span", { class: "desc" }, canLearn
-        ? "Adds this line to the speaker's personal emotion profile, so their future lines are judged against it."
-        : "Identify the speaker first: emotion profiles belong to a person.")));
+        ? "Their corrections adjust how the detector reads their voice: a few lines corrected to neutral stop their ordinary voice being called happy, and clear emotions stay what they are."
+        : "Identify the speaker first: what is learned belongs to a person.")));
   const wrong = seg.emotion_corrected ? h("label", { class: "switch" },
     h("input", { type: "checkbox", checked: !!seg.emotion_misidentified }),
-    h("span", null, "This correction was a mistake", h("span", { class: "desc" }, "Leaves it out of the speaker's emotion profile."))) : null;
+    h("span", null, "Leave this correction out of learning", h("span", { class: "desc" }, "The line keeps its emotion; the detector no longer learns from it."))) : null;
   const bd = seg.detector_breakdown;
   const detected = h("div", { class: "small muted" },
     seg.emotion_category ? ["Detected: ", emotionInfo(seg.emotion_category).label, seg.emotion_confidence != null ? ` (${pct(seg.emotion_confidence)})` : "",

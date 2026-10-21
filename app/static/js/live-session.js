@@ -142,7 +142,8 @@ class LiveSession extends EventTarget {
         const seg = this.byId.get(id);
         if (!seg) continue;
         changed.push({ seg, before: { speaker_id: seg.speaker_id, speaker_name: seg.speaker_name } });
-        Object.assign(seg, { speaker_id: data.speaker_id, speaker_name: data.speaker_name, is_known: data.is_known });
+        Object.assign(seg, { speaker_id: data.speaker_id, speaker_name: data.speaker_name, is_known: data.is_known },
+          data.emotions?.[id] || {});   // read again with the speaker's emotion corrections
       }
       this.emit("speaker_update", { update: data, changed });
       this.log("speaker_update", `${data.segment_ids?.length || 0} line(s) → ${data.speaker_name}${data.is_known ? " (known)" : ""}`);

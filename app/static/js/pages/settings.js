@@ -7,8 +7,6 @@ import { micAvailable } from "../audio.js";
 const FIELDS = [
   { key: "speaker_threshold", label: "Speaker match threshold", min: 0.1, max: 0.9, step: 0.01,
     desc: "How close a single line's voice must be to a stored speaker to take their name. Only used when lines are matched one by one (SPEAKER_ASSIGNMENT=segment, or live tracking off); the default whole-speaker matching has its own threshold (CLUSTER_SPEAKER_THRESHOLD)." },
-  { key: "emotion_threshold", label: "Emotion profile threshold", min: 0.3, max: 1, step: 0.01,
-    desc: "How closely a line must match someone's personal emotion profile to use it instead of the generic detector. Higher means fewer, surer personal matches." },
   { key: "silence_duration", label: "Live pause length", min: 0.1, max: 5, step: 0.05, unit: "s",
     desc: "How long a pause in a live stream must be before the speech so far is processed. Shorter gives lines sooner, longer gives each chunk more context." },
   { key: "context_padding", label: "Voice context padding", min: 0.05, max: 2, step: 0.05, unit: "s",
