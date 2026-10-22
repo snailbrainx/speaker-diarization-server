@@ -21,8 +21,9 @@ only uses the public API, so it doubles as an example client.
   and emotions per speaker, and the transcript with words under 50% confidence underlined and the word being played
   highlighted. Name a voice, move a line to someone else, leave a line out of a voice profile, correct an emotion,
   recalculate emotions, reprocess, export (text, subtitles, JSON).
-- **Speakers** — enrol someone from a sample or a recording made in the browser, rename, delete, name or clear
-  `Unknown` voices, and tune each person's emotion profile.
+- **Speakers** — enrol someone from a sample or a recording made in the browser, rename, delete; play `Unknown`
+  voices, merge one into the person it sounds like, clean up the ones heard only briefly; see what each person's
+  emotion corrections have taught.
 - **Backups** — save, restore, checkpoint, download and import profiles.
 - **Settings** — the runtime settings (`/api/v1/settings/voice`) and server status.
 
@@ -32,21 +33,25 @@ Browsers only allow the microphone on HTTPS pages (or on `localhost`): to record
 
 ### Screenshots
 
-The screenshots below are from an older version of the separate example
-[Next.js frontend](https://github.com/snailbrainx/speaker_identity_nextjs) and may not match the current API or features.
+A demo with recordings from the [AMI Meeting Corpus](https://groups.inf.ed.ac.uk/ami/corpus/) (CC BY 4.0): two people
+enrolled from short samples, a third named from an uploaded meeting, then a later meeting streamed live, in which all
+three are recognised by name and the voice nobody named stays the same `Unknown`.
 
 <table>
   <tr>
-    <td align="center"><img src="screenshots/1.png" width="300" alt="Voice Profile Management"/><br/>Voice Profile Management</td>
-    <td align="center"><img src="screenshots/2.png" width="300" alt="Process Audio"/><br/>Process Audio</td>
-    <td align="center"><img src="screenshots/3.png" width="300" alt="Conversation Detail"/><br/>Conversation Detail</td>
+    <td align="center"><img src="screenshots/live.png" width="300" alt="Live session"/><br/>Live</td>
+    <td align="center"><img src="screenshots/transcribe.png" width="300" alt="Transcribe a file"/><br/>Transcribe a file</td>
+    <td align="center"><img src="screenshots/conversation.png" width="300" alt="Conversation with timeline, talk time and emotions"/><br/>Conversation</td>
   </tr>
   <tr>
-    <td align="center"><img src="screenshots/4.png" width="300" alt="Conversations List"/><br/>Conversations List</td>
-    <td align="center"><img src="screenshots/5.png" width="300" alt="Speaker Management"/><br/>Speaker Management</td>
-    <td align="center"><img src="screenshots/6.png" width="300" alt="Live Recording"/><br/>Live Recording</td>
+    <td align="center"><img src="screenshots/playback-dark.png" width="300" alt="Playback following the transcript, dark theme"/><br/>Playback (dark theme)</td>
+    <td align="center"><img src="screenshots/speakers.png" width="300" alt="Speakers and Unknown voices"/><br/>Speakers</td>
+    <td align="center"><img src="screenshots/backups-dark.png" width="300" alt="Backups, dark theme"/><br/>Backups (dark theme)</td>
   </tr>
 </table>
+
+An older, separate example client, the [Next.js frontend](https://github.com/snailbrainx/speaker_identity_nextjs),
+predates this interface and no longer matches the API.
 
 ## Features
 
