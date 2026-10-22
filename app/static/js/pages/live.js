@@ -229,21 +229,29 @@ export function render(root) {
     h("code", null, "certs/"), " (", h("code", null, "./generate_cert.sh"), " makes a self-signed one) and open ",
     h("code", null, `https://${location.host}`), ". Streaming a file works without it.")) : null;
 
+  const top = h("div", { class: "stack", style: { gap: "16px" } }, recorder, stats, doneBox);
+  const transcriptCard = h("div", { class: "card" }, h("div", { class: "card-head" }, h("h2", null, icon("chat"), "Transcript"), feedCount), feed);
+  const voicesCard = h("div", { class: "card" }, h("div", { class: "card-head" }, h("h2", null, icon("users"), "Voices")),
+    h("div", { class: "card-body" }, speakersBox));
+  const main = h("div", { class: "stack", style: { gap: "16px", minWidth: "0" } });
+  const side = h("div", { class: "stack", style: { gap: "16px" } });
   root.append(h("div", { class: "page" },
     h("div", { class: "page-head" }, h("div", null, h("h1", null, "Live"),
       h("p", { class: "sub" }, "Stream your microphone, or a file at real-time pace, and see who is speaking as it happens. Each voice is followed through the session and named as soon as it clearly matches someone you have named before."))),
     insecure,
-    h("div", { class: "live-top" }, h("div", { class: "stack", style: { gap: "16px" } }, recorder, stats, doneBox), optionsCard),
-    h("div", { class: "grid", style: { gridTemplateColumns: "minmax(0, 1fr) 320px" }, id: "live-grid" },
-      h("div", { class: "card" }, h("div", { class: "card-head" }, h("h2", null, icon("chat"), "Transcript"), feedCount), feed),
-      h("div", { class: "card", style: { alignSelf: "start" } }, h("div", { class: "card-head" }, h("h2", null, icon("users"), "Voices")),
-        h("div", { class: "card-body" }, speakersBox))),
+    h("div", { class: "live-main" }, main, side),
     h("details", { class: "card collapse" },
       h("summary", { class: "card-head" }, h("h2", null, icon("chevronRight", "chev"), icon("terminal"), "Event log"), logCount),
       logBox)));
 
+  // Two columns that stack independently (the transcript right under the recorder, however tall the source card is);
+  // one column on narrow screens, with the source before the transcript
   const narrow = matchMedia("(max-width: 1000px)");
-  const layout = () => { root.querySelector("#live-grid").style.gridTemplateColumns = narrow.matches ? "1fr" : "minmax(0, 1fr) 320px"; };
+  const layout = () => {
+    if (narrow.matches) main.append(top, optionsCard, transcriptCard, voicesCard);
+    else { main.append(top, transcriptCard); side.append(optionsCard, voicesCard); }
+    side.hidden = narrow.matches;
+  };
   narrow.addEventListener("change", layout);
   layout();
 

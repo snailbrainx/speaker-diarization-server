@@ -511,7 +511,7 @@ export function conversationView(initial, opts = {}) {
 
   function updatePlayhead() {
     const t = audio.currentTime || 0;
-    if (timeEl) timeEl.textContent = `${fmtClock(t, 1)} / ${fmtClock(duration)}`;
+    if (timeEl) timeEl.textContent = `${fmtClock(t, 1)} / ${fmtClock(Math.round(duration))}`;
     if (playheadEl) playheadEl.style.left = `${(t / (duration || 1)) * 100}%`;
   }
 

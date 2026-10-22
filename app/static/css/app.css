@@ -349,8 +349,8 @@ input[type="range"] { width: 100%; accent-color: var(--accent); }
 .file-card .name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 /* ---------- live ---------- */
-.live-top { display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 16px; }
-@media (max-width: 1000px) { .live-top { grid-template-columns: 1fr; } }
+.live-main { display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 16px; align-items: start; }
+@media (max-width: 1000px) { .live-main { grid-template-columns: 1fr; } }
 .recorder { display: flex; align-items: center; gap: 22px; padding: 22px; flex-wrap: wrap; }
 .rec-btn {
   width: 76px; height: 76px; border-radius: 50%; flex: none; cursor: pointer; position: relative;

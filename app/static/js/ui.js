@@ -102,9 +102,12 @@ export function fmtClock(sec, decimals = 0) {
 
 export function fmtDuration(sec) {
   if (sec == null || !isFinite(sec)) return "–";
-  if (sec < 60) return `${sec.toFixed(sec < 10 ? 1 : 0)} s`;
-  const m = Math.floor(sec / 60), s = Math.round(sec % 60);
-  if (m < 60) return `${m}m ${String(s).padStart(2, "0")}s`;
+  if (sec < 59.5) return `${sec.toFixed(sec < 9.95 ? 1 : 0)} s`;
+  if (sec < 3599.5) {
+    const s = Math.round(sec);   // rounded before splitting, so 179.6 s is 3m 00s, not 2m 60s
+    return `${Math.floor(s / 60)}m ${String(s % 60).padStart(2, "0")}s`;
+  }
+  const m = Math.round(sec / 60);
   return `${Math.floor(m / 60)}h ${String(m % 60).padStart(2, "0")}m`;
 }
 
