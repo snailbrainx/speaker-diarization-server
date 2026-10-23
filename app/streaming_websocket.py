@@ -489,6 +489,7 @@ async def _handle_segment_processed(
 
             segments_data.append({
                 "segment_id": segment.id,
+                "speaker_id": segment.speaker_id,
                 "speaker_name": segment.speaker_name,
                 "text": segment.text,
                 "start_offset": float(segment.start_offset),
@@ -498,7 +499,7 @@ async def _handle_segment_processed(
                 "emotion_confidence": float(emotion_conf) if emotion_conf is not None else None,
                 "detector_breakdown": convert_numpy_to_native(detector_breakdown) if detector_breakdown else None,
                 "is_known": seg.get("is_known", False),
-                "words": seg.get("words", []),
+                "words": segment.words or [],
                 "avg_logprob": segment.avg_logprob
             })
 
@@ -569,12 +570,31 @@ def _save_tracks(db: Session, segments: list, engine) -> None:
             seg["speaker"], seg["is_known"] = "Unknown", False
 
 
+def _reread_emotions(db: Session, engine, segment_ids: list, speaker_id: int) -> dict:
+    """Segments that have just become this speaker's are read with the speaker's emotion corrections (if any), as
+    their new lines are. -> {segment id: {emotion_category, emotion_confidence}} of the segments read again."""
+    calibration_of = getattr(engine, "speaker_emotion_calibration", None)
+    calibration = calibration_of(speaker_id, db) if calibration_of else None
+    if calibration is None:
+        return {}
+    changed = {}
+    for seg in db.query(ConversationSegment).filter(ConversationSegment.id.in_(segment_ids),
+                                                    ConversationSegment.emotion_corrected == False):  # noqa: E712
+        personal = engine.calibrated_emotion(seg.get_emotion_embedding(), calibration)
+        if personal:
+            seg.emotion_category, seg.emotion_confidence = personal["emotion"], personal["confidence"]
+            seg.detector_breakdown = json.dumps(personal["breakdown"])
+            changed[seg.id] = {"emotion_category": seg.emotion_category, "emotion_confidence": seg.emotion_confidence}
+    return changed
+
+
 def _relabel_tracks(db: Session, conversation_id: int, tracks: Optional[SessionTracks], segments: list,
                     engine) -> list:
     """Live tracks of this chunk that now have a speaker take their earlier plain-"Unknown" (provisional) segments;
     Unknowns of this session that have just become a named or matched speaker (tracks.renames) take this session's
-    segments that carry them, and the Unknown, left without segments, is deleted. Returns one "speaker_update"
-    message per change: {segment_ids, speaker_id, speaker_name, is_known}."""
+    segments that carry them, and the Unknown, left without segments, is deleted. The moved segments' emotions are
+    read with the speaker's corrections. Returns one "speaker_update" message per change: {segment_ids, speaker_id,
+    speaker_name, is_known, emotions} (emotions: {segment id: {emotion_category, emotion_confidence}} read again)."""
     updates = []
     for track in {id(s["track"]): s["track"] for s in segments if s.get("track") is not None}.values():
         if track.speaker_id is None or not track.segment_ids:
@@ -588,7 +608,8 @@ def _relabel_tracks(db: Session, conversation_id: int, tracks: Optional[SessionT
             speaker = db.query(Speaker).filter(Speaker.id == track.speaker_id).first()
             rows.update({"speaker_id": speaker.id, "speaker_name": speaker.name}, synchronize_session=False)
             updates.append({"segment_ids": ids, "speaker_id": speaker.id, "speaker_name": speaker.name,
-                            "is_known": not speaker.name.startswith("Unknown_")})
+                            "is_known": not speaker.name.startswith("Unknown_"),
+                            "emotions": _reread_emotions(db, engine, ids, speaker.id)})
     while tracks is not None and tracks.renames:
         old, new = tracks.renames.pop(0)
         speaker = db.query(Speaker).filter(Speaker.id == new).first()
@@ -603,7 +624,8 @@ def _relabel_tracks(db: Session, conversation_id: int, tracks: Optional[SessionT
             db.query(Speaker).filter(Speaker.id == old, Speaker.name.like("Unknown_%")).delete(synchronize_session=False)
         if ids:
             updates.append({"segment_ids": ids, "speaker_id": speaker.id, "speaker_name": speaker.name,
-                            "is_known": not speaker.name.startswith("Unknown_")})
+                            "is_known": not speaker.name.startswith("Unknown_"),
+                            "emotions": _reread_emotions(db, engine, ids, speaker.id)})
         logger.info(f"🔁 Live session: {len(ids)} earlier segment(s) relabelled to {speaker.name}")
     if updates:
         db.flush()

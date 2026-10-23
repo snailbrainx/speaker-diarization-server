@@ -49,16 +49,17 @@ def test_chunks_join_the_track_of_their_voice_one_to_one():
     assert len(tracks.tracks) == 3 and first["S1"].seconds == 4.0
 
 
-def test_a_track_is_named_only_when_its_voice_is_clear_and_long_enough():
+def test_a_track_is_named_only_when_its_voice_is_clear():
     tracks = lt.SessionTracks()
     t = tracks.assign({"S0": (A, 1.0)})["S0"]
     stored = {1: [A], 2: [B]}
-    assert tracks.identify(t, stored) is None                          # 1 s: too little speech
-    tracks.assign({"S0": (A, 2.0)})
-    assert tracks.identify(t, stored)[0] == 1
+    assert tracks.identify(t, stored)[0] == 1                          # one short line, clearly them: named
     assert tracks.identify(t, {1: [A], 2: [A * 0.99 + B * 0.01]}) is None   # two people alike: no guess
     assert tracks.identify(t, {2: [B]}) is None                        # nobody like it: stays Unknown
     assert tracks.identify(t, stored, taken=(1,)) is None              # given to another voice of this chunk
+    at = lambda sim: [sim * A + np.sqrt(1 - sim ** 2) * C]             # a stored voice this similar to the track's
+    assert tracks.identify(t, {1: at(0.65)})[0] == 1                   # a short line scores ~0.6 against its owner
+    assert tracks.identify(t, {1: at(0.58)}) is None
 
 
 def test_a_second_track_of_one_voice_shares_its_unknown_and_both_follow_its_name():
@@ -109,19 +110,19 @@ def test_live_strangers_get_one_unknown_each_and_known_people_their_name(eng, db
     assert again["S0"]["speaker"] == stranger and db.query(Speaker).count() == 2
 
 
-def test_a_short_new_voice_stays_a_plain_unknown_until_it_is_clear(eng, db):
-    enroll(db, "Ann", A)
+def test_short_lines_are_named_and_new_voices_are_known_in_the_next_session(eng, db):
+    """Someone who speaks in short replies: named from their first line in every session, and a voice nobody named
+    is stored at once, so the next session gives it the same Unknown (it was a plain "Unknown" with nothing stored
+    before 3 s of speech, and a name needed 2 s: a session of short replies never got either)."""
+    ann = enroll(db, "Ann", A)
     db.commit()
-    tracks = lt.SessionTracks()
-    first = chunk(eng, db, tracks, {"S0": (A, 1.5)})                   # too short to name, too short for an Unknown
-    assert first["S0"]["speaker"] == "Unknown" and first["S0"].get("speaker_id") is None
-    assert db.query(Speaker).count() == 1                              # no stranger created for a few words
-    second = chunk(eng, db, tracks, {"S0": (A, 2.0)})
-    assert second["S0"]["speaker"] == "Ann" and tracks.renames == []
-    stranger = chunk(eng, db, tracks, {"S1": (B, 2.0)})
-    assert stranger["S1"].get("speaker_id") is None
-    stranger = chunk(eng, db, tracks, {"S1": (B, 1.5)})                # 3.5 s now: its own Unknown
-    assert stranger["S1"]["speaker"].startswith("Unknown_") and db.query(Speaker).count() == 2
+    first = chunk(eng, db, lt.SessionTracks(), {"S0": (A, 1.2), "S1": (B, 1.2)})
+    assert (first["S0"]["speaker"], first["S0"]["speaker_id"]) == ("Ann", ann)
+    stranger = first["S1"]["speaker"]
+    assert stranger.startswith("Unknown_") and db.query(Speaker).count() == 2
+    later = chunk(eng, db, lt.SessionTracks(), {"S0": (B, 1.1), "S1": (A, 1.0)})   # another session
+    assert later["S0"]["speaker"] == stranger and later["S1"]["speaker"] == "Ann"
+    assert db.query(Speaker).count() == 2
 
 
 def test_provisional_segments_take_their_tracks_speaker_later(db):
@@ -142,7 +143,8 @@ def test_provisional_segments_take_their_tracks_speaker_later(db):
             pass
 
     updates = _relabel_tracks(db, conv.id, lt.SessionTracks(), [{"track": track}], Eng())
-    assert updates == [{"segment_ids": [seg.id], "speaker_id": ann, "speaker_name": "Ann", "is_known": True}]
+    assert updates == [{"segment_ids": [seg.id], "speaker_id": ann, "speaker_name": "Ann", "is_known": True,
+                        "emotions": {}}]   # Ann has no emotion corrections: emotions stay as they were
     db.expire_all()
     assert db.get(ConversationSegment, seg.id).speaker_name == "Ann"
 

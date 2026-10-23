@@ -9,10 +9,10 @@ track per voice:
 - a track is named from that voice: the stored speaker (a person, or an Unknown from an earlier session) it matches
   with at least NAME_SIMILARITY and NAME_MARGIN above the next one, once it has MIN_NAME_SECONDS of speech; failing
   that, another track of this session it matches the same way (two tracks of one voice share one Unknown); failing
-  that, once it has PROVISIONAL_SECONDS of speech, an Unknown of its own (before that its segments are a plain
-  "Unknown" with no stored speaker, so a few words nobody can place do not each become a stranger to name). When a
-  track gets a speaker, its earlier segments follow; when an Unknown of this session gets a name, every segment that
-  carries it follows (SessionTracks.renames, applied by the caller).
+  that, once it has PROVISIONAL_SECONDS of speech, an Unknown of its own, stored, so the voice is recognised in later
+  sessions (before that its segments are a plain "Unknown" with no stored speaker). When a track gets a speaker, its
+  earlier segments follow; when an Unknown of this session gets a name, every segment that carries it follows
+  (SessionTracks.renames, applied by the caller).
 """
 from dataclasses import dataclass, field, replace
 from typing import Dict, List, Optional, Tuple
@@ -21,12 +21,15 @@ import numpy as np
 
 # Tuned on live replays of the AMI test meetings with the default voice model (WeSpeaker ResNet34): people named in a
 # first meeting are named in the next with 93.8% of their speech right and 2.9% wrong in its first 8 minutes (most of
-# the wrong share is diarization mixing two voices in a chunk); speakers nobody named are never named, one Unknown each.
+# the wrong share is diarization mixing two voices in a chunk); speakers nobody named are never named, even when only
+# one person is enrolled. Spoken as short phrases (each 0.8-2 s line a chunk of its own; one line's voice is only
+# about 0.5 similar to the same person's next line), named people are named in 65% of their speech (50% when a name
+# took 0.70 and 2 s of speech, which a session of short replies may never reach) with 1.8% wrong.
 JOIN_SIMILARITY = 0.50   # a chunk's speaker joins a track whose voice is at least this similar (else a new track)
-NAME_SIMILARITY = 0.70   # a track takes a stored speaker's name at this similarity
+NAME_SIMILARITY = 0.62   # a track takes a stored speaker's name at this similarity
 NAME_MARGIN = 0.05       # ... and only this far above the next stored speaker
-MIN_NAME_SECONDS = 2.0   # ... and only once it has this much speech
-PROVISIONAL_SECONDS = 3.0  # a voice nobody matches gets its own Unknown only after this much speech
+MIN_NAME_SECONDS = 0.0   # ... and only once it has this much speech
+PROVISIONAL_SECONDS = 0.0  # a voice nobody matches gets its own stored Unknown after this much speech
 WEIGHT_CAP_SEC = 10.0    # one chunk counts for at most this long in a track's voice (as cluster mode's centroids)
 
 

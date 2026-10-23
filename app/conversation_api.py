@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 from typing import Optional
 import asyncio
 import json
+import mimetypes
 import os
 
 from .database import get_db, utc_now
@@ -19,6 +20,7 @@ from .schemas import (
     ToggleMisidentifiedRequest,
 )
 from .diarization import SpeakerRecognitionEngine
+from .emotion_calibration import LABELS as EMOTION_LABELS
 from .api import get_engine
 from .config import get_config
 from .conversation_lifecycle import (
@@ -117,6 +119,26 @@ async def get_conversation(conversation_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Conversation not found")
 
     return conversation
+
+
+@router.get("/{conversation_id}/audio")
+async def get_conversation_audio(conversation_id: int, db: Session = Depends(get_db)):
+    """The conversation's whole recording: an upload as it was processed, a live recording once it has finished.
+    Answers HTTP range requests, so a player can seek in a long recording without downloading all of it."""
+    conversation = db.query(Conversation).filter(
+        Conversation.id == conversation_id
+    ).first()
+    if not conversation:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    if not conversation.audio_path or not os.path.exists(conversation.audio_path):
+        raise HTTPException(status_code=404, detail="Audio file not found")
+    ext = os.path.splitext(conversation.audio_path)[1].lower()
+    return FileResponse(
+        path=conversation.audio_path,
+        media_type=mimetypes.guess_type(conversation.audio_path)[0] or "application/octet-stream",
+        filename=f"conversation_{conversation_id}{ext}",
+        content_disposition_type="inline",
+    )
 
 
 @router.patch("/{conversation_id}", response_model=ConversationResponse)
@@ -350,16 +372,9 @@ async def recalculate_emotions(
             ConversationSegment.conversation_id == conversation_id
         ).all()
 
+        # each speaker's emotion corrections adjust how the model's scores are read for them (app/emotion_calibration.py)
         speaker_ids = {segment.speaker_id for segment in segments if segment.speaker_id}
-        speakers_by_id = (
-            {
-                speaker.id: speaker
-                for speaker in db.query(Speaker).filter(
-                    Speaker.id.in_(speaker_ids)
-                ).all()
-            }
-            if speaker_ids else {}
-        )
+        calibrations = {sid: engine.speaker_emotion_calibration(sid, db) for sid in speaker_ids}
 
         # Decode and resample the conversation exactly once, but only when at
         # least one segment is eligible for emotion work. Every eligible
@@ -396,32 +411,17 @@ async def recalculate_emotions(
                     skipped_count += 1
                     continue
 
-                speaker = speakers_by_id.get(segment.speaker_id)
-                if speaker and speaker.emotion_profiles:
-                    voice_emb = segment.get_speaker_embedding()
-                    emotion_emb = emotion_data.get("embedding")
-                    if voice_emb is not None and emotion_emb is not None:
-                        dual_result = engine.match_emotion_dual_detector(
-                            emotion_embedding=emotion_emb,
-                            voice_embedding=voice_emb,
-                            speaker_emotion_profiles=speaker.emotion_profiles,
-                            global_threshold=get_config().get_settings().emotion_threshold,
-                            speaker_threshold=speaker.emotion_threshold,
-                            generic_emotion=emotion_data["emotion_category"],
-                            generic_confidence=emotion_data["emotion_confidence"],
-                        )
-                        final = dual_result["final_decision"]
-                        segment.emotion_category = final["emotion"]
-                        segment.emotion_confidence = final["confidence"]
-                        segment.detector_breakdown = json.dumps(dual_result)
-                    else:
-                        segment.emotion_category = emotion_data["emotion_category"]
-                        segment.emotion_confidence = emotion_data["emotion_confidence"]
-                        segment.detector_breakdown = None
+                personal = engine.calibrated_emotion(emotion_data.get("embedding"), calibrations.get(segment.speaker_id))
+                if personal:
+                    segment.emotion_category = personal["emotion"]
+                    segment.emotion_confidence = personal["confidence"]
+                    segment.detector_breakdown = json.dumps(personal["breakdown"])
                 else:
                     segment.emotion_category = emotion_data["emotion_category"]
                     segment.emotion_confidence = emotion_data["emotion_confidence"]
                     segment.detector_breakdown = None
+                if emotion_data.get("embedding") is not None:
+                    segment.set_emotion_embedding(emotion_data["embedding"])
                 updated_count += 1
             except Exception as exc:  # one bad segment must not discard all good updates
                 logger.warning(
@@ -671,14 +671,10 @@ async def identify_speaker_in_segment(
         db.commit()
         db.refresh(segment)
 
-        # Re-detect emotions using personalized profiles (Unknown→Known transition)
+        # The lines now carry this speaker: read their emotions with the speaker's corrections (Unknown → known)
         emotions_updated = 0
-        if speaker.emotion_profiles:
-            profiles = [
-                (prof.emotion_category, prof.get_embedding(), prof.confidence_threshold)
-                for prof in speaker.emotion_profiles
-            ]
-            global_threshold = get_config().get_settings().emotion_threshold
+        calibration = engine.speaker_emotion_calibration(speaker.id, db)
+        if calibration is not None:
             identified_segments = db.query(ConversationSegment).filter(
                 ConversationSegment.speaker_id == speaker.id,
                 ConversationSegment.conversation_id == conversation_id,
@@ -739,22 +735,19 @@ async def identify_speaker_in_segment(
                         )
 
                 if emotion_embedding is not None and not np.isnan(emotion_embedding).any():
-                    match = engine.match_emotion_to_profile(
-                        emotion_embedding, profiles, global_threshold,
-                        speaker_threshold=speaker.emotion_threshold,
-                    )
-                    if match:
-                        matched_emotion, confidence = match
-                        if matched_emotion != original_emotion:
-                            logger.info(f"  ✓ Segment {seg.id}: {original_emotion} → {matched_emotion} ({confidence:.2%} personalized match)")
-                            seg.emotion_category = matched_emotion
-                            seg.emotion_confidence = confidence
-                            emotions_updated += 1
+                    personal = engine.calibrated_emotion(emotion_embedding, calibration)
+                    if personal and personal["emotion"] != original_emotion:
+                        logger.info(f"  ✓ Segment {seg.id}: {original_emotion} → {personal['emotion']} "
+                                    f"(read with {calibration.corrections} correction(s) of {speaker.name})")
+                        seg.emotion_category = personal["emotion"]
+                        seg.emotion_confidence = personal["confidence"]
+                        seg.detector_breakdown = json.dumps(personal["breakdown"])
+                        emotions_updated += 1
 
             if emotions_updated > 0:
-                logger.info(f"✅ Updated {emotions_updated} emotion(s) using personalized profiles")
+                logger.info(f"✅ Updated {emotions_updated} emotion(s) with {speaker.name}'s corrections")
         else:
-            logger.info(f"  ℹ️ No emotion profiles found for {speaker.name} - keeping generic detections")
+            logger.info(f"  ℹ️ No emotion corrections for {speaker.name} - keeping the model's emotions")
 
         db.commit()
         db.refresh(segment)
@@ -1031,11 +1024,13 @@ async def correct_emotion_in_segment(
     """
     Correct emotion in a segment and optionally learn from the correction.
 
-    This enables personalized emotion detection by building speaker-specific emotion profiles.
+    A speaker's corrections (learn=true) adjust how the emotion model's scores are read for them from then on
+    (app/emotion_calibration.py): someone whose ordinary voice the model hears as happy corrects a few lines to
+    neutral. learn=false only fixes this line; it is left out of the learning.
 
     Args:
         corrected_emotion: The correct emotion category (angry, happy, sad, neutral, fearful, surprised, disgusted, other)
-        learn: If True, extract embedding and update speaker's emotion profile (default: True)
+        learn: If True, the correction is learned from (default: True)
 
     Returns:
         Success message with details about learning
@@ -1096,6 +1091,7 @@ async def correct_emotion_in_segment(
                         status_code=500,
                         detail="Failed to extract emotion embedding for learning"
                     )
+                segment.set_emotion_embedding(emotion_embedding)   # what the speaker's calibration is fitted on
             except Exception as e:
                 raise HTTPException(
                     status_code=500,
@@ -1109,6 +1105,7 @@ async def correct_emotion_in_segment(
     segment.emotion_confidence = 1.0  # Manual correction = 100% confidence
     segment.emotion_corrected = True
     segment.emotion_corrected_at = utc_now()
+    segment.emotion_misidentified = not learn   # a correction not to learn from is left out, as one marked wrong
     db.flush()
 
     # CRITICAL: If changing from one emotion to another, recalculate OLD emotion profile
@@ -1187,7 +1184,7 @@ async def correct_emotion_in_segment(
                 sample_count = 1
                 logger.info(f"✓ Created new '{corrected_emotion}' profile with segment {segment_id}")
 
-            # Also merge VOICE embedding for this emotion (Detector 2 data)
+            # Also the speaker's voice over this emotion's lines: an extra voice sample for per-segment identification
             voice_emb = segment.get_speaker_embedding()
             if voice_emb is not None and not np.isnan(voice_emb).any():
                 existing_voice_emb = profile.get_voice_embedding()
@@ -1241,7 +1238,8 @@ async def reset_speaker_emotion_profiles(
     db: Session = Depends(get_db)
 ):
     """
-    Reset emotion profiles for a speaker.
+    Reset emotion profiles for a speaker: their corrections (of this emotion, or all) are no longer learned from;
+    the corrected lines keep their emotion.
 
     Args:
         emotion_category: If specified, only reset this emotion. If None, reset all emotions.
@@ -1256,6 +1254,13 @@ async def reset_speaker_emotion_profiles(
     query = db.query(SpeakerEmotionProfile).filter(
         SpeakerEmotionProfile.speaker_id == speaker_id
     )
+    corrections = db.query(ConversationSegment).filter(
+        ConversationSegment.speaker_id == speaker_id,
+        ConversationSegment.emotion_corrected == True,   # noqa: E712
+    )
+    if emotion_category:
+        corrections = corrections.filter(ConversationSegment.emotion_category == emotion_category)
+    corrections.update({"emotion_misidentified": True}, synchronize_session=False)
 
     if emotion_category:
         query = query.filter(SpeakerEmotionProfile.emotion_category == emotion_category)
@@ -1277,12 +1282,16 @@ async def reset_speaker_emotion_profiles(
         }
 
 
-@router.get("/speakers/{speaker_id}/emotion-threshold")
+@router.get("/speakers/{speaker_id}/emotion-threshold", deprecated=True)
 async def get_speaker_emotion_threshold(
     speaker_id: int,
     db: Session = Depends(get_db)
 ):
-    """Get speaker's custom emotion threshold (or global default)"""
+    """Get speaker's custom emotion threshold (or global default)
+
+    Deprecated: thresholds no longer affect emotions, which are read with the speaker's corrections (personal
+    calibration). Kept so existing clients keep working.
+    """
     speaker = db.query(Speaker).filter(Speaker.id == speaker_id).first()
     if not speaker:
         raise HTTPException(status_code=404, detail="Speaker not found")
@@ -1299,7 +1308,7 @@ async def get_speaker_emotion_threshold(
     }
 
 
-@router.patch("/speakers/{speaker_id}/emotion-threshold")
+@router.patch("/speakers/{speaker_id}/emotion-threshold", deprecated=True)
 async def set_speaker_emotion_threshold(
     speaker_id: int,
     threshold: Optional[float] = Query(None, ge=0.3, le=1.0, description="Custom threshold (0.3-1.0) or null for global"),
@@ -1307,6 +1316,9 @@ async def set_speaker_emotion_threshold(
 ):
     """
     Set speaker's custom emotion threshold.
+
+    Deprecated: thresholds no longer affect emotions, which are read with the speaker's corrections (personal
+    calibration). Kept so existing clients keep working.
 
     Args:
         threshold: Custom threshold (0.3-1.0) or None to use global default
@@ -1337,9 +1349,11 @@ async def set_speaker_emotion_threshold(
 @router.get("/speakers/{speaker_id}/emotion-profiles")
 async def get_speaker_emotion_profiles(
     speaker_id: int,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    engine: SpeakerRecognitionEngine = Depends(get_engine),
 ):
-    """Get all emotion profiles for a speaker"""
+    """Get all emotion profiles for a speaker, and the calibration their corrections give: how much each emotion's
+    score is raised (+) or lowered (-) for them (app/emotion_calibration.py)."""
     speaker = db.query(Speaker).filter(Speaker.id == speaker_id).first()
     if not speaker:
         raise HTTPException(status_code=404, detail="Speaker not found")
@@ -1352,6 +1366,7 @@ async def get_speaker_emotion_profiles(
         "speaker_id": speaker_id,
         "speaker_name": speaker.name,
         "emotion_threshold": speaker.emotion_threshold,
+        "calibration": _calibration_summary(engine.speaker_emotion_calibration(speaker_id, db)),
         "profiles": [
             {
                 "emotion_category": prof.emotion_category,
@@ -1367,6 +1382,13 @@ async def get_speaker_emotion_profiles(
     }
 
 
+
+
+def _calibration_summary(calibration) -> Optional[dict]:
+    if calibration is None:
+        return None
+    return {"corrections": calibration.corrections,
+            "offsets": {label: round(float(v), 3) for label, v in zip(EMOTION_LABELS, calibration.offsets)}}
 
 
 def _get_speaker_emotion_profile(speaker_id: int, emotion_category: str, db: Session) -> tuple:
@@ -1386,7 +1408,7 @@ def _get_speaker_emotion_profile(speaker_id: int, emotion_category: str, db: Ses
     return speaker, profile
 
 
-@router.patch("/speakers/{speaker_id}/emotion-profiles/{emotion_category}/threshold")
+@router.patch("/speakers/{speaker_id}/emotion-profiles/{emotion_category}/threshold", deprecated=True)
 async def set_emotion_profile_threshold(
     speaker_id: int,
     emotion_category: str,
@@ -1396,7 +1418,11 @@ async def set_emotion_profile_threshold(
     ),
     db: Session = Depends(get_db),
 ):
-    """Set the per-emotion confidence threshold applied to emotion2vec matches."""
+    """Set the per-emotion confidence threshold applied to emotion2vec matches.
+
+    Deprecated: thresholds no longer affect emotions, which are read with the speaker's corrections (personal
+    calibration). Kept so existing clients keep working.
+    """
     speaker, profile = _get_speaker_emotion_profile(speaker_id, emotion_category, db)
     profile.confidence_threshold = threshold
     db.commit()
@@ -1408,7 +1434,7 @@ async def set_emotion_profile_threshold(
     }
 
 
-@router.patch("/speakers/{speaker_id}/emotion-profiles/{emotion_category}/voice-threshold")
+@router.patch("/speakers/{speaker_id}/emotion-profiles/{emotion_category}/voice-threshold", deprecated=True)
 async def set_emotion_profile_voice_threshold(
     speaker_id: int,
     emotion_category: str,
@@ -1418,7 +1444,11 @@ async def set_emotion_profile_voice_threshold(
     ),
     db: Session = Depends(get_db),
 ):
-    """Set the per-emotion voice-profile threshold (Detector 2, 512-D pyannote embeddings)."""
+    """Set the per-emotion voice-profile threshold.
+
+    Deprecated: thresholds no longer affect emotions, which are read with the speaker's corrections (personal
+    calibration). Kept so existing clients keep working.
+    """
     speaker, profile = _get_speaker_emotion_profile(speaker_id, emotion_category, db)
     profile.voice_threshold = threshold
     db.commit()
