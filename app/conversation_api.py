@@ -279,12 +279,11 @@ async def reprocess_conversation(
         ).one()
         audio_path = conversation.audio_path
         conv_start = conversation.start_time
-        known_speakers = load_known_speakers(db)
         threshold = get_config().get_settings().speaker_threshold
         result = await asyncio.to_thread(
             engine.transcribe_with_diarization,
             audio_path,
-            known_speakers,
+            None,
             threshold=threshold,
             db_session=db,
         )
@@ -320,7 +319,11 @@ async def reprocess_conversation(
             raise HTTPException(status_code=409, detail="Reprocessing lease lost")
 
         try:
-            engine.clear_gpu_cache()
+            clear_async = getattr(engine, "clear_gpu_cache_async", None)
+            if clear_async is not None:
+                clear_async("reprocess")
+            else:
+                engine.clear_gpu_cache()
         except Exception as exc:  # noqa: BLE001 - cleanup is non-authoritative
             logger.warning("GPU cleanup after reprocessing failed: %s", exc)
 
@@ -440,7 +443,11 @@ async def recalculate_emotions(
             raise HTTPException(status_code=409, detail="Recalculation lease lost")
 
         try:
-            engine.clear_gpu_cache()
+            clear_async = getattr(engine, "clear_gpu_cache_async", None)
+            if clear_async is not None:
+                clear_async("recalc_emotion")
+            else:
+                engine.clear_gpu_cache()
         except Exception as exc:  # noqa: BLE001 - cleanup cannot undo results
             logger.warning("GPU cleanup after emotion recalculation failed: %s", exc)
 
@@ -751,7 +758,7 @@ async def identify_speaker_in_segment(
 
         db.commit()
         db.refresh(segment)
-        engine.clear_gpu_cache()
+        (getattr(engine, "clear_gpu_cache_async", None) or (lambda *_: engine.clear_gpu_cache()))("identify")
         return merge_suffix, emotions_updated
 
     merge_suffix, _ = await asyncio.to_thread(_retroactive_updates)
@@ -806,8 +813,8 @@ async def toggle_segment_misidentified(
     db.commit()
     db.refresh(segment)
 
-    # Clear GPU cache after embedding extractions
-    engine.clear_gpu_cache()
+    # Queue async GPU cleanup if above threshold
+    (getattr(engine, "clear_gpu_cache_async", None) or (lambda *_: engine.clear_gpu_cache()))("misidentified")
 
     status_text = "marked as misidentified" if request.is_misidentified else "unmarked as misidentified"
     return {
@@ -868,8 +875,8 @@ async def toggle_emotion_misidentified(
     db.commit()
     db.refresh(segment)
 
-    # Clear GPU cache after embedding extractions
-    engine.clear_gpu_cache()
+    # Queue async GPU cleanup if above threshold
+    (getattr(engine, "clear_gpu_cache_async", None) or (lambda *_: engine.clear_gpu_cache()))("misidentified")
 
     status_text = "marked as misidentified" if request.is_misidentified else "unmarked as misidentified"
     return {
@@ -1212,8 +1219,8 @@ async def correct_emotion_in_segment(
     db.commit()
     db.refresh(segment)
 
-    # Clear GPU cache
-    engine.clear_gpu_cache()
+    # Queue async GPU cleanup if above threshold
+    (getattr(engine, "clear_gpu_cache_async", None) or (lambda *_: engine.clear_gpu_cache()))("correct_emotion")
 
     speaker = db.query(Speaker).filter(Speaker.id == segment.speaker_id).first()
 

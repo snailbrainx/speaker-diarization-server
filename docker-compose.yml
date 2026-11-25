@@ -42,6 +42,11 @@ services:
       - SNAP_TO_TURNS=${SNAP_TO_TURNS:-}
       - OVERLAP_SEPARATION=${OVERLAP_SEPARATION:-}
       - LIVE_SPEAKER_TRACKING=${LIVE_SPEAKER_TRACKING:-}
+      - LIVE_MIN_FLUSH_SECONDS=${LIVE_MIN_FLUSH_SECONDS:-}
+      - EMOTION_BATCH_SIZE=${EMOTION_BATCH_SIZE:-}
+      - EMOTION_BF16=${EMOTION_BF16:-}
+      - EMOTION_TEXT_MODEL=${EMOTION_TEXT_MODEL:-}
+      - EMOTION_TEXT_WEIGHT=${EMOTION_TEXT_WEIGHT:-}
       # Voice-embedding model for speaker identification (README "Voice embeddings"); empty = the default.
       - SPEAKER_EMBEDDING_MODEL=${SPEAKER_EMBEDDING_MODEL:-}
     # Match the `app` user baked into the image (uid 1000) so bind-mounted

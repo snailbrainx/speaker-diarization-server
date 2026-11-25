@@ -103,6 +103,7 @@ class StreamingRecorder:
         silence_threshold: float = 0.005,
         silence_duration: Optional[float] = None,
         max_workers: int = 1,
+        min_flush_seconds: Optional[float] = None,
     ):
         """
         Args:
@@ -113,13 +114,21 @@ class StreamingRecorder:
             max_workers: background processing threads. Kept at 1 by default
                 because the pyannote+Whisper engine holds the GIL through its
                 CUDA calls, so extra workers just queue without parallelism.
+            min_flush_seconds: minimum buffered seconds before a pause flushes
+                (falls back to LIVE_MIN_FLUSH_SECONDS / MIN_FLUSH_SECONDS).
         """
         self.sample_rate = sample_rate
         self.silence_threshold = silence_threshold
 
         from .config import get_config
         settings = get_config().get_settings()
+        self._custom_silence_duration = silence_duration
         self.silence_duration = silence_duration if silence_duration is not None else settings.silence_duration
+        self.min_flush_seconds = (
+            float(min_flush_seconds)
+            if min_flush_seconds is not None
+            else _env_seconds("LIVE_MIN_FLUSH_SECONDS", self.MIN_FLUSH_SECONDS, allow_zero=True)
+        )
 
         # State
         self.is_recording = False
@@ -173,9 +182,10 @@ class StreamingRecorder:
 
     def start_recording(self, conversation_id: int):
         """Start recording for a conversation."""
-        # Pick up any runtime change to silence_duration
-        from .config import get_config
-        self.silence_duration = get_config().get_settings().silence_duration
+        # Pick up any runtime change to silence_duration unless overridden for this session
+        if getattr(self, "_custom_silence_duration", None) is None:
+            from .config import get_config
+            self.silence_duration = get_config().get_settings().silence_duration
 
         self.is_recording = True
         self.conversation_id = conversation_id
@@ -294,7 +304,7 @@ class StreamingRecorder:
                 self.speech_detected = False
                 self._silent_samples += len(audio_data)
                 if (self._silent_samples >= self.silence_duration * self.sample_rate
-                        and self._buffered_samples >= self.MIN_FLUSH_SECONDS * self.sample_rate):
+                        and self._buffered_samples >= self.min_flush_seconds * self.sample_rate):
                     self._flush_locked()
 
             # Bound RAM: force-flush if the unflushed buffer exceeds the cap
@@ -380,6 +390,8 @@ class StreamingRecorder:
             "start_offset": start_offset,
             "end_offset": end_offset,
             "timestamp": datetime.now(),
+            "audio_samples": segment_audio,
+            "sample_rate": self.sample_rate,
         }
 
         self.segment_paths.append(segment_path)

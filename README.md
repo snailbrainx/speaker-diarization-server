@@ -172,6 +172,7 @@ All configuration is environment variables (see `.env.example` for the curated l
 |-----------------------------------|----------------------------------|-----------------------------------------------------------|
 | `MAX_STREAM_BUFFER_SECONDS`       | `120` (`300` in docker-compose)  | Longest speech buffered before a segment is force-flushed. |
 | `STREAM_LONG_TURN_SECONDS`        | `15`                             | Speech with no pause this long (noisy rooms, crosstalk) is cut at its quietest point and processed instead of waiting for a pause. `0` = wait for a pause. |
+| `LIVE_MIN_FLUSH_SECONDS`          | `2.5`                            | Minimum buffered speech seconds before a pause flushes a live chunk. Lower (e.g. `0.25`) with lower `SILENCE_DURATION` (e.g. `0.25`) for low-latency voice conversation. Can also be overridden per WebSocket session in the `start` message (`silence_duration`, `min_flush_seconds`, `fast_emit`). |
 | `SEGMENT_HANDLER_TIMEOUT_SECONDS` | `600`                            | How long a live segment may take to process.              |
 | `WS_SEND_TIMEOUT_SECONDS`         | `10` (`5` in docker-compose)     | Timeout for sending a message to a WebSocket client.      |
 
@@ -195,7 +196,11 @@ All configuration is environment variables (see `.env.example` for the curated l
 | `PARAKEET_MODEL`               | `nvidia/parakeet-tdt-0.6b-v2`    | `ASR_BACKEND=parakeet` model. v2 is English-only; `nvidia/parakeet-tdt-0.6b-v3` covers 25 European languages (detected automatically). |
 | `SPEAKER_EMBEDDING_MODEL`      | `pyannote/wespeaker-voxceleb-resnet34-LM` | Voice-embedding model behind speaker identification (see [Voice embeddings](#voice-embeddings)). `pyannote/embedding` = the original. Stored voices are rebuilt automatically when it changes. |
 | `DIARIZATION_BACKEND`          | `pyannote`                       | Diarization runtime: `pyannote` or `speakrs`, the same community-1 models and clustering in Rust/CUDA (see [Diarization runtime](#diarization-runtime-pyannote-or-speakrs)). |
-| `EMOTION_MODEL`                | `iic/emotion2vec_plus_large`     | FunASR emotion model ID.                            |
+| `EMOTION_MODEL`                | `iic/emotion2vec_plus_large`     | FunASR emotion model ID (e.g. `iic/emotion2vec_plus_large` or lighter `iic/emotion2vec_plus_base`). |
+| `EMOTION_BATCH_SIZE`           | `1`                              | Direct PyTorch `emotion2vec` batch size (`1` = exact fast path bypassing FunASR per-call overhead; `0` = legacy `FunASR.generate`). |
+| `EMOTION_BF16`                 | `false`                          | Enable `bfloat16` autocast in direct emotion inference (`false` preserves exact TF32 scores). |
+| `EMOTION_TEXT_MODEL`           | *(unset)*                        | Optional HuggingFace text-emotion classifier (e.g. `SamLowe/roberta-base-go_emotions`, MIT) fused with acoustic probabilities for higher conversational emotion accuracy. |
+| `EMOTION_TEXT_WEIGHT`          | `0.55`                           | Blend weight (`0.0`–`1.0`) for `EMOTION_TEXT_MODEL` probabilities when enabled. |
 | `ENABLE_PERSONALIZED_EMOTIONS` | `true`                           | Read each speaker's emotions with their corrections (see [Personal calibration](#personal-calibration)); stores each segment's emotion embedding. |
 | `OFFLINE_MODE`                 | `false`                          | Force cached models only; never hit the hub.        |
 

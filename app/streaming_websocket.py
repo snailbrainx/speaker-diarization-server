@@ -97,13 +97,13 @@ async def send_message(websocket: WebSocket, message_type: str, data: dict) -> b
             "data": data,
             "timestamp": utc_now().isoformat(),
         }
-        logger.info(
+        logger.debug(
             "🔌 Sending WebSocket message: type=%s, data_keys=%s",
             message_type,
             list(data.keys()) if isinstance(data, dict) else "not-dict",
         )
         await websocket.send_json(message)
-        logger.info(f"✅ Successfully sent {message_type} message")
+        logger.debug(f"✅ Successfully sent {message_type} message")
         return True
     except WebSocketDisconnect:
         logger.info(
@@ -154,6 +154,7 @@ def _make_segment_callback(
     loop,
     diarize: bool = True,
     tracks: Optional[SessionTracks] = None,
+    fast_emit: bool = False,
 ):
     """Bridge the recorder worker to the async handler with a hard deadline."""
     def segment_callback(seg_info):
@@ -165,6 +166,7 @@ def _make_segment_callback(
             get_engine(),
             diarize=diarize,
             tracks=tracks,
+            fast_emit=fast_emit,
         )
         try:
             future = asyncio.run_coroutine_threadsafe(coroutine, loop)
@@ -258,14 +260,29 @@ async def websocket_endpoint(
         conversation_id = conversation.id
         assert conversation_id is not None
 
-        # Initialize recorder
+        # Initialize recorder (optional per-session low-latency overrides from start message)
         config = get_config()
         settings = config.get_settings()
+
+        req_silence = init_message.get("silence_duration")
+        if isinstance(req_silence, (int, float)) and math.isfinite(req_silence) and 0.1 <= req_silence <= 5.0:
+            silence_duration = float(req_silence)
+        else:
+            silence_duration = None
+
+        req_min_flush = init_message.get("min_flush_seconds")
+        if isinstance(req_min_flush, (int, float)) and math.isfinite(req_min_flush) and 0.0 <= req_min_flush <= 30.0:
+            min_flush_seconds = float(req_min_flush)
+        else:
+            min_flush_seconds = None
+
+        fast_emit = bool(init_message.get("fast_emit", False))
 
         recorder = StreamingRecorder(
             sample_rate=sample_rate,
             silence_threshold=WS_SILENCE_THRESHOLD,
-            silence_duration=settings.silence_duration,
+            silence_duration=silence_duration,
+            min_flush_seconds=min_flush_seconds,
         )
 
         # Get event loop for scheduling async tasks from background threads
@@ -274,10 +291,12 @@ async def websocket_endpoint(
         # Block until persistence completes, but through a bounded bridge so a
         # stalled client or engine cannot hang finalisation forever.
         # "diarize": false in the start message: one person talking, no speaker diarization per chunk
+        # "fast_emit": true sends segments before emotion finishes, then pushes "emotion_update"
         # LIVE_SPEAKER_TRACKING: the session's speakers are tracked across chunks and named from all their speech
         recorder.on_segment_processed = _make_segment_callback(
             websocket, conversation_id, processing_token, loop, diarize=bool(init_message.get("diarize", True)),
             tracks=SessionTracks(conversation_id) if LIVE_SPEAKER_TRACKING else None,
+            fast_emit=fast_emit,
         )
 
         recorder.start_recording(conversation_id)
@@ -308,7 +327,7 @@ async def websocket_endpoint(
                 if "bytes" in message:
                     # Binary audio chunk (PCM in the start message's format)
                     audio_bytes = message["bytes"]
-                    logger.info(f"📦 Received audio chunk: {len(audio_bytes)} bytes")
+                    logger.debug(f"📦 Received audio chunk: {len(audio_bytes)} bytes")
 
                     # Clients occasionally send truncated frames — skip instead of crashing.
                     if len(audio_bytes) % sample_size != 0:
@@ -316,11 +335,11 @@ async def websocket_endpoint(
                         continue
 
                     audio_array = np.frombuffer(audio_bytes, dtype=sample_dtype)
-                    logger.info(f"🔊 Converted to audio array: {len(audio_array)} samples")
+                    logger.debug(f"🔊 Converted to audio array: {len(audio_array)} samples")
 
                     # Process chunk (StreamingRecorder expects tuple of (sample_rate, audio_data))
                     result = recorder.process_audio_chunk((sample_rate, audio_array))
-                    logger.info(f"📊 VAD: {result['speech_detected']}, Level: {result['audio_level']:.3f}")
+                    logger.debug(f"📊 VAD: {result['speech_detected']}, Level: {result['audio_level']:.3f}")
 
                     # Send status update
                     status_sent = await _send_message_bounded(websocket, "status", {
@@ -384,6 +403,23 @@ async def websocket_endpoint(
         await _close_websocket_bounded(websocket)
 
 
+def _in_memory_from_segment_info(segment_info: dict) -> Optional[dict]:
+    """Build pyannote/Parakeet in-memory 16 kHz tensor directly from recorder samples to avoid disk round-trip."""
+    samples = segment_info.get("audio_samples")
+    sr = segment_info.get("sample_rate")
+    if samples is None or not sr:
+        return None
+    import torch
+    arr = np.ascontiguousarray(samples, dtype=np.float32)
+    if arr.ndim > 1:
+        arr = arr.mean(axis=1)
+    t = torch.from_numpy(arr)
+    if sr != 16000:
+        import torchaudio.functional as F
+        t = F.resample(t, int(sr), 16000)
+    return {"waveform": t.contiguous()[None], "sample_rate": 16000}
+
+
 async def _handle_segment_processed(
     websocket: WebSocket,
     conversation_id: int,
@@ -392,6 +428,7 @@ async def _handle_segment_processed(
     engine,
     diarize: bool = True,
     tracks: Optional[SessionTracks] = None,
+    fast_emit: bool = False,
 ):
     """
     Callback when StreamingRecorder finishes processing a segment.
@@ -429,18 +466,23 @@ async def _handle_segment_processed(
             logger.info(f"Segment file not found: {segment_file}")
             return
 
-        known_speakers = load_known_speakers(db)
-
         # Get threshold from config
         config = get_config()
         settings = config.get_settings()
         threshold = settings.speaker_threshold
 
+        in_memory_audio = _in_memory_from_segment_info(segment_info)
+        extra_kwargs = {}
+        if in_memory_audio is not None:
+            extra_kwargs["audio"] = in_memory_audio
+        if fast_emit:
+            extra_kwargs["include_emotion"] = False
+
         # Process with diarization + transcription — heavy GPU work, run off the event loop
         result = await asyncio.to_thread(
             engine.transcribe_with_diarization,
             segment_file,
-            known_speakers,
+            None,
             threshold=threshold,
             db_session=db,
             # A live chunk holds a few seconds of speech: never cluster mode; the session's tracks (if on) name
@@ -448,6 +490,7 @@ async def _handle_segment_processed(
             cluster_speakers=False,
             diarize=diarize,
             tracks=tracks,
+            **extra_kwargs,
         )
 
         # Timeout only stops the recorder waiting; inference can still finish
@@ -527,6 +570,40 @@ async def _handle_segment_processed(
         for seg_data in segments_data:
             logger.info(f"   → Segment: {seg_data['speaker_name']}: {seg_data['text'][:50]}...")
             await _send_message_bounded(websocket, "segment", seg_data)
+
+        # In fast_emit mode, run emotion off the critical path after segment delivery, then update DB & client.
+        if fast_emit and segments_data and hasattr(engine, "extract_emotions_for_segments"):
+            try:
+                emo_updates = await asyncio.to_thread(
+                    engine.extract_emotions_for_segments,
+                    segment_file,
+                    result["segments"],
+                    in_memory_audio,
+                    db,
+                )
+                if emo_updates:
+                    for seg_data, emo in zip(segments_data, emo_updates):
+                        if not emo:
+                            continue
+                        row = db.query(ConversationSegment).filter(
+                            ConversationSegment.id == seg_data["segment_id"]
+                        ).first()
+                        if row is not None and not row.emotion_corrected:
+                            row.emotion_category = emo.get("emotion_category")
+                            row.emotion_confidence = emo.get("emotion_confidence")
+                            if emo.get("embedding") is not None:
+                                row.set_emotion_embedding(emo["embedding"])
+                            if emo.get("detector_breakdown"):
+                                row.detector_breakdown = json.dumps(emo["detector_breakdown"])
+                            await _send_message_bounded(websocket, "emotion_update", {
+                                "segment_id": row.id,
+                                "emotion_category": row.emotion_category,
+                                "emotion_confidence": row.emotion_confidence,
+                            })
+                    db.commit()
+            except Exception as emo_exc:  # noqa: BLE001 - async emotion must never fail already-sent segments
+                logger.warning(f"Post-emit emotion failed: {emo_exc}")
+                db.rollback()
 
         # Queue async GPU cleanup (non-blocking)
         engine.clear_gpu_cache_async("segment_complete")
@@ -733,7 +810,12 @@ async def _finalize_recording(
         )
 
         try:
-            get_engine().clear_gpu_cache()
+            eng = get_engine()
+            clear_async = getattr(eng, "clear_gpu_cache_async", None)
+            if clear_async is not None:
+                clear_async("finalize")
+            else:
+                eng.clear_gpu_cache()
         except Exception as exc:  # noqa: BLE001 - cleanup cannot un-finalize data
             logger.warning("Post-finalization GPU cleanup failed: %s", exc)
 
