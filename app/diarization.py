@@ -35,13 +35,13 @@ from sqlalchemy.orm import Session as OrmSession
 
 from . import emotion_calibration, live_tracking, overlap
 from .config import get_config
-from .models import ConversationSegment, Speaker, SpeakerEmotionProfile
+from .models import ConversationSegment, Speaker
 
 logger = logging.getLogger(__name__)
 
 # Engines whose speaker-profile cache must be dropped whenever stored voices change (any session, any endpoint).
 _ENGINES: "weakref.WeakSet" = weakref.WeakSet()
-_VOICE_TABLES = (Speaker, SpeakerEmotionProfile)
+_VOICE_TABLES = (Speaker,)
 
 
 @event.listens_for(OrmSession, "after_flush")
@@ -73,9 +73,6 @@ event.listen(OrmSession, "after_rollback", _drop_voice_caches)
 FALLBACK_THRESHOLD_REDUCTION = 0.05
 MIN_FALLBACK_THRESHOLD = 0.20
 UNKNOWN_NAME_MAX_ATTEMPTS = 5
-
-# Emotion detection constants
-MIN_VOICE_SAMPLES = 3
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -454,20 +451,6 @@ def _build_profile_list(speakers: list) -> List[Dict[str, Any]]:
                 "embedding": general_emb,
                 "emotion": None,
                 "profile_type": "general",
-            })
-        for emotion_profile in speaker.emotion_profiles:
-            if emotion_profile.voice_sample_count < MIN_VOICE_SAMPLES:
-                continue
-            voice_emb = emotion_profile.get_voice_embedding()
-            if voice_emb is None or np.isnan(voice_emb).any():
-                continue
-            profiles.append({
-                "speaker_id": speaker.id,
-                "speaker_name": speaker.name,
-                "embedding": voice_emb,
-                "emotion": emotion_profile.emotion_category,
-                "profile_type": "emotion_voice",
-                "sample_count": emotion_profile.voice_sample_count,
             })
     return profiles
 

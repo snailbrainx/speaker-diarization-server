@@ -129,7 +129,7 @@ def _tunable_settings(source) -> dict[str, Any]:
     return {field: getattr(source, field) for field in VoiceSettings.model_fields}
 
 
-def _serialize_speakers(db: Session, include_emotion_profiles: bool) -> list:
+def _serialize_speakers(db: Session) -> list:
     speakers_out = []
     for speaker in db.query(Speaker).all():
         embedding = speaker.get_embedding()
@@ -138,21 +138,6 @@ def _serialize_speakers(db: Session, include_emotion_profiles: bool) -> list:
             "name": speaker.name,
             "embedding": embedding.tolist() if embedding is not None else None,
         }
-        if include_emotion_profiles:
-            entry["emotion_threshold"] = speaker.emotion_threshold
-            emotion_profiles = []
-            for prof in speaker.emotion_profiles:
-                voice_emb = prof.get_voice_embedding()
-                emotion_profiles.append({
-                    "emotion_category": prof.emotion_category,
-                    "embedding": prof.get_embedding().tolist(),
-                    "sample_count": prof.sample_count,
-                    "confidence_threshold": prof.confidence_threshold,
-                    "voice_embedding": voice_emb.tolist() if voice_emb is not None else None,
-                    "voice_sample_count": prof.voice_sample_count,
-                    "voice_threshold": prof.voice_threshold,
-                })
-            entry["emotion_profiles"] = emotion_profiles
         speakers_out.append(entry)
     return speakers_out
 
@@ -277,7 +262,7 @@ def save_current_state(profile_name: str, description: str, db: Session, allow_o
 
     settings = get_config().get_settings()
     database_namespace = _get_database_namespace(db)
-    speakers = _serialize_speakers(db, include_emotion_profiles=True)
+    speakers = _serialize_speakers(db)
     segments = _serialize_segments(db)
 
     profile_data = {
@@ -468,7 +453,7 @@ async def create_checkpoint(profile_name: str, db: Session = Depends(get_db)):
         # wipe-and-rebuild, so anything the checkpoint omits is permanently
         # deleted by a successful restore (SOL-003). Keeping them makes the
         # checkpoint→restore round-trip lossless.
-        speakers = _serialize_speakers(db, include_emotion_profiles=True)
+        speakers = _serialize_speakers(db)
         segments = _serialize_segments(db)
 
         checkpoint_data = {
@@ -616,25 +601,9 @@ async def restore_from_file(filename: str, db: Session = Depends(get_db)):
             speaker = Speaker(name=speaker_data["name"])
             if speaker_data.get("embedding"):
                 speaker.set_embedding(np.array(speaker_data["embedding"], dtype=np.float32))
-            speaker.emotion_threshold = speaker_data.get("emotion_threshold")
             db.add(speaker)
             db.flush()
             speaker_id_map[old_id] = speaker.id
-
-            for prof_data in speaker_data.get("emotion_profiles", []):
-                profile = SpeakerEmotionProfile(
-                    speaker_id=speaker.id,
-                    emotion_category=prof_data["emotion_category"],
-                    sample_count=prof_data.get("sample_count", 1),
-                    confidence_threshold=prof_data.get("confidence_threshold"),
-                    voice_sample_count=prof_data.get("voice_sample_count", 0),
-                    voice_threshold=prof_data.get("voice_threshold"),
-                )
-                if prof_data.get("embedding"):
-                    profile.set_embedding(np.array(prof_data["embedding"], dtype=np.float32))
-                if prof_data.get("voice_embedding"):
-                    profile.set_voice_embedding(np.array(prof_data["voice_embedding"], dtype=np.float32))
-                db.add(profile)
 
         db.flush()
         new_id_by_name = {s.name: s.id for s in db.query(Speaker).all()}

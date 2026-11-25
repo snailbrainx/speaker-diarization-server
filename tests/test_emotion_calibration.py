@@ -130,6 +130,39 @@ def test_forgetting_a_speakers_emotions_stops_learning_from_their_corrections(en
     assert db.query(ConversationSegment).filter_by(emotion_category="neutral").count() == 3   # labels stay
 
 
+def test_corrections_are_counted_from_the_corrected_lines(eng, db, ann):
+    """A correction marks the line; what the Speakers page shows is counted from the lines themselves, and no
+    per-emotion profile is built any more."""
+    from types import SimpleNamespace
+    from app import conversation_api
+    from app.models import SpeakerEmotionProfile
+    conv, speaker = ann
+    line = add_line(db, conv, speaker, embedding(happy=3.0, neutral=2.1), "happy")
+    db.commit()
+    stub = SimpleNamespace(clear_gpu_cache_async=lambda *_: None)
+    out = asyncio.run(conversation_api.correct_emotion_in_segment(conv.id, line.id, "neutral", True, db, stub))
+    assert out["sample_count"] == 4 and out["learned"] is True
+    out = asyncio.run(conversation_api.correct_emotion_in_segment(conv.id, line.id, "neutral", False, db, stub))
+    assert out["sample_count"] == 0   # learn=false: left out
+    assert db.query(SpeakerEmotionProfile).count() == 0
+    profiles = asyncio.run(conversation_api.get_speaker_emotion_profiles(speaker.id, db, eng))
+    assert profiles["profiles"] == [{"emotion_category": "neutral", "sample_count": 3}]
+    assert profiles["calibration"]["corrections"] == 3
+
+
+def test_forgetting_also_clears_profiles_left_by_older_versions(eng, db, ann):
+    from app import conversation_api
+    from app.models import SpeakerEmotionProfile
+    _, speaker = ann
+    legacy = SpeakerEmotionProfile(speaker_id=speaker.id, emotion_category="neutral", sample_count=3)
+    legacy.set_embedding(np.ones(16, dtype=np.float32))
+    db.add(legacy)
+    db.commit()
+    out = asyncio.run(conversation_api.reset_speaker_emotion_profiles(speaker.id, "neutral", db))
+    assert out["deleted"] == 3 and out["emotion_category"] == "neutral"
+    assert db.query(SpeakerEmotionProfile).count() == 0
+
+
 def test_live_lines_given_to_a_speaker_later_are_read_with_their_corrections(eng, db, ann):
     """A live line that only gets its speaker when the session's track is named was first read without them."""
     from app.streaming_websocket import _reread_emotions

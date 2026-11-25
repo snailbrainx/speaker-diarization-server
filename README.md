@@ -184,7 +184,6 @@ All configuration is environment variables (see `.env.example` for the curated l
 | `CONTEXT_PADDING`        | `0.15`   | Seconds of audio added around a segment before embedding.      |
 | `SILENCE_DURATION`       | `0.5`    | Streaming: seconds without speech (Silero VAD) before a buffered chunk of at least 2.5 s is processed. |
 | `FILTER_HALLUCINATIONS`  | `true`   | Drop Whisper filler phrases ("thank you.", etc.).              |
-| `EMOTION_THRESHOLD`      | `0.6`    | No longer used (emotions are personalised by calibration); kept so existing settings load. |
 
 ### Models
 

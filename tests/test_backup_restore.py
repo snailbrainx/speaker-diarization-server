@@ -169,10 +169,9 @@ class TestRestoreAtomicity:
             "speakers": [{
                 "id": 7,
                 "name": "Replacement",
-                "embedding": [1.0, 0.0],
-                # Missing emotion_category raises after the speaker wipe and
-                # replacement INSERT have already executed.
-                "emotion_profiles": [{"embedding": [0.2, 0.3]}],
+                # A voice that is not numbers raises after the speaker wipe
+                # has already executed.
+                "embedding": ["not", "a", "voice"],
             }],
             "segments": [],
         }
@@ -189,20 +188,16 @@ class TestRestoreAtomicity:
 
 
 class TestCheckpointRestoreRoundTrip:
-    def test_checkpoint_restore_preserves_emotion_profiles(self, db_session, backup_dir, monkeypatch):
-        """SOL-003: checkpoints used to omit emotion profiles, so restoring one
-        silently deleted all learned emotion state. Round-trip must be lossless."""
+    def test_checkpoint_round_trip_drops_legacy_emotion_profiles(self, db_session, backup_dir, monkeypatch):
+        """Per-emotion profiles are no longer used (emotions are read with each speaker's corrected lines, which stay
+        in the database): checkpoints leave them out, and restoring clears any left from older versions."""
         import numpy as np
 
         from app import backup_api
         from app.models import SpeakerEmotionProfile
 
         speaker = _make_speaker(db_session, "Trained")
-        prof = SpeakerEmotionProfile(
-            speaker_id=speaker.id,
-            emotion_category="happy",
-            sample_count=4,
-        )
+        prof = SpeakerEmotionProfile(speaker_id=speaker.id, emotion_category="happy", sample_count=4)
         prof.set_embedding(np.full(1024, 0.25, dtype=np.float32))
         db_session.add(prof)
         db_session.commit()
@@ -213,20 +208,18 @@ class TestCheckpointRestoreRoundTrip:
         ckpt_file = backup_dir / next(
             f for f in os.listdir(backup_dir) if f.startswith("checkpoint_rt_")
         )
-        assert ckpt_file.exists()
-
-        # Checkpoint must actually contain the emotion profile now.
         payload = json.loads(ckpt_file.read_text())
-        assert payload["speakers"][0].get("emotion_profiles"), (
-            "checkpoint must serialize emotion profiles or restore destroys them"
-        )
+        assert "emotion_profiles" not in payload["speakers"][0]
 
+        # An older backup that still carries profiles restores its speakers and leaves the profiles out
+        payload["speakers"][0]["emotion_profiles"] = [{"emotion_category": "happy", "embedding": [0.25] * 1024,
+                                                       "sample_count": 4}]
+        payload["speakers"][0]["emotion_threshold"] = 0.6
+        ckpt_file.write_text(json.dumps(payload))
         asyncio.run(backup_api.restore_from_file(filename=ckpt_file.name, db=db_session))
         db_session.expire_all()
-        profiles = db_session.query(SpeakerEmotionProfile).all()
-        assert len(profiles) == 1, f"emotion profiles lost after checkpoint restore: {len(profiles)}"
-        assert profiles[0].emotion_category == "happy"
-        assert profiles[0].sample_count == 4
+        assert [s.name for s in db_session.query(Speaker).all()] == ["Trained"]
+        assert db_session.query(SpeakerEmotionProfile).count() == 0
 
     def test_concurrent_checkpoint_requests_publish_distinct_files(
         self, backup_dir, monkeypatch
