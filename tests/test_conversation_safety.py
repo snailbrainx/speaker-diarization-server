@@ -412,67 +412,6 @@ def test_recalculate_emotions_decodes_conversation_once(db_session, tmp_path):
     assert stored.processing_token is None
 
 
-def test_emotion_profile_rebuild_preloads_once_per_audio_path(db_session, tmp_path):
-    from app.services import recalculate_emotion_profile
-
-    audio_path = tmp_path / "profile-source.wav"
-    audio_path.write_bytes(b"fake-audio-for-stub-engine")
-    speaker = Speaker(name="ProfileDecodeOnce")
-    speaker.set_embedding(np.ones(4, dtype=np.float32))
-    db_session.add(speaker)
-    db_session.flush()
-    conversation = Conversation(
-        title="profile decode once",
-        start_time=datetime.now(timezone.utc),
-        status="completed",
-        audio_path=str(audio_path),
-    )
-    db_session.add(conversation)
-    db_session.flush()
-    for index in range(2):
-        db_session.add(ConversationSegment(
-            conversation_id=conversation.id,
-            speaker_id=speaker.id,
-            speaker_name=speaker.name,
-            text=f"corrected {index}",
-            start_time=datetime.now(timezone.utc),
-            end_time=datetime.now(timezone.utc),
-            start_offset=float(index),
-            end_offset=float(index + 1),
-            emotion_category="happy",
-            emotion_corrected=True,
-            emotion_misidentified=False,
-        ))
-    db_session.commit()
-    speaker_id = speaker.id
-
-    marker = object()
-
-    class CountingEngine:
-        preload_calls = 0
-        extract_calls = 0
-
-        def clear_speaker_cache(self):
-            return None
-
-        def preload_emotion_audio(self, path):
-            assert path == str(audio_path)
-            self.preload_calls += 1
-            return marker
-
-        def extract_emotion(self, _path, _start, _end, **kwargs):
-            assert kwargs["preloaded_audio"] is marker
-            self.extract_calls += 1
-            return {"embedding": np.ones(4, dtype=np.float32)}
-
-    engine = CountingEngine()
-    assert recalculate_emotion_profile(
-        speaker_id, "happy", db_session, engine
-    ) == "created"
-    assert engine.preload_calls == 1
-    assert engine.extract_calls == 2
-
-
 def test_identify_retroactive_emotion_preloads_once_per_audio_path(
     db_session, tmp_path, monkeypatch
 ):
@@ -687,7 +626,7 @@ def test_enrollment_refuses_chunk_audio_with_conversation_offsets(db_session, tm
 
 
 def test_recalculation_skips_unsafe_chunk_fallback(db_session, tmp_path):
-    from app.services import recalculate_emotion_profile, recalculate_speaker_embedding
+    from app.services import recalculate_speaker_embedding
 
     speaker = Speaker(name="Alice")
     speaker.set_embedding(np.ones(4, dtype=np.float32))
@@ -702,7 +641,6 @@ def test_recalculation_skips_unsafe_chunk_fallback(db_session, tmp_path):
 
     engine = FakeEngine()
     assert recalculate_speaker_embedding(speaker, db_session, engine) == 0
-    assert recalculate_emotion_profile(speaker.id, "happy", db_session, engine) is None
 
 
 def test_deleted_speaker_keeps_non_relabelable_tombstone(db_session, tmp_path, monkeypatch):

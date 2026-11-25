@@ -184,7 +184,6 @@ All configuration is environment variables (see `.env.example` for the curated l
 | `CONTEXT_PADDING`        | `0.15`   | Seconds of audio added around a segment before embedding.      |
 | `SILENCE_DURATION`       | `0.5`    | Streaming: seconds without speech (Silero VAD) before a buffered chunk of at least 2.5 s is processed. |
 | `FILTER_HALLUCINATIONS`  | `true`   | Drop Whisper filler phrases ("thank you.", etc.).              |
-| `EMOTION_THRESHOLD`      | `0.6`    | No longer used (emotions are personalised by calibration); kept so existing settings load. |
 
 ### Models
 
@@ -197,7 +196,7 @@ All configuration is environment variables (see `.env.example` for the curated l
 | `SPEAKER_EMBEDDING_MODEL`      | `pyannote/wespeaker-voxceleb-resnet34-LM` | Voice-embedding model behind speaker identification (see [Voice embeddings](#voice-embeddings)). `pyannote/embedding` = the original. Stored voices are rebuilt automatically when it changes. |
 | `DIARIZATION_BACKEND`          | `pyannote`                       | Diarization runtime: `pyannote` or `speakrs`, the same community-1 models and clustering in Rust/CUDA (see [Diarization runtime](#diarization-runtime-pyannote-or-speakrs)). |
 | `EMOTION_MODEL`                | `iic/emotion2vec_plus_large`     | FunASR emotion model ID (e.g. `iic/emotion2vec_plus_large` or lighter `iic/emotion2vec_plus_base`). |
-| `EMOTION_BATCH_SIZE`           | `1`                              | Direct PyTorch `emotion2vec` batch size (`1` = exact fast path bypassing FunASR per-call overhead; `0` = legacy `FunASR.generate`). |
+| `EMOTION_BATCH_SIZE`           | `1`                              | Direct PyTorch `emotion2vec` batch size (`1` = the same results as FunASR without its per-call overhead; above `1`, segments of similar length run padded together, faster on long files but padded segments can differ slightly; `0` = legacy `FunASR.generate`). |
 | `EMOTION_BF16`                 | `false`                          | Enable `bfloat16` autocast in direct emotion inference (`false` preserves exact TF32 scores). |
 | `EMOTION_TEXT_MODEL`           | *(unset)*                        | Optional HuggingFace text-emotion classifier (e.g. `SamLowe/roberta-base-go_emotions`, MIT) fused with acoustic probabilities for higher conversational emotion accuracy. |
 | `EMOTION_TEXT_WEIGHT`          | `0.55`                           | Blend weight (`0.0`–`1.0`) for `EMOTION_TEXT_MODEL` probabilities when enabled. |
@@ -528,10 +527,14 @@ Full interactive docs at `/docs` (Swagger UI). The OpenAPI JSON is at `/openapi.
 - `POST /api/v1/conversations/{id}/segments/{sid}/{identify,correct-emotion}`, `PATCH .../{misidentified,emotion-misidentified}` — segment corrections.
 - `GET /api/v1/conversations/segments/{sid}/audio` — extract segment audio.
 - `GET /api/v1/conversations/{id}/audio` — the whole recording (an upload as processed, a live recording once finished); answers range requests, so players can seek.
-- `POST /api/v1/process` — upload and process a whole file (form field `diarize=false` skips speaker diarization when one person is talking: faster, one speaker, still matched against the stored voices).
+- `POST /api/v1/process` — upload and process a whole file (form field `diarize=false` skips speaker diarization when one person is talking: faster, one speaker, still matched against the stored voices). Optional form fields for callers that only need the answer:
+  - `save_conversation=false` — stateless: nothing is written (no conversation, no recording, no new Unknown speakers). WAV, FLAC, OGG and MP3 are decoded in memory. Stored speakers are still recognised; a voice that matches nobody comes back as `"Unknown"` with no `speaker_id`, and each segment's `speaker_label` (`SPEAKER_00`, ...) tells this request's voices apart. The response has `id: 0`.
+  - `identify_speakers=false` — skip voice matching; speakers are the raw diarization labels.
+  - `include_emotion=false` — skip emotion recognition.
 - `GET/POST /api/v1/settings/voice`, `POST /api/v1/settings/voice/reset` — runtime-tunable voice settings.
 - `GET/POST /api/v1/profiles`, checkpoints, download, import, restore — backup/restore.
 - `WS /api/v1/streaming/ws` — live audio ingestion: a `{"type": "start"}` message, then binary PCM chunks (48 kHz float32 by default; `"sample_rate": 16000, "format": "int16"` in the start message is a sixth of the bandwidth; `"diarize": false` skips diarization per chunk), then `{"type": "stop"}`. Speech is processed at each pause, and a turn that runs 15 s without one is cut at its quietest point.
+  Optional `start` fields for low-latency voice conversation: `"silence_duration"` (seconds of pause that end a chunk, 0.1–5) and `"min_flush_seconds"` (speech needed before a pause flushes it, 0–30) override `SILENCE_DURATION` and `LIVE_MIN_FLUSH_SECONDS` for the session; `"fast_emit": true` sends each `segment` before its emotion is ready and follows with an `emotion_update` message (`segment_id`, `emotion_category`, `emotion_confidence`, `detector_breakdown`) once it is saved.
 
 ### Example — upload + process
 

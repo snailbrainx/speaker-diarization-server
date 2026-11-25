@@ -20,6 +20,7 @@ from fastapi import APIRouter, HTTPException, Depends, Request, Body
 from fastapi.responses import StreamingResponse, JSONResponse
 from sqlalchemy.orm import Session
 from typing import Optional, Any, Dict
+from . import __version__
 import inspect
 import typing
 import json
@@ -476,7 +477,7 @@ async def mcp_info():
     """
     return {
         "name": "Speaker Diarization MCP Server",
-        "version": "1.0.0",
+        "version": __version__,
         "protocol": "MCP 2024-11-05",
         "transport": "HTTP (SSE)",
         "description": "Speaker diarization MCP interface",
@@ -543,7 +544,7 @@ async def mcp_rpc(body: Dict[str, Any] = Body(...), db: Session = Depends(get_db
             "result": {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "speaker-diarization", "version": "1.0.0"}
+                "serverInfo": {"name": "speaker-diarization", "version": __version__}
             },
             "id": req_id
         })

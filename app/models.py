@@ -42,7 +42,7 @@ class Speaker(Base):
     updated_at = Column(DateTime, default=utc_now, onupdate=utc_now)
 
     # Per-speaker emotion matching threshold (NULL = use global default)
-    emotion_threshold = Column(Float, nullable=True)
+    emotion_threshold = Column(Float, nullable=True)  # unused; kept so older databases load
 
     # Relationships
     emotion_profiles = relationship("SpeakerEmotionProfile", back_populates="speaker", cascade="all, delete-orphan")
@@ -59,10 +59,9 @@ class Speaker(Base):
 
 
 class SpeakerEmotionProfile(Base):
-    """
-    Emotion embeddings for a specific speaker and emotion category.
-    Stores learned emotional signatures that improve with corrections.
-    """
+    """Legacy per-emotion profiles of a speaker. Nothing reads or writes them any more: emotions are read with each
+    speaker's corrected lines (app/emotion_calibration.py). The table stays so older databases load; resetting a
+    speaker's emotions, deleting them or restoring a backup clears their rows."""
     __tablename__ = "speaker_emotion_profiles"
 
     id = Column(Integer, primary_key=True, index=True)

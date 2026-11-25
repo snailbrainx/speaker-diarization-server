@@ -35,13 +35,13 @@ from sqlalchemy.orm import Session as OrmSession
 
 from . import emotion_calibration, live_tracking, overlap
 from .config import get_config
-from .models import ConversationSegment, Speaker, SpeakerEmotionProfile
+from .models import ConversationSegment, Speaker
 
 logger = logging.getLogger(__name__)
 
 # Engines whose speaker-profile cache must be dropped whenever stored voices change (any session, any endpoint).
 _ENGINES: "weakref.WeakSet" = weakref.WeakSet()
-_VOICE_TABLES = (Speaker, SpeakerEmotionProfile)
+_VOICE_TABLES = (Speaker,)
 
 
 @event.listens_for(OrmSession, "after_flush")
@@ -73,9 +73,6 @@ event.listen(OrmSession, "after_rollback", _drop_voice_caches)
 FALLBACK_THRESHOLD_REDUCTION = 0.05
 MIN_FALLBACK_THRESHOLD = 0.20
 UNKNOWN_NAME_MAX_ATTEMPTS = 5
-
-# Emotion detection constants
-MIN_VOICE_SAMPLES = 3
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -149,12 +146,18 @@ SNAP_TO_TURNS = _env_flag("SNAP_TO_TURNS", True)
 OVERLAP_SEPARATION = _env_flag("OVERLAP_SEPARATION", False)
 LIVE_SPEAKER_TRACKING = _env_flag("LIVE_SPEAKER_TRACKING", True)
 DIARIZATION_BACKEND = (os.getenv("DIARIZATION_BACKEND") or "pyannote").strip().lower()
-EMOTION_BATCH_SIZE = int(os.getenv("EMOTION_BATCH_SIZE") or 1)
+try:
+    EMOTION_BATCH_SIZE = int(os.getenv("EMOTION_BATCH_SIZE") or 1)
+except ValueError:
+    logger.warning("EMOTION_BATCH_SIZE must be a whole number; using 1")
+    EMOTION_BATCH_SIZE = 1
 EMOTION_BF16 = _env_flag("EMOTION_BF16", False)
 EMOTION_TEXT_MODEL = (os.getenv("EMOTION_TEXT_MODEL") or "").strip()
 EMOTION_TEXT_WEIGHT = float(os.getenv("EMOTION_TEXT_WEIGHT") or 0.55)
 
 # Mapping from text-emotion classifier labels (GoEmotions 28-class & Ekman 7-class) to emotion2vec's canonical 7 classes.
+# Idle cleanup gives back PyTorch's unused VRAM cache once it is this large (see _periodic_cleanup_worker)
+_IDLE_CACHE_RELEASE_GB = 1.0
 _CANON7_EMOTIONS = ("neutral", "happy", "sad", "angry", "fearful", "disgusted", "surprised")
 _TEXT_EMOTION_TO_CANON7 = {
     "neutral": "neutral",
@@ -455,20 +458,6 @@ def _build_profile_list(speakers: list) -> List[Dict[str, Any]]:
                 "emotion": None,
                 "profile_type": "general",
             })
-        for emotion_profile in speaker.emotion_profiles:
-            if emotion_profile.voice_sample_count < MIN_VOICE_SAMPLES:
-                continue
-            voice_emb = emotion_profile.get_voice_embedding()
-            if voice_emb is None or np.isnan(voice_emb).any():
-                continue
-            profiles.append({
-                "speaker_id": speaker.id,
-                "speaker_name": speaker.name,
-                "embedding": voice_emb,
-                "emotion": emotion_profile.emotion_category,
-                "profile_type": "emotion_voice",
-                "sample_count": emotion_profile.voice_sample_count,
-            })
     return profiles
 
 
@@ -647,7 +636,10 @@ class SpeakerRecognitionEngine:
                 self._active_requests = max(0, getattr(self, "_active_requests", 1) - 1)
 
     def _periodic_cleanup_worker(self):
-        """Every 30s, free excess VRAM only when idle and above threshold (avoids stalling live/short requests)."""
+        """Every 30s, while no request is running, give back VRAM that PyTorch holds but no model uses: always when
+        that cache is over _IDLE_CACHE_RELEASE_GB (a long upload leaves several GB on a card other services share),
+        or when total use is over CLEANUP_VRAM_THRESHOLD_GB. The small cache short and live requests leave stays,
+        so they do not pay for allocating it again."""
         while self._cleanup_running:
             try:
                 time.sleep(30)
@@ -658,7 +650,8 @@ class SpeakerRecognitionEngine:
 
                 threshold_gb = float(os.getenv("CLEANUP_VRAM_THRESHOLD_GB") or "12")
                 vram_before_gb = torch.cuda.memory_reserved() / (1024**3)
-                if vram_before_gb < threshold_gb:
+                cached_gb = vram_before_gb - torch.cuda.memory_allocated() / (1024**3)
+                if vram_before_gb < threshold_gb and cached_gb < _IDLE_CACHE_RELEASE_GB:
                     continue
                 gc.collect()
                 torch.cuda.empty_cache()
@@ -892,6 +885,11 @@ class SpeakerRecognitionEngine:
                     disable_update=True,
                     local_files_only=use_offline,
                 )
+                # FunASR only switches to eval mode inside generate(); the direct forward in _extract_emotions_batch
+                # would otherwise run with dropout on and give a slightly different answer on every call.
+                inner = getattr(self._emotion_model, "model", None)
+                if hasattr(inner, "eval"):
+                    inner.eval()
                 logger.info(f"emotion2vec model loaded successfully ({model_name})")
             except ImportError:
                 logger.warning("FunASR not installed. Emotion detection disabled. Install with: pip install funasr")
@@ -910,6 +908,7 @@ class SpeakerRecognitionEngine:
         Args:
             audio_file: Path to audio file
             audio: the file already in memory (_in_memory), used by Parakeet; Whisper decodes the file itself
+                and uses this only when there is no file (stateless uploads decoded in memory)
 
         Returns:
             List of transcription segments with timestamps
@@ -920,11 +919,16 @@ class SpeakerRecognitionEngine:
         # Get language from environment variable (default: "en")
         # Use "auto" for auto-detection, or specify language code (e.g., "es", "fr", "de")
         language = os.getenv("WHISPER_LANGUAGE", "en")
+        # A stateless upload decoded in memory has no file on disk; faster-whisper takes the 16 kHz samples directly.
+        # Files on disk are still decoded by faster-whisper itself, as before.
+        source = audio_file
+        if audio is not None and not os.path.exists(audio_file):
+            source = audio["waveform"][0].numpy()
         # faster-whisper transcription with word-level timestamps and confidence
         if WHISPER_BATCH_SIZE > 0:
             # Batched pipeline (VAD-chunked, always filters non-speech); see WHISPER_BATCH_SIZE above.
             segments_generator, info = self.batched_whisper().transcribe(
-                audio_file,
+                source,
                 language=None if language == "auto" else language,
                 task="transcribe",
                 beam_size=5,
@@ -933,7 +937,7 @@ class SpeakerRecognitionEngine:
             )
         else:
             segments_generator, info = self.whisper_model.transcribe(
-                audio_file,
+                source,
                 language=None if language == "auto" else language,  # None = auto-detect
                 task="transcribe",
                 beam_size=5,
@@ -1410,6 +1414,8 @@ class SpeakerRecognitionEngine:
         Running length-bucketed batches directly through model.extract_features() + model.proj() under
         bf16 autocast eliminates the per-segment Python/FunASR wrapper overhead and utilizes Tensor Cores,
         while falling back seamlessly to extract_emotion() for test stubs or non-standard models.
+        EMOTION_BATCH_SIZE=1 (default) gives FunASR's own results; in larger batches the shorter, padded segments of a
+        bucket can come out slightly different (padding changes the model's normalisation).
         """
         if not spans:
             return []
@@ -1635,6 +1641,15 @@ class SpeakerRecognitionEngine:
         return out
 
     @staticmethod
+    def _apply_personal_emotion(emo: Dict[str, Any], personal: Dict[str, Any]) -> None:
+        """Give a line its speaker's calibrated reading. Text fusion (EMOTION_TEXT_MODEL) then starts from these
+        scores, so the speaker's corrections still count when the transcript's emotion is blended in."""
+        emo.update(emotion_category=personal["emotion"], emotion_confidence=personal["confidence"],
+                   detector_breakdown=personal["breakdown"])
+        if emo.get("probs") is not None and personal.get("probs"):
+            emo["probs"] = {c: p for c, p in personal["probs"].items() if c in _CANON7_EMOTIONS}
+
+    @staticmethod
     def _fuse_multimodal_emotion(
         acoustic: Optional[Dict[str, Any]],
         text_probs: Optional[Dict[str, float]],
@@ -1695,11 +1710,7 @@ class SpeakerRecognitionEngine:
                     calibrations[speaker_id] = self.speaker_emotion_calibration(speaker_id, db_session)
                 personal = self.calibrated_emotion(emo.get("embedding"), calibrations.get(speaker_id))
                 if personal:
-                    emo.update(
-                        emotion_category=personal["emotion"],
-                        emotion_confidence=personal["confidence"],
-                        detector_breakdown=personal["breakdown"],
-                    )
+                    self._apply_personal_emotion(emo, personal)
             out.append(self._fuse_multimodal_emotion(emo, tx_p))
         return out
 
@@ -1875,8 +1886,7 @@ class SpeakerRecognitionEngine:
                     calibrations[speaker_id] = self.speaker_emotion_calibration(speaker_id, db_session)
                 personal = self.calibrated_emotion(emotion_data.get("embedding"), calibrations.get(speaker_id))
                 if personal:
-                    emotion_data.update(emotion_category=personal["emotion"], emotion_confidence=personal["confidence"],
-                                        detector_breakdown=personal["breakdown"])
+                    self._apply_personal_emotion(emotion_data, personal)
             if tx_probs is not None:
                 emotion_data = self._fuse_multimodal_emotion(emotion_data, tx_probs)
 
@@ -2101,25 +2111,21 @@ class SpeakerRecognitionEngine:
             who = self._speaker(name, track.speaker_id, is_known=track.speaker_id is not None
                                 and not name.startswith("Unknown_"), confidence=similarity)
             identities[label] = dict(who, track=track)
-        # In one-speaker sessions (diarize=False), a reply too short to embed (e.g. a lone "yes")
-        # inherits the session's active speaker track instead of turning into an unassigned Unknown.
+        # In one-speaker sessions (diarize=False, the caller's word that one person talks), a reply too short to
+        # embed (e.g. a lone "yes") takes the session's only speaker instead of an unassigned Unknown. Its voice was
+        # never checked, so it says so (confidence 0) and stays off the track: it neither grows the track's voice nor
+        # becomes the segment that _follow_user reads, so correcting this one line cannot move the whole track.
         if not diarize and len(tracks.tracks) == 1:
             sole_track = tracks.tracks[0]
             if db_session is not None:
                 self._follow_user([sole_track], db_session, names, tracks.conversation_id)
-            sole_name = names.get(sole_track.speaker_id, "Unknown")
-            sole_who = dict(
-                self._speaker(
-                    sole_name,
-                    sole_track.speaker_id,
-                    is_known=sole_track.speaker_id is not None and not sole_name.startswith("Unknown_"),
-                    confidence=1.0,
-                ),
-                track=sole_track,
-            )
-            for _, label, _ in segments:
-                if label not in identities:
-                    identities[label] = dict(sole_who)
+            if sole_track.speaker_id is not None and sole_track.speaker_id in names:
+                sole_name = names[sole_track.speaker_id]
+                sole_who = self._speaker(sole_name, sole_track.speaker_id,
+                                         is_known=not sole_name.startswith("Unknown_"), confidence=0.0)
+                for _, label, _ in segments:
+                    if label not in identities:
+                        identities[label] = dict(sole_who)
         return identities
 
     @staticmethod

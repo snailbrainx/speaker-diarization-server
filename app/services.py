@@ -238,139 +238,22 @@ def recalculate_speaker_embedding(
     return len(embeddings)
 
 
-def recalculate_emotion_profile(
-    speaker_id: int,
-    emotion_category: str,
-    db: Session,
-    engine,
-) -> Optional[str]:
-    """
-    Recalculate a speaker's emotion profile from all corrected, non-misidentified segments.
-
-    Returns:
-        "updated", "created", "deleted", or None if nothing changed
-    """
-    _invalidate_speaker_cache(engine)
-    segments = (
-        db.query(ConversationSegment)
-        .options(joinedload(ConversationSegment.conversation))
+def emotion_correction_counts(db: Session, speaker_id: int) -> Dict[str, int]:
+    """How many of a speaker's lines were corrected to each emotion and are learned from (the same rows the
+    personal emotion calibration is fitted on)."""
+    rows = (
+        db.query(ConversationSegment.emotion_category, func.count(ConversationSegment.id))
         .filter(
             ConversationSegment.speaker_id == speaker_id,
-            ConversationSegment.is_misidentified == False,   # not this speaker's voice: never in their profiles
-            ConversationSegment.emotion_corrected == True,
-            ConversationSegment.emotion_misidentified == False,
-            ConversationSegment.emotion_category == emotion_category,
+            ConversationSegment.emotion_corrected == True,   # noqa: E712
+            ConversationSegment.emotion_misidentified == False,   # noqa: E712
+            ConversationSegment.is_misidentified == False,   # noqa: E712
+            ConversationSegment.emotion_category.isnot(None),
         )
-        # Group segments by recording so the decoded-audio cache below only
-        # ever needs to hold one file at a time.
-        .order_by(ConversationSegment.conversation_id, ConversationSegment.start_offset)
+        .group_by(ConversationSegment.emotion_category)
         .all()
     )
-
-    emotion_embeddings = []
-    voice_embeddings = []
-    preloaded_audio_by_path = {}
-    preload_failures = set()
-    preloader = getattr(engine, "preload_emotion_audio", None)
-
-    for seg in segments:
-        # Emotion embedding
-        stored_emb = seg.get_emotion_embedding()
-        if stored_emb is not None and not np.isnan(stored_emb).any():
-            emotion_embeddings.append(stored_emb)
-        else:
-            audio_path = resolve_audio_path(seg.conversation, seg)
-            if audio_path and not uses_segment_audio_fallback(seg.conversation, seg, audio_path):
-                try:
-                    kwargs = {"extract_embedding": True}
-                    if preloader is not None:
-                        if (
-                            audio_path not in preloaded_audio_by_path
-                            and audio_path not in preload_failures
-                        ):
-                            # Segments arrive ordered by conversation, so a new
-                            # path means the previous recording is done with —
-                            # release it instead of holding every decoded file
-                            # (~115 MB per mono hour) until the call returns.
-                            preloaded_audio_by_path.clear()
-                            try:
-                                preloaded_audio_by_path[audio_path] = preloader(audio_path)
-                            except Exception as exc:  # one failed decode, not N
-                                preload_failures.add(audio_path)
-                                logger.warning(
-                                    "Could not preload emotion audio %s: %s",
-                                    audio_path,
-                                    exc,
-                                )
-                        if audio_path in preload_failures:
-                            data = None
-                        else:
-                            kwargs["preloaded_audio"] = preloaded_audio_by_path[audio_path]
-                            data = engine.extract_emotion(
-                                audio_path,
-                                seg.start_offset,
-                                seg.end_offset,
-                                **kwargs,
-                            )
-                    else:
-                        data = engine.extract_emotion(
-                            audio_path,
-                            seg.start_offset,
-                            seg.end_offset,
-                            **kwargs,
-                        )
-                    if data and 'embedding' in data and not np.isnan(data['embedding']).any():
-                        emotion_embeddings.append(data['embedding'])
-                except Exception as e:
-                    logger.warning(f"Could not extract emotion embedding for segment {seg.id}: {e}")
-            elif audio_path:
-                logger.warning(
-                    "Skipping emotion re-extraction for segment %s: only chunk "
-                    "audio is available for conversation-relative offsets",
-                    seg.id,
-                )
-
-        # Voice embedding (none from overlapping speech: two voices at once)
-        voice_emb = None if seg.is_overlap else seg.get_speaker_embedding()
-        if voice_emb is not None and not np.isnan(voice_emb).any():
-            voice_embeddings.append(voice_emb)
-
-    profile = db.query(SpeakerEmotionProfile).filter(
-        SpeakerEmotionProfile.speaker_id == speaker_id,
-        SpeakerEmotionProfile.emotion_category == emotion_category
-    ).first()
-
-    if emotion_embeddings:
-        avg_emb = np.mean(emotion_embeddings, axis=0)
-        avg_voice = np.mean(voice_embeddings, axis=0) if voice_embeddings else None
-
-        if profile:
-            profile.set_embedding(avg_emb)
-            profile.sample_count = len(emotion_embeddings)
-            if avg_voice is not None:
-                profile.set_voice_embedding(avg_voice)
-                profile.voice_sample_count = len(voice_embeddings)
-            else:
-                profile.set_voice_embedding(None)
-                profile.voice_sample_count = 0
-            return "updated"
-        else:
-            profile = SpeakerEmotionProfile(
-                speaker_id=speaker_id,
-                emotion_category=emotion_category,
-                sample_count=len(emotion_embeddings),
-                voice_sample_count=len(voice_embeddings) if voice_embeddings else 0
-            )
-            profile.set_embedding(avg_emb)
-            if avg_voice is not None:
-                profile.set_voice_embedding(avg_voice)
-            db.add(profile)
-            return "created"
-    elif profile:
-        db.delete(profile)
-        return "deleted"
-
-    return None
+    return {emotion: count for emotion, count in rows}
 
 
 def delete_unknown_speakers(db: Session, engine=None, max_seconds: Optional[float] = None) -> Tuple[int, List[str]]:
@@ -461,18 +344,6 @@ def migrate_voice_embeddings(db: Session, engine, commit: bool = True) -> Option
         else:
             speaker.set_embedding(np.full(engine.embedding_dim, np.nan, dtype=np.float32))
             counts["speakers_without_audio"].append(speaker.name)
-        for profile in speaker.emotion_profiles:
-            if profile.voice_embedding is None:
-                continue
-            voices = [v for (v,) in db.query(ConversationSegment.speaker_embedding).filter(
-                ConversationSegment.speaker_id == speaker.id, ConversationSegment.is_misidentified == False,  # noqa: E712
-                ConversationSegment.is_overlap == False,  # noqa: E712
-                ConversationSegment.emotion_corrected == True, ConversationSegment.emotion_misidentified == False,  # noqa: E712
-                ConversationSegment.emotion_category == profile.emotion_category,
-                ConversationSegment.speaker_embedding.isnot(None)).all()]
-            embs = [np.frombuffer(v, dtype=np.float32) for v in voices]
-            profile.set_voice_embedding(np.mean(embs, axis=0) if embs else None)
-            profile.voice_sample_count = len(embs)
     if row is None:
         db.add(AppMetadata(key=VOICE_MODEL_KEY, value=SPEAKER_EMBEDDING_MODEL))
     else:

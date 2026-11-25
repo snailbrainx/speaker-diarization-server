@@ -13,7 +13,6 @@ router = APIRouter(prefix="/settings", tags=["Settings"])
 class SettingsUpdateRequest(BaseModel):
     """Request model for updating settings"""
     speaker_threshold: Optional[float] = None
-    emotion_threshold: Optional[float] = None
     context_padding: Optional[float] = None
     silence_duration: Optional[float] = None
     filter_hallucinations: Optional[bool] = None
@@ -44,8 +43,6 @@ async def update_voice_settings(updates: SettingsUpdateRequest):
       (SPEAKER_ASSIGNMENT=segment, LIVE_SPEAKER_TRACKING=false). Higher = stricter matching.
       - 0.30: Original default
       - 0.20: Noisy environments (movies, background noise)
-    - **emotion_threshold**: no longer used (kept for compatibility): emotions are read with each speaker's
-      corrections instead (personal calibration).
     - **context_padding**: Padding before/after segments for embedding extraction (seconds)
       - 0.15: Default, helps with background music
     - **silence_duration**: Silence duration before processing streaming segment (seconds)

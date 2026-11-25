@@ -130,6 +130,39 @@ def test_forgetting_a_speakers_emotions_stops_learning_from_their_corrections(en
     assert db.query(ConversationSegment).filter_by(emotion_category="neutral").count() == 3   # labels stay
 
 
+def test_corrections_are_counted_from_the_corrected_lines(eng, db, ann):
+    """A correction marks the line; what the Speakers page shows is counted from the lines themselves, and no
+    per-emotion profile is built any more."""
+    from types import SimpleNamespace
+    from app import conversation_api
+    from app.models import SpeakerEmotionProfile
+    conv, speaker = ann
+    line = add_line(db, conv, speaker, embedding(happy=3.0, neutral=2.1), "happy")
+    db.commit()
+    stub = SimpleNamespace(clear_gpu_cache_async=lambda *_: None)
+    out = asyncio.run(conversation_api.correct_emotion_in_segment(conv.id, line.id, "neutral", True, db, stub))
+    assert out["sample_count"] == 4 and out["learned"] is True
+    out = asyncio.run(conversation_api.correct_emotion_in_segment(conv.id, line.id, "neutral", False, db, stub))
+    assert out["sample_count"] == 0   # learn=false: left out
+    assert db.query(SpeakerEmotionProfile).count() == 0
+    profiles = asyncio.run(conversation_api.get_speaker_emotion_profiles(speaker.id, db, eng))
+    assert profiles["profiles"] == [{"emotion_category": "neutral", "sample_count": 3}]
+    assert profiles["calibration"]["corrections"] == 3
+
+
+def test_forgetting_also_clears_profiles_left_by_older_versions(eng, db, ann):
+    from app import conversation_api
+    from app.models import SpeakerEmotionProfile
+    _, speaker = ann
+    legacy = SpeakerEmotionProfile(speaker_id=speaker.id, emotion_category="neutral", sample_count=3)
+    legacy.set_embedding(np.ones(16, dtype=np.float32))
+    db.add(legacy)
+    db.commit()
+    out = asyncio.run(conversation_api.reset_speaker_emotion_profiles(speaker.id, "neutral", db))
+    assert out["deleted"] == 3 and out["emotion_category"] == "neutral"
+    assert db.query(SpeakerEmotionProfile).count() == 0
+
+
 def test_live_lines_given_to_a_speaker_later_are_read_with_their_corrections(eng, db, ann):
     """A live line that only gets its speaker when the session's track is named was first read without them."""
     from app.streaming_websocket import _reread_emotions
@@ -139,3 +172,21 @@ def test_live_lines_given_to_a_speaker_later_are_read_with_their_corrections(eng
     reread = _reread_emotions(db, eng, [late.id, angry.id], speaker.id)
     assert {i: e["emotion_category"] for i, e in reread.items()} == {late.id: "neutral", angry.id: "angry"}
     assert late.detector_breakdown and angry.emotion_category == "angry"
+
+
+def test_text_fusion_starts_from_the_speakers_calibrated_reading(eng, db, ann):
+    """With EMOTION_TEXT_MODEL on, the blend uses the speaker's corrected reading, not the model's raw one."""
+    _, speaker = ann
+    cal = eng.speaker_emotion_calibration(speaker.id, db)
+    emb = embedding(happy=3.1, neutral=2.0)
+    raw = eng.emotion_logits(emb)
+    p = np.exp(raw - raw.max()); p /= p.sum()
+    emo = {"emotion_category": "happy", "emotion_confidence": float(p[L.index("happy")]), "embedding": emb,
+           "probs": {c: float(p[L.index(c)]) for c in ("neutral", "happy", "sad", "angry", "fearful", "disgusted",
+                                                       "surprised")}}
+    eng._apply_personal_emotion(emo, eng.calibrated_emotion(emb, cal))
+    assert emo["emotion_category"] == "neutral"
+    flat_text = {c: 1 / 7 for c in emo["probs"]}   # a transcript that says nothing either way
+    fused = eng._fuse_multimodal_emotion(emo, flat_text, weight=0.3)
+    assert fused["emotion_category"] == "neutral"
+    assert "personal_calibration" in fused["detector_breakdown"]

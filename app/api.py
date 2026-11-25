@@ -394,18 +394,25 @@ async def process_audio(
 
         segs_out = []
         for idx, seg in enumerate(result["segments"], start=1):
+            speaker_name, confidence = seg.get("speaker") or seg.get("speaker_label"), seg.get("confidence")
+            if identify_speakers and seg.get("speaker_id") is None and not seg.get("is_known"):
+                # Nothing is saved, so a voice that matches nobody gets no stored Unknown: name it plainly (a
+                # temporary Unknown_01 could read as the stored speaker of that name) and let speaker_label tell
+                # this request's strangers apart.
+                speaker_name, confidence = "Unknown", None
             segs_out.append(
                 ConversationSegmentResponse(
                     id=idx,
                     conversation_id=0,
                     speaker_id=seg.get("speaker_id"),
-                    speaker_name=seg.get("speaker") or seg.get("speaker_label"),
+                    speaker_name=speaker_name,
+                    speaker_label=seg.get("speaker_label"),
                     text=seg.get("text"),
                     start_time=start_time + timedelta(seconds=seg["start"]),
                     end_time=start_time + timedelta(seconds=seg["end"]),
                     start_offset=seg["start"],
                     end_offset=seg["end"],
-                    confidence=seg.get("confidence"),
+                    confidence=confidence,
                     emotion_category=seg.get("emotion_category"),
                     emotion_confidence=seg.get("emotion_confidence"),
                     detector_breakdown=seg.get("detector_breakdown"),
