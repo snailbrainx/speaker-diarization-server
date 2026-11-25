@@ -22,6 +22,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 import uvicorn
+
+from app import __version__
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
@@ -194,7 +196,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Speaker Diarization API",
     description="Speaker diarization and recognition service with GPU acceleration",
-    version="1.0.0",
+    version=__version__,
     lifespan=lifespan
 )
 
