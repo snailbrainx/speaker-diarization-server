@@ -264,19 +264,22 @@ async def websocket_endpoint(
         config = get_config()
         settings = config.get_settings()
 
+        def _number(v):   # a JSON number only (true/false are ints to Python)
+            return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+
         req_silence = init_message.get("silence_duration")
-        if isinstance(req_silence, (int, float)) and math.isfinite(req_silence) and 0.1 <= req_silence <= 5.0:
+        if _number(req_silence) and 0.1 <= req_silence <= 5.0:
             silence_duration = float(req_silence)
         else:
             silence_duration = None
 
         req_min_flush = init_message.get("min_flush_seconds")
-        if isinstance(req_min_flush, (int, float)) and math.isfinite(req_min_flush) and 0.0 <= req_min_flush <= 30.0:
+        if _number(req_min_flush) and 0.0 <= req_min_flush <= 30.0:
             min_flush_seconds = float(req_min_flush)
         else:
             min_flush_seconds = None
 
-        fast_emit = bool(init_message.get("fast_emit", False))
+        fast_emit = init_message.get("fast_emit") is True   # JSON true only: the string "false" is not a yes
 
         recorder = StreamingRecorder(
             sample_rate=sample_rate,
@@ -582,11 +585,13 @@ async def _handle_segment_processed(
                     db,
                 )
                 if emo_updates:
+                    messages = []
                     for seg_data, emo in zip(segments_data, emo_updates):
                         if not emo:
                             continue
                         row = db.query(ConversationSegment).filter(
-                            ConversationSegment.id == seg_data["segment_id"]
+                            ConversationSegment.id == seg_data["segment_id"],
+                            ConversationSegment.conversation_id == conversation_id,
                         ).first()
                         if row is not None and not row.emotion_corrected:
                             row.emotion_category = emo.get("emotion_category")
@@ -595,12 +600,15 @@ async def _handle_segment_processed(
                                 row.set_emotion_embedding(emo["embedding"])
                             if emo.get("detector_breakdown"):
                                 row.detector_breakdown = json.dumps(emo["detector_breakdown"])
-                            await _send_message_bounded(websocket, "emotion_update", {
+                            messages.append({
                                 "segment_id": row.id,
                                 "emotion_category": row.emotion_category,
                                 "emotion_confidence": row.emotion_confidence,
+                                "detector_breakdown": emo.get("detector_breakdown"),
                             })
                     db.commit()
+                    for message in messages:   # only what was saved reaches the client
+                        await _send_message_bounded(websocket, "emotion_update", message)
             except Exception as emo_exc:  # noqa: BLE001 - async emotion must never fail already-sent segments
                 logger.warning(f"Post-emit emotion failed: {emo_exc}")
                 db.rollback()

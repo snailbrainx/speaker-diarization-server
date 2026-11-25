@@ -83,6 +83,9 @@ class ConversationSegmentResponse(BaseModel):
     avg_logprob: Optional[float] = None
     is_misidentified: bool = False
     is_overlap: bool = False  # words recovered from a second voice talking over someone (OVERLAP_SEPARATION)
+    # Stateless uploads (save_conversation=false) only: this request's diarization speaker (SPEAKER_00, ...). Voices
+    # that match nobody are all named "Unknown" there (no Unknown is stored), so this tells them apart.
+    speaker_label: Optional[str] = None
 
     @field_validator('detector_breakdown', mode='before')
     @classmethod

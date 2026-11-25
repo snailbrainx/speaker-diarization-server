@@ -52,6 +52,7 @@ def decide(logits: np.ndarray, calibration: Calibration) -> Dict:
     return {
         "emotion": LABELS[c],
         "confidence": float(personal[c]),
+        "probs": {label: float(p) for label, p in zip(LABELS, personal)},
         "breakdown": {
             "emotion2vec": {"emotion": LABELS[m], "confidence": float(model[m])},
             "personal_calibration": {"corrections": calibration.corrections,

@@ -78,13 +78,35 @@ def test_single_speaker_short_reply_inherits_active_track():
     t.speaker_id = 42
     t.own_unknown = False
 
+    eng._all_profiles = lambda db: [{"speaker_id": 42, "speaker_name": "Alice", "profile_type": "general",
+                                     "embedding": v}]
+    eng._follow_user = lambda *a, **k: None
+
     # Next chunk: a short "yes" (0.2 s) whose embedding is None
     eng._label_centroids = lambda *a, **k: {"SPEAKER_00": None}
     segments = [({"start": 0.0, "end": 0.2, "text": "yes"}, "SPEAKER_00", None)]
-    identities = eng._identify_tracks(None, segments, {"exclusive_segments": []}, tracks, None, diarize=False)
-    assert "SPEAKER_00" in identities
-    assert identities["SPEAKER_00"]["track"] is t
-    assert identities["SPEAKER_00"]["speaker_id"] == 42
+    identities = eng._identify_tracks(None, segments, {"exclusive_segments": []}, tracks, object(), diarize=False)
+    who = identities["SPEAKER_00"]
+    assert (who["speaker"], who["speaker_id"], who["is_known"]) == ("Alice", 42, True)
+    # its voice was never checked: no confidence, and it stays off the track (so correcting it cannot move the track)
+    assert who["confidence"] == 0.0
+    assert "track" not in who
+
+
+def test_single_speaker_short_reply_stays_unknown_while_the_track_has_no_speaker():
+    eng = SpeakerRecognitionEngine.__new__(SpeakerRecognitionEngine)
+    eng._speaker_cache = None
+    eng._cache_lock = threading.Lock()
+    tracks = lt.SessionTracks()
+    v = np.zeros(8, dtype=np.float32)
+    v[0] = 1.0
+    tracks.assign({"SPEAKER_00": (v, 3.0)})   # a new voice: its Unknown is only created when the chunk is saved
+    eng._all_profiles = lambda db: []
+    eng._follow_user = lambda *a, **k: None
+    eng._label_centroids = lambda *a, **k: {"SPEAKER_00": None}
+    segments = [({"start": 0.0, "end": 0.2, "text": "yes"}, "SPEAKER_00", None)]
+    identities = eng._identify_tracks(None, segments, {"exclusive_segments": []}, tracks, object(), diarize=False)
+    assert "SPEAKER_00" not in identities   # the caller names it a plain Unknown
 
 
 def test_in_memory_from_bytes_matches_wav_file(tmp_path):
@@ -215,3 +237,82 @@ def test_multimodal_text_emotion_mapping_and_fusion():
     assert fused["emotion_category"] == "neutral"
     assert fused["emotion_confidence"] > 0.65
     assert "multimodal" in fused["detector_breakdown"]
+
+
+def test_stateless_upload_names_unmatched_voices_plainly_and_keeps_their_labels():
+    """Nothing is saved, so a voice that matches nobody has no stored Unknown: it is "Unknown" (not a temporary
+    Unknown_01 that could read as a stored speaker) with no confidence, and speaker_label tells the voices apart."""
+    from fastapi.testclient import TestClient
+    from app import api
+    from app.main import app
+
+    def seg(start, label, **who):
+        return dict({"start": start, "end": start + 1.0, "text": "x", "speaker_label": label, "words": [],
+                     "avg_logprob": -0.1}, **who)
+
+    class StubEngine:
+        def clear_gpu_cache_async(self, reason):
+            pass
+
+        def transcribe_with_diarization(self, *a, **k):
+            return {"num_speakers": 3, "segments": [
+                seg(0.0, "SPEAKER_00", speaker="Alice", speaker_id=7, is_known=True, confidence=0.81),
+                seg(1.0, "SPEAKER_01", speaker="Unknown", is_known=False, confidence=1.0, enroll={"voice": None}),
+                seg(2.0, "SPEAKER_02", speaker="Unknown_01", is_known=False, confidence=0.0),
+            ]}
+
+    app.dependency_overrides[api.get_engine] = lambda: StubEngine()
+    try:
+        resp = TestClient(app).post("/api/v1/process", files={"audio_file": ("clip.wav", b"RIFF0000WAVE", "audio/wav")},
+                                    data={"save_conversation": "false", "include_emotion": "false"})
+    finally:
+        app.dependency_overrides.pop(api.get_engine, None)
+    assert resp.status_code == 200, resp.text
+    got = [(s["speaker_name"], s["speaker_id"], s["confidence"], s["speaker_label"])
+           for s in resp.json()["transcript_segments"]]
+    assert got == [("Alice", 7, 0.81, "SPEAKER_00"), ("Unknown", None, None, "SPEAKER_01"),
+                   ("Unknown", None, None, "SPEAKER_02")]
+
+
+def test_whisper_reads_in_memory_audio_when_the_upload_has_no_file(monkeypatch):
+    """A stateless upload decoded in memory passes only its file name; Whisper then takes the samples."""
+    seen = []
+
+    class Whisper:
+        def transcribe(self, source, **kwargs):
+            seen.append(source)
+            return iter(()), types.SimpleNamespace(language="en", language_probability=1.0)
+
+    eng = SpeakerRecognitionEngine.__new__(SpeakerRecognitionEngine)
+    eng._whisper_model = Whisper()
+    monkeypatch.setattr(type(eng), "whisper_model", property(lambda self: self._whisper_model))
+    eng.clear_gpu_cache_async = lambda *a: None
+    monkeypatch.setattr(diarization, "ASR_BACKEND", "whisper")
+    monkeypatch.setattr(diarization, "WHISPER_BATCH_SIZE", 0)
+    samples = np.zeros(1600, dtype=np.float32)
+    audio = {"waveform": [types.SimpleNamespace(numpy=lambda: samples)], "sample_rate": 16000}   # as _in_memory
+    eng.transcribe("clip.wav", audio)
+    assert isinstance(seen[-1], np.ndarray) and len(seen[-1]) == 1600
+    eng.transcribe(__file__, audio)   # a file on disk is still decoded by faster-whisper itself
+    assert seen[-1] == __file__
+
+
+def test_emotion_model_is_put_in_eval_mode_when_loaded(monkeypatch):
+    """FunASR only switches to eval mode inside generate(); the direct forward would otherwise keep dropout on."""
+    import sys
+
+    class Inner:
+        training = True
+
+        def eval(self):
+            self.training = False
+            return self
+
+    class AutoModel:
+        def __init__(self, **kwargs):
+            self.model = Inner()
+
+    monkeypatch.setitem(sys.modules, "funasr", types.SimpleNamespace(AutoModel=AutoModel))
+    eng = SpeakerRecognitionEngine.__new__(SpeakerRecognitionEngine)
+    eng._emotion_model, eng._emotion_model_failed, eng._model_lock = None, False, threading.Lock()
+    assert eng.emotion_model.model.training is False

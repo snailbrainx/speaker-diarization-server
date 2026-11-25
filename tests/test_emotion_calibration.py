@@ -172,3 +172,21 @@ def test_live_lines_given_to_a_speaker_later_are_read_with_their_corrections(eng
     reread = _reread_emotions(db, eng, [late.id, angry.id], speaker.id)
     assert {i: e["emotion_category"] for i, e in reread.items()} == {late.id: "neutral", angry.id: "angry"}
     assert late.detector_breakdown and angry.emotion_category == "angry"
+
+
+def test_text_fusion_starts_from_the_speakers_calibrated_reading(eng, db, ann):
+    """With EMOTION_TEXT_MODEL on, the blend uses the speaker's corrected reading, not the model's raw one."""
+    _, speaker = ann
+    cal = eng.speaker_emotion_calibration(speaker.id, db)
+    emb = embedding(happy=3.1, neutral=2.0)
+    raw = eng.emotion_logits(emb)
+    p = np.exp(raw - raw.max()); p /= p.sum()
+    emo = {"emotion_category": "happy", "emotion_confidence": float(p[L.index("happy")]), "embedding": emb,
+           "probs": {c: float(p[L.index(c)]) for c in ("neutral", "happy", "sad", "angry", "fearful", "disgusted",
+                                                       "surprised")}}
+    eng._apply_personal_emotion(emo, eng.calibrated_emotion(emb, cal))
+    assert emo["emotion_category"] == "neutral"
+    flat_text = {c: 1 / 7 for c in emo["probs"]}   # a transcript that says nothing either way
+    fused = eng._fuse_multimodal_emotion(emo, flat_text, weight=0.3)
+    assert fused["emotion_category"] == "neutral"
+    assert "personal_calibration" in fused["detector_breakdown"]
