@@ -147,6 +147,12 @@ class LiveSession extends EventTarget {
       }
       this.emit("speaker_update", { update: data, changed });
       this.log("speaker_update", `${data.segment_ids?.length || 0} line(s) → ${data.speaker_name}${data.is_known ? " (known)" : ""}`);
+    } else if (type === "emotion_update") {
+      const seg = this.byId.get(data.segment_id);
+      if (seg) {
+        Object.assign(seg, { emotion_category: data.emotion_category, emotion_confidence: data.emotion_confidence });
+        this.emit("speaker_update", { update: null, changed: [{ seg, before: { speaker_id: seg.speaker_id, speaker_name: seg.speaker_name } }] });
+      }
     } else if (type === "error") {
       this.error = data.message;
       this.log("error", data.message || "error");

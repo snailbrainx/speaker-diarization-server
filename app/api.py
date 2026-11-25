@@ -4,6 +4,7 @@ from sqlalchemy.orm import Session
 from typing import List, Optional
 import os
 import shutil
+import tempfile
 import asyncio
 import logging
 from datetime import timedelta
@@ -17,9 +18,9 @@ from .database import get_db, utc_now
 from .models import Speaker, SpeakerEmotionProfile, Conversation, ConversationSegment
 from .schemas import (
     SpeakerResponse, SpeakerRename, SpeakerSegment, UnknownVoiceMatches, VoiceMatch,
-    StatusResponse, ConversationResponse,
+    StatusResponse, ConversationResponse, ConversationSegmentResponse,
 )
-from .diarization import SpeakerRecognitionEngine
+from .diarization import SpeakerRecognitionEngine, _in_memory_from_bytes
 from .config import get_config
 from .conversation_lifecycle import (
     fail_processing_lease,
@@ -34,6 +35,15 @@ from .services import (
 )
 
 router = APIRouter()
+
+
+def _maybe_clear_gpu_cache(engine, reason: str) -> None:
+    """Prefer threshold-gated async GPU cleanup so uploads don't trigger blocking CUDA syncs."""
+    clear_async = getattr(engine, "clear_gpu_cache_async", None)
+    if clear_async is not None:
+        clear_async(reason)
+    else:
+        engine.clear_gpu_cache()
 
 
 def _convert_audio(src: str, dst: str) -> None:
@@ -215,8 +225,8 @@ async def enroll_speaker(
         except Exception:  # noqa: BLE001 - cache failures must fall back to a full reload
             engine.clear_speaker_cache()
 
-        # Clear GPU cache after embedding extraction
-        engine.clear_gpu_cache()
+        # Clear GPU cache asynchronously if above threshold
+        _maybe_clear_gpu_cache(engine, "enroll")
 
         return speaker
 
@@ -322,21 +332,107 @@ async def delete_all_unknown_speakers(max_seconds: Optional[float] = None, db: S
 async def process_audio(
     audio_file: UploadFile = File(...),
     diarize: bool = Form(True),
+    include_emotion: bool = Form(True),
+    identify_speakers: bool = Form(True),
+    save_conversation: bool = Form(True),
     db: Session = Depends(get_db),
     engine: SpeakerRecognitionEngine = Depends(get_engine)
 ):
     """
     Process uploaded audio file with speaker diarization and recognition.
-    Creates a new Conversation with segments. diarize=false skips speaker diarization when one person is talking
-    (faster; the whole file is one speaker, still matched against the stored voices).
+    Creates a new Conversation with segments unless save_conversation=false (stateless/ephemeral fast path:
+    decodes WAV/FLAC/OGG directly in memory, skips SQLite writes and never enrolls Unknown speakers).
+    diarize=false skips speaker diarization when one person is talking; identify_speakers=false skips voice
+    embedding extraction and returns raw diarization speaker labels; include_emotion=false skips emotion inference.
     """
+    base_filename = os.path.basename(audio_file.filename or "upload")
+    start_time = utc_now()
+    threshold = get_config().get_settings().speaker_threshold
+
+    if not save_conversation:
+        raw_bytes = await asyncio.to_thread(audio_file.file.read)
+        in_mem_audio = await asyncio.to_thread(_in_memory_from_bytes, raw_bytes)
+        tmp_dir_ctx = None
+        file_path = base_filename
+        try:
+            if in_mem_audio is None:
+                tmp_dir_ctx = tempfile.TemporaryDirectory(prefix="sds-ephemeral-")
+                raw_path = os.path.join(tmp_dir_ctx.name, base_filename)
+                with open(raw_path, "wb") as buffer:
+                    buffer.write(raw_bytes)
+                if not raw_path.lower().endswith(".wav"):
+                    wav_path = raw_path.rsplit(".", 1)[0] + ".wav"
+                    try:
+                        await asyncio.to_thread(_convert_audio, raw_path, wav_path)
+                        file_path = wav_path
+                    except Exception as e:
+                        logger.warning(f"Failed to convert ephemeral upload to WAV: {e}")
+                        file_path = raw_path
+                else:
+                    file_path = raw_path
+
+            result = await asyncio.to_thread(
+                engine.transcribe_with_diarization,
+                file_path,
+                None,
+                threshold=threshold,
+                db_session=db if identify_speakers else None,
+                diarize=diarize,
+                audio=in_mem_audio,
+                include_emotion=include_emotion,
+                identify_speakers=identify_speakers,
+            )
+        except Exception:
+            import traceback
+            traceback.print_exc()
+            raise HTTPException(status_code=500, detail="Audio processing failed")
+        finally:
+            if tmp_dir_ctx is not None:
+                tmp_dir_ctx.cleanup()
+
+        _maybe_clear_gpu_cache(engine, "upload_ephemeral_complete")
+
+        segs_out = []
+        for idx, seg in enumerate(result["segments"], start=1):
+            segs_out.append(
+                ConversationSegmentResponse(
+                    id=idx,
+                    conversation_id=0,
+                    speaker_id=seg.get("speaker_id"),
+                    speaker_name=seg.get("speaker") or seg.get("speaker_label"),
+                    text=seg.get("text"),
+                    start_time=start_time + timedelta(seconds=seg["start"]),
+                    end_time=start_time + timedelta(seconds=seg["end"]),
+                    start_offset=seg["start"],
+                    end_offset=seg["end"],
+                    confidence=seg.get("confidence"),
+                    emotion_category=seg.get("emotion_category"),
+                    emotion_confidence=seg.get("emotion_confidence"),
+                    detector_breakdown=seg.get("detector_breakdown"),
+                    words=seg.get("words"),
+                    avg_logprob=seg.get("avg_logprob"),
+                    is_overlap=bool(seg.get("overlap", False)),
+                )
+            )
+        duration = max((s["end"] for s in result["segments"]), default=0.0)
+        return ConversationResponse(
+            id=0,
+            title=f"Uploaded: {audio_file.filename}",
+            start_time=start_time,
+            end_time=start_time + timedelta(seconds=duration) if result["segments"] else start_time,
+            duration=duration if result["segments"] else None,
+            status="completed",
+            audio_format="wav",
+            num_segments=len(segs_out),
+            num_speakers=result["num_speakers"],
+            transcript_segments=segs_out,
+        )
+
     # Save audio file
     recordings_dir = os.path.join(data_path(), "recordings")
     os.makedirs(recordings_dir, exist_ok=True)
-    timestamp = utc_now().strftime("%Y%m%d_%H%M%S")
+    timestamp = start_time.strftime("%Y%m%d_%H%M%S")
 
-    # Save uploaded file with timestamp (basename strips any directory component)
-    base_filename = os.path.basename(audio_file.filename or "upload")
     # uuid suffix avoids collisions between uploads with the same name in the
     # same second (they used to overwrite each other mid-stream).
     import uuid as _uuid
@@ -362,7 +458,6 @@ async def process_audio(
         file_path = temp_path
 
     # Create conversation entry
-    start_time = utc_now()
     processing_token = new_processing_token()
     conversation = Conversation(
         title=f"Uploaded: {audio_file.filename}",
@@ -376,21 +471,17 @@ async def process_audio(
     db.refresh(conversation)
 
     try:
-        known_speakers = load_known_speakers(db)
-
-        # Get threshold from config
-        config = get_config()
-        settings = config.get_settings()
-        threshold = settings.speaker_threshold
-
-        # Process audio with transcription (run in thread to avoid blocking event loop)
+        # Process audio with transcription (run in thread to avoid blocking event loop).
+        # db_session gives the engine access to its cached profiles without an extra full-table scan.
         result = await asyncio.to_thread(
             engine.transcribe_with_diarization,
             file_path,
-            known_speakers,
+            None,
             threshold=threshold,
             db_session=db,
             diarize=diarize,
+            include_emotion=include_emotion,
+            identify_speakers=identify_speakers,
         )
 
         for seg in result["segments"]:
@@ -418,8 +509,8 @@ async def process_audio(
             raise RuntimeError("Upload processing lease lost")
         db.refresh(conversation)
 
-        # Clear GPU cache after processing
-        engine.clear_gpu_cache()
+        # Queue async GPU cleanup only if VRAM exceeds threshold (avoids per-request CUDA sync stalls)
+        _maybe_clear_gpu_cache(engine, "upload_complete")
 
         # Return conversation
         return conversation

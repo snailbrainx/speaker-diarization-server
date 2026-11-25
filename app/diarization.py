@@ -17,6 +17,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 from typing import Any, List, Dict, Tuple, Optional
 from faster_whisper import WhisperModel
 from concurrent.futures import ThreadPoolExecutor
+import io
 import time
 import tempfile
 import traceback
@@ -27,6 +28,7 @@ import threading
 import queue
 import gc
 
+from contextlib import contextmanager, nullcontext
 import weakref
 from sqlalchemy import event
 from sqlalchemy.orm import Session as OrmSession
@@ -147,6 +149,27 @@ SNAP_TO_TURNS = _env_flag("SNAP_TO_TURNS", True)
 OVERLAP_SEPARATION = _env_flag("OVERLAP_SEPARATION", False)
 LIVE_SPEAKER_TRACKING = _env_flag("LIVE_SPEAKER_TRACKING", True)
 DIARIZATION_BACKEND = (os.getenv("DIARIZATION_BACKEND") or "pyannote").strip().lower()
+EMOTION_BATCH_SIZE = int(os.getenv("EMOTION_BATCH_SIZE") or 1)
+EMOTION_BF16 = _env_flag("EMOTION_BF16", False)
+EMOTION_TEXT_MODEL = (os.getenv("EMOTION_TEXT_MODEL") or "").strip()
+EMOTION_TEXT_WEIGHT = float(os.getenv("EMOTION_TEXT_WEIGHT") or 0.55)
+
+# Mapping from text-emotion classifier labels (GoEmotions 28-class & Ekman 7-class) to emotion2vec's canonical 7 classes.
+_CANON7_EMOTIONS = ("neutral", "happy", "sad", "angry", "fearful", "disgusted", "surprised")
+_TEXT_EMOTION_TO_CANON7 = {
+    "neutral": "neutral",
+    "happy": "happy", "joy": "happy", "amusement": "happy", "excitement": "happy",
+    "gratitude": "happy", "love": "happy", "optimism": "happy", "pride": "happy",
+    "admiration": "happy", "approval": "happy", "caring": "happy", "relief": "happy",
+    "desire": "happy",
+    "sad": "sad", "sadness": "sad", "disappointment": "sad", "embarrassment": "sad",
+    "grief": "sad", "remorse": "sad",
+    "angry": "angry", "anger": "angry", "annoyance": "angry", "disapproval": "angry",
+    "fearful": "fearful", "fear": "fearful", "nervousness": "fearful",
+    "disgusted": "disgusted", "disgust": "disgusted",
+    "surprised": "surprised", "surprise": "surprised", "curiosity": "surprised",
+    "realization": "surprised", "confusion": "surprised",
+}
 SPLIT_PAUSE_SEC = 1.0      # WORD_LEVEL_SPEAKERS (and Parakeet's segments): a pause this long between words starts a new segment
 SPLIT_MAX_SEC = 30.0       # WORD_LEVEL_SPEAKERS (and Parakeet's segments): longest segment before a split at a word boundary
 CENTROID_MAX_WEIGHT_SEC = 10.0  # SPEAKER_ASSIGNMENT=cluster: a segment counts by its duration, up to this
@@ -271,6 +294,21 @@ def _in_memory(audio_file: str) -> Dict:
     """The file decoded once (mono, 16 kHz) in pyannote's in-memory form ({"waveform", "sample_rate"}), for every model
     that reads it: pyannote crops each window and each segment from it instead of reading the file again."""
     return {"waveform": torch.from_numpy(_load_audio_16k(audio_file))[None], "sample_rate": 16000}
+
+
+def _in_memory_from_bytes(raw_bytes: bytes) -> Optional[Dict]:
+    """Decode an uploaded WAV/FLAC/OGG byte buffer directly in RAM (mono, 16 kHz) without writing a file to disk.
+    Returns None if libsndfile cannot decode the format (caller falls back to ffmpeg via a temp file)."""
+    try:
+        data, sr = sf.read(io.BytesIO(raw_bytes), dtype="float32", always_2d=True)
+    except Exception:  # noqa: BLE001 - unsupported codec falls back to disk+ffmpeg
+        return None
+    audio = data.mean(axis=1)
+    if sr != 16000:
+        import torchaudio.functional as F
+        audio = F.resample(torch.from_numpy(audio), sr, 16000).numpy()
+    arr = np.ascontiguousarray(audio, dtype=np.float32)
+    return {"waveform": torch.from_numpy(arr)[None], "sample_rate": 16000}
 
 
 def _chunks_at_pauses(audio: np.ndarray, max_sec: float, sr: int = 16000) -> List[Tuple[int, int]]:
@@ -535,6 +573,8 @@ class SpeakerRecognitionEngine:
         self._separator = None
         self._emotion_model = None
         self._emotion_model_failed = False
+        self._text_emotion_bundle = None
+        self._text_emotion_failed = False
 
         # Serializes lazy-load on the four models. The startup warmup already
         # populates them, so on hot paths this is uncontended — but if warmup
@@ -549,6 +589,9 @@ class SpeakerRecognitionEngine:
         # Speaker profile cache (reduces DB queries during streaming)
         self._speaker_cache = None
         self._cache_lock = threading.Lock()
+        self._active_lock = threading.Lock()
+        self._active_requests = 0
+        self._parallel_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="diar-par")
 
         # Background cleanup thread (non-blocking)
         self._cleanup_running = True  # Set BEFORE starting thread
@@ -588,15 +631,35 @@ class SpeakerRecognitionEngine:
             except Exception as e:
                 logger.info(f"Background cleanup error: {e}")
 
+    @contextmanager
+    def _inference_slot(self):
+        """Track in-flight requests so periodic CUDA cache cleanup never stalls active work."""
+        lock = getattr(self, "_active_lock", None)
+        if lock is None:
+            yield
+            return
+        with lock:
+            self._active_requests = getattr(self, "_active_requests", 0) + 1
+        try:
+            yield
+        finally:
+            with lock:
+                self._active_requests = max(0, getattr(self, "_active_requests", 1) - 1)
+
     def _periodic_cleanup_worker(self):
-        """Every 30s, free VRAM. Silent unless the cleanup actually freed something."""
+        """Every 30s, free excess VRAM only when idle and above threshold (avoids stalling live/short requests)."""
         while self._cleanup_running:
             try:
                 time.sleep(30)
                 if not torch.cuda.is_available():
                     continue
+                if getattr(self, "_active_requests", 0) > 0:
+                    continue
 
+                threshold_gb = float(os.getenv("CLEANUP_VRAM_THRESHOLD_GB") or "12")
                 vram_before_gb = torch.cuda.memory_reserved() / (1024**3)
+                if vram_before_gb < threshold_gb:
+                    continue
                 gc.collect()
                 torch.cuda.empty_cache()
                 torch.cuda.synchronize()
@@ -682,6 +745,11 @@ class SpeakerRecognitionEngine:
         if self._diarization_pipeline is not None:
             return self._diarization_pipeline
         with self._model_lock:
+            if PYANNOTE_ALLOW_TF32 and self.device.type == "cuda":
+                # Keep TF32 enabled unconditionally regardless of backend: pyannote.audio's Inference
+                # (used by embedding_model even when DIARIZATION_BACKEND=speakrs) calls fix_reproducibility(),
+                # which otherwise forces Parakeet, ResNet34 and emotion2vec down to slow plain FP32.
+                _keep_tf32_on()
             if self._diarization_pipeline is None and DIARIZATION_BACKEND == "speakrs":
                 try:
                     import speakrs
@@ -716,6 +784,8 @@ class SpeakerRecognitionEngine:
                 model = Model.from_pretrained(SPEAKER_EMBEDDING_MODEL)
                 inference = Inference(model, window="whole")
                 inference.to(self.device)
+                if PYANNOTE_ALLOW_TF32 and self.device.type == "cuda":
+                    _keep_tf32_on()
                 self._embedding_model = inference
         return self._embedding_model
 
@@ -772,9 +842,8 @@ class SpeakerRecognitionEngine:
                 decoding = model.cfg.decoding
                 with open_dict(decoding):
                     decoding.compute_timestamps = True
-                    # No CUDA graphs in the greedy decoder: NeMo captures them while other threads keep using the
-                    # GPU (pyannote runs alongside), and a graph captured that way can fail on replay with an
-                    # illegal memory access that leaves the CUDA context unusable for every later request.
+                    # No CUDA graphs in the greedy decoder: NeMo 3.0.0's TDT graph replay hits illegal memory
+                    # access when other CUDA models share the process (verified even when serialized with speakrs).
                     decoding.greedy.use_cuda_graph_decoder = False
                     # Token probabilities; _parakeet_word_confidence turns them into word probabilities.
                     decoding.confidence_cfg = {"preserve_token_confidence": True, "exclude_blank": True,
@@ -1084,11 +1153,19 @@ class SpeakerRecognitionEngine:
         except Exception as e:
             logger.warning(f"Could not get audio duration, using original times: {e}")
 
-        with torch.no_grad():
+        with torch.inference_mode():
             if in_memory:
                 sr = audio_file["sample_rate"]
                 crop = audio_file["waveform"][:, int(round(start_time * sr)):int(round(end_time * sr))]
-                embedding = self.embedding_model({"waveform": crop, "sample_rate": sr})
+                # Direct WeSpeaker/pyannote model forward bypasses pyannote.audio.Inference wrapper overhead
+                # (~2.4x faster at 0.9999999 cosine match) when sample rate matches 16 kHz.
+                emb_inf = self.embedding_model
+                raw_model = getattr(emb_inf, "model", None)
+                if raw_model is not None and sr == 16000 and isinstance(crop, torch.Tensor):
+                    dev = getattr(emb_inf, "device", self.device)
+                    embedding = raw_model(crop.unsqueeze(0).to(dev, non_blocking=True)).squeeze(0).cpu().numpy()
+                else:
+                    embedding = emb_inf({"waveform": crop, "sample_rate": sr})
             else:
                 embedding = self.embedding_model.crop(audio_file, Segment(start_time, end_time))
         return np.array(embedding)
@@ -1109,6 +1186,9 @@ class SpeakerRecognitionEngine:
             List of embeddings (numpy arrays) in same order as input segments
             Skips segments that fail extraction (returns None in that position)
         """
+        if context_padding is None:
+            context_padding = get_config().get_settings().context_padding
+            self.context_padding = context_padding
         embeddings = []
         for seg in segments:
             try:
@@ -1172,27 +1252,30 @@ class SpeakerRecognitionEngine:
                 if (end_time - start_time) > MAX_EMOTION_DURATION_SEC:
                     end_time = start_time + MAX_EMOTION_DURATION_SEC
 
-                # Extract segment from preloaded audio when available.
-                # Callers processing many segments of one file (the main
-                # diarization loop) used to re-decode the ENTIRE file per
-                # segment (measured ~0.5 s/segment on a 30 min file); decode
-                # once and slice instead.
-                if preloaded_audio is not None:
-                    audio = preloaded_audio
+                # Extract segment from preloaded audio when available (either a 16 kHz mono float32 ndarray
+                # already decoded by _in_memory, or a pydub AudioSegment from preload_emotion_audio).
+                if isinstance(preloaded_audio, np.ndarray):
+                    s0 = max(0, int(start_time * 16000))
+                    s1 = min(len(preloaded_audio), int(end_time * 16000))
+                    samples = np.ascontiguousarray(preloaded_audio[s0:s1], dtype=np.float32)
                 else:
-                    audio = AudioSegment.from_file(audio_file)
-                start_ms = int(start_time * 1000)
-                end_ms = int(end_time * 1000)
-                segment = audio[start_ms:end_ms]
+                    if preloaded_audio is not None:
+                        audio = preloaded_audio
+                    else:
+                        audio = AudioSegment.from_file(audio_file)
+                    start_ms = int(start_time * 1000)
+                    end_ms = int(end_time * 1000)
+                    segment = audio[start_ms:end_ms]
 
-                # Resample to 16kHz if needed (emotion2vec requirement).
-                # Preloaded audio is already 16kHz by contract.
-                if preloaded_audio is None and segment.frame_rate != 16000:
-                    segment = segment.set_frame_rate(16000)
+                    # Resample to 16kHz if needed (emotion2vec requirement).
+                    # Preloaded audio is already 16kHz by contract.
+                    if preloaded_audio is None and segment.frame_rate != 16000:
+                        segment = segment.set_frame_rate(16000)
+                    samples = _float_samples(segment)
 
                 # Hand the samples over in memory: a temp WAV per segment stalls on a busy disk.
                 result = self.emotion_model.generate(
-                    _float_samples(segment),
+                    samples,
                     granularity="utterance",
                     extract_embedding=extract_embedding,
                 )
@@ -1310,6 +1393,316 @@ class SpeakerRecognitionEngine:
             self.clear_gpu_cache_async("emotion_error")
             return None
 
+    @staticmethod
+    def _clean_emotion_label(raw_label: str) -> str:
+        return raw_label.split("/")[-1].strip() if "/" in raw_label else raw_label
+
+    def _extract_emotions_batch(
+        self,
+        wav_16k: Optional[np.ndarray],
+        spans: List[Tuple[float, float]],
+        audio_file: str,
+        extract_embedding: bool = False,
+    ) -> List[Optional[Dict]]:
+        """Length-bucketed batched BF16/FP32 emotion2vec inference directly on the PyTorch model.
+
+        FunASR's Emotion2vec.inference() loops serially at batch size 1 in FP32 even when given a list.
+        Running length-bucketed batches directly through model.extract_features() + model.proj() under
+        bf16 autocast eliminates the per-segment Python/FunASR wrapper overhead and utilizes Tensor Cores,
+        while falling back seamlessly to extract_emotion() for test stubs or non-standard models.
+        """
+        if not spans:
+            return []
+        if getattr(self, "_emotion_model_failed", False):
+            return [None] * len(spans)
+        # In unit tests that build engines via __new__ and stub extract_emotion without _emotion_model,
+        # avoid triggering a real HuggingFace model load.
+        if not hasattr(self, "_model_lock") and getattr(self, "_emotion_model", None) is None:
+            return [
+                self.extract_emotion(audio_file, s, e, extract_embedding=extract_embedding, preloaded_audio=wav_16k)
+                for s, e in spans
+            ]
+        emo_wrapper = self.emotion_model
+        if emo_wrapper is None:
+            return [None] * len(spans)
+
+        model = getattr(emo_wrapper, "model", None)
+        kwargs = getattr(emo_wrapper, "kwargs", None) or {}
+        tokenizer = kwargs.get("tokenizer")
+        if (
+            wav_16k is None
+            or EMOTION_BATCH_SIZE <= 0
+            or model is None
+            or not hasattr(model, "extract_features")
+            or getattr(model, "proj", None) is None
+        ):
+            preloaded = wav_16k
+            if preloaded is None:
+                try:
+                    preloaded = self.preload_emotion_audio(audio_file)
+                except Exception as exc:  # noqa: BLE001
+                    logger.info(f"Emotion preload failed ({exc}); falling back to per-segment decode")
+                    preloaded = None
+            return [
+                self.extract_emotion(audio_file, s, e, extract_embedding=extract_embedding, preloaded_audio=preloaded)
+                for s, e in spans
+            ]
+
+        labels = list(tokenizer.token_list) if tokenizer is not None and getattr(tokenizer, "token_list", None) else list(emotion_calibration.LABELS)
+        unuse_mask = [lb.startswith("unuse") for lb in labels]
+        clean_labels = [self._clean_emotion_label(lb) for lb in labels]
+        normalize = bool(getattr(getattr(model, "cfg", None), "normalize", False))
+        device = next(model.parameters()).device
+        use_bf16 = bool(EMOTION_BF16 and device.type == "cuda" and torch.cuda.is_bf16_supported())
+
+        # Slice 16 kHz waveforms in memory, capped at MAX_EMOTION_DURATION_SEC
+        results: List[Optional[Dict]] = [None] * len(spans)
+        valid_items: List[Tuple[int, np.ndarray]] = []
+        n_total = len(wav_16k)
+        for idx, (start_t, end_t) in enumerate(spans):
+            if (end_t - start_t) > MAX_EMOTION_DURATION_SEC:
+                end_t = start_t + MAX_EMOTION_DURATION_SEC
+            s0 = max(0, int(start_t * 16000))
+            s1 = min(n_total, int(end_t * 16000))
+            piece = wav_16k[s0:s1]
+            if len(piece) < 400:  # <25 ms cannot pass emotion2vec's conv frontend stride
+                continue
+            valid_items.append((idx, np.ascontiguousarray(piece, dtype=np.float32)))
+
+        if not valid_items:
+            return results
+
+        # Sort by length and group into tight length buckets so padding overhead stays minimal in O(n^2) attention.
+        valid_items.sort(key=lambda item: len(item[1]))
+        buckets: List[List[Tuple[int, np.ndarray]]] = []
+        cur: List[Tuple[int, np.ndarray]] = []
+        cur_min = 0
+        for item in valid_items:
+            length = len(item[1])
+            if not cur:
+                cur = [item]
+                cur_min = length
+            elif len(cur) < EMOTION_BATCH_SIZE and length <= cur_min * 1.5:
+                cur.append(item)
+            else:
+                buckets.append(cur)
+                cur = [item]
+                cur_min = length
+        if cur:
+            buckets.append(cur)
+
+        import torch.nn.functional as F
+
+        amp_ctx = torch.amp.autocast("cuda", dtype=torch.bfloat16) if use_bf16 else nullcontext()
+        try:
+            with torch.inference_mode():
+                for bucket in buckets:
+                    bsz = len(bucket)
+                    if bsz == 1:
+                        idx0, arr0 = bucket[0]
+                        t0 = torch.from_numpy(arr0).to(device, non_blocking=True)
+                        if normalize:
+                            t0 = F.layer_norm(t0, t0.shape)
+                        batch_tensor = t0.unsqueeze(0)
+                        pad_mask = None
+                    else:
+                        max_len = max(len(arr) for _, arr in bucket)
+                        batch_tensor = torch.zeros((bsz, max_len), dtype=torch.float32, device=device)
+                        pad_mask = torch.ones((bsz, max_len), dtype=torch.bool, device=device)
+                        for b_i, (_, arr) in enumerate(bucket):
+                            t = torch.from_numpy(arr).to(device, non_blocking=True)
+                            if normalize:
+                                t = F.layer_norm(t, t.shape)
+                            L = t.shape[0]
+                            batch_tensor[b_i, :L] = t
+                            pad_mask[b_i, :L] = False
+
+                    with amp_ctx:
+                        feats = model.extract_features(batch_tensor, padding_mask=pad_mask)
+                        x = feats["x"]
+                        out_pm = feats.get("padding_mask")
+                        if out_pm is not None:
+                            valid = (~out_pm).unsqueeze(-1).to(x.dtype)
+                            utt = (x * valid).sum(dim=1) / valid.sum(dim=1).clamp(min=1.0)
+                        else:
+                            utt = x.mean(dim=1)
+
+                    utt_f32 = utt.float()
+                    logits = model.proj(utt_f32)
+                    for c_i, is_unused in enumerate(unuse_mask):
+                        if is_unused:
+                            logits[:, c_i] = float("-inf")
+                    probs = torch.softmax(logits, dim=-1).cpu().numpy()
+                    embs = utt_f32.cpu().numpy() if extract_embedding else None
+
+                    for b_i, (orig_idx, _) in enumerate(bucket):
+                        row_probs = probs[b_i]
+                        best_i = int(np.argmax(row_probs))
+                        canon_probs = {
+                            clean_labels[c_i]: float(row_probs[c_i])
+                            for c_i in range(len(clean_labels))
+                            if clean_labels[c_i] in _CANON7_EMOTIONS
+                        }
+                        entry: Dict[str, Any] = {
+                            "emotion_category": clean_labels[best_i],
+                            "emotion_confidence": float(row_probs[best_i]),
+                            "probs": canon_probs,
+                        }
+                        if embs is not None:
+                            entry["embedding"] = embs[b_i].astype(np.float32, copy=False)
+                        results[orig_idx] = entry
+        except Exception as exc:  # noqa: BLE001 - fall back to serial path if batched forward ever fails
+            logger.warning(f"Batched emotion inference failed ({exc}); falling back to serial extraction")
+            return [
+                self.extract_emotion(audio_file, s, e, extract_embedding=extract_embedding, preloaded_audio=wav_16k)
+                for s, e in spans
+            ]
+
+        self.clear_gpu_cache_async("emotion")
+        return results
+
+    @property
+    def text_emotion_bundle(self):
+        """Lazy-load optional text-emotion classifier (EMOTION_TEXT_MODEL) for multimodal acoustic+text fusion."""
+        if not EMOTION_TEXT_MODEL or getattr(self, "_text_emotion_failed", False):
+            return None
+        if getattr(self, "_text_emotion_bundle", None) is not None:
+            return self._text_emotion_bundle
+        with self._model_lock:
+            if getattr(self, "_text_emotion_bundle", None) is not None:
+                return self._text_emotion_bundle
+            if getattr(self, "_text_emotion_failed", False):
+                return None
+            try:
+                from transformers import AutoModelForSequenceClassification, AutoTokenizer
+                use_offline = os.getenv("OFFLINE_MODE", "false").lower() == "true"
+                logger.info(f"Loading text emotion model ({EMOTION_TEXT_MODEL}) for multimodal fusion...")
+                tok = AutoTokenizer.from_pretrained(EMOTION_TEXT_MODEL, local_files_only=use_offline)
+                dtype = torch.bfloat16 if (self.device.type == "cuda" and torch.cuda.is_bf16_supported()) else torch.float32
+                mdl = AutoModelForSequenceClassification.from_pretrained(
+                    EMOTION_TEXT_MODEL, dtype=dtype, local_files_only=use_offline
+                ).to(self.device).eval()
+                self._text_emotion_bundle = (tok, mdl)
+                logger.info(f"Text emotion model loaded ({EMOTION_TEXT_MODEL})")
+            except Exception as exc:  # noqa: BLE001 - optional multimodal booster must never break pipeline
+                logger.warning(f"Failed to load EMOTION_TEXT_MODEL ({EMOTION_TEXT_MODEL}): {exc}")
+                self._text_emotion_failed = True
+                return None
+        return self._text_emotion_bundle
+
+    @staticmethod
+    def _map_text_scores_to_canon7(id2label: Dict[int, str], probs_row: np.ndarray) -> Dict[str, float]:
+        """Aggregate model-specific emotion probabilities (28 GoEmotions or 7 Ekman) onto canonical 7 classes."""
+        acc = {c: 0.0 for c in _CANON7_EMOTIONS}
+        for idx, val in enumerate(probs_row):
+            raw = str(id2label.get(idx, id2label.get(str(idx), ""))).strip().lower()
+            canon = _TEXT_EMOTION_TO_CANON7.get(raw)
+            if canon:
+                acc[canon] += float(val)
+        total = sum(acc.values())
+        if total > 0.0:
+            for k in acc:
+                acc[k] /= total
+        return acc
+
+    def _extract_text_emotions_batch(self, texts: List[str]) -> List[Optional[Dict[str, float]]]:
+        """Run batched GPU text-emotion classification on segment transcripts (~0.1-0.3 ms/seg batched)."""
+        if not texts or not EMOTION_TEXT_MODEL:
+            return [None] * len(texts)
+        bundle = self.text_emotion_bundle
+        if bundle is None:
+            return [None] * len(texts)
+        tok, mdl = bundle
+        out: List[Optional[Dict[str, float]]] = [None] * len(texts)
+        non_empty = [(i, t.strip()) for i, t in enumerate(texts) if t and t.strip()]
+        if not non_empty:
+            return out
+        id2label = getattr(mdl.config, "id2label", {}) or {}
+        multi_label = getattr(mdl.config, "problem_type", None) == "multi_label_classification"
+        device = next(mdl.parameters()).device
+        bs = 64
+        try:
+            with torch.inference_mode():
+                for s in range(0, len(non_empty), bs):
+                    chunk = non_empty[s:s + bs]
+                    enc = tok([t for _, t in chunk], padding=True, truncation=True, max_length=128, return_tensors="pt").to(device)
+                    logits = mdl(**enc).logits.float()
+                    probs = (torch.sigmoid(logits) if multi_label else torch.softmax(logits, dim=-1)).cpu().numpy()
+                    for row_idx, (orig_i, _) in enumerate(chunk):
+                        out[orig_i] = self._map_text_scores_to_canon7(id2label, probs[row_idx])
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"Text emotion inference failed ({exc}); keeping acoustic emotions only")
+        return out
+
+    @staticmethod
+    def _fuse_multimodal_emotion(
+        acoustic: Optional[Dict[str, Any]],
+        text_probs: Optional[Dict[str, float]],
+        weight: float = EMOTION_TEXT_WEIGHT,
+    ) -> Optional[Dict[str, Any]]:
+        """Late probability fusion of acoustic and text emotion distributions."""
+        if text_probs is None:
+            return acoustic
+        if acoustic is None:
+            best = max(text_probs.items(), key=lambda kv: kv[1])
+            return {"emotion_category": best[0], "emotion_confidence": float(best[1]), "probs": text_probs}
+        ac_probs = acoustic.get("probs")
+        if not ac_probs:
+            return acoustic
+        ac_sum = sum(ac_probs.values()) or 1.0
+        w = max(0.0, min(1.0, float(weight)))
+        fused = {
+            c: (1.0 - w) * (ac_probs.get(c, 0.0) / ac_sum) + w * text_probs.get(c, 0.0)
+            for c in _CANON7_EMOTIONS
+        }
+        best_c, best_p = max(fused.items(), key=lambda kv: kv[1])
+        merged = dict(acoustic)
+        merged["emotion_category"] = best_c
+        merged["emotion_confidence"] = float(best_p)
+        bd = dict(merged.get("detector_breakdown") or {})
+        ac_best = max(ac_probs.items(), key=lambda kv: kv[1])
+        tx_best = max(text_probs.items(), key=lambda kv: kv[1])
+        bd["multimodal"] = {
+            "acoustic": {"emotion": ac_best[0], "confidence": round(float(ac_best[1] / ac_sum), 4)},
+            "text": {"emotion": tx_best[0], "confidence": round(float(tx_best[1]), 4)},
+            "text_weight": w,
+            "final": {"emotion": best_c, "confidence": round(float(best_p), 4)},
+        }
+        merged["detector_breakdown"] = bd
+        return merged
+
+    def extract_emotions_for_segments(
+        self,
+        audio_file: str,
+        segments: List[Dict],
+        audio: Optional[Dict] = None,
+        db_session=None,
+    ) -> List[Optional[Dict]]:
+        """Run emotion (+ optional multimodal text fusion & personal calibration) for output segment dicts."""
+        if not segments:
+            return []
+        enable_personalized = os.getenv("ENABLE_PERSONALIZED_EMOTIONS", "true").lower() == "true"
+        wav_16k = audio["waveform"][0].numpy() if audio is not None else _load_audio_16k(audio_file)
+        spans = [(s["start"], s["end"]) for s in segments]
+        raw_emotions = self._extract_emotions_batch(wav_16k, spans, audio_file, extract_embedding=enable_personalized)
+        text_emotions = self._extract_text_emotions_batch([s.get("text", "") for s in segments]) if EMOTION_TEXT_MODEL else [None] * len(segments)
+        calibrations: Dict[int, Optional[emotion_calibration.Calibration]] = {}
+        out: List[Optional[Dict]] = []
+        for seg, emo, tx_p in zip(segments, raw_emotions, text_emotions):
+            if emo and enable_personalized and db_session is not None:
+                speaker_id = seg.get("speaker_id")
+                if speaker_id is not None and speaker_id not in calibrations:
+                    calibrations[speaker_id] = self.speaker_emotion_calibration(speaker_id, db_session)
+                personal = self.calibrated_emotion(emo.get("embedding"), calibrations.get(speaker_id))
+                if personal:
+                    emo.update(
+                        emotion_category=personal["emotion"],
+                        emotion_confidence=personal["confidence"],
+                        detector_breakdown=personal["breakdown"],
+                    )
+            out.append(self._fuse_multimodal_emotion(emo, tx_p))
+        return out
+
     def transcribe_with_diarization(
         self,
         audio_file: str,
@@ -1319,6 +1712,9 @@ class SpeakerRecognitionEngine:
         cluster_speakers: Optional[bool] = None,
         diarize: bool = True,
         tracks: Optional[live_tracking.SessionTracks] = None,
+        audio: Optional[Dict] = None,
+        include_emotion: bool = True,
+        identify_speakers: bool = True,
     ) -> Dict:
         """
         Full pipeline: transcription + diarization + speaker recognition + personalized emotions
@@ -1334,28 +1730,69 @@ class SpeakerRecognitionEngine:
                 matched against the stored voices.
             tracks: a live session's speaker tracks (app/live_tracking.py): each diarization speaker of this chunk is
                 named after its session track instead of segment by segment; a segment's "track" is its track.
+            audio: Optional pre-decoded in-memory waveform dict ({"waveform", "sample_rate"}).
+            include_emotion: False skips emotion inference (faster for callers that only need words/speakers).
+            identify_speakers: False skips voice embedding extraction and speaker DB matching, returning raw
+                diarization speaker labels (SPEAKER_00, SPEAKER_01, ...).
 
         Returns:
             Dictionary with transcribed segments and speaker labels
         """
         known_speakers = known_speakers or []
-        logger.info(f"Known speakers: {len(known_speakers)}")
-        for speaker_id, speaker_name, _ in known_speakers:
-            logger.info(f"  - ID: {speaker_id}, Name: {speaker_name}")
+        if known_speakers and logger.isEnabledFor(logging.DEBUG):
+            logger.debug(f"Known speakers: {len(known_speakers)}")
+            for speaker_id, speaker_name, _ in known_speakers:
+                logger.debug(f"  - ID: {speaker_id}, Name: {speaker_name}")
 
-        # Run transcription and diarization IN PARALLEL
+        with self._inference_slot():
+            return self._transcribe_with_diarization_inner(
+                audio_file,
+                known_speakers=known_speakers,
+                threshold=threshold,
+                db_session=db_session,
+                cluster_speakers=cluster_speakers,
+                diarize=diarize,
+                tracks=tracks,
+                audio=audio,
+                include_emotion=include_emotion,
+                identify_speakers=identify_speakers,
+            )
+
+    def _get_parallel_executor(self) -> ThreadPoolExecutor:
+        executor = getattr(self, "_parallel_executor", None)
+        if executor is None:
+            executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="diar-par")
+            self._parallel_executor = executor
+        return executor
+
+    def _transcribe_with_diarization_inner(
+        self,
+        audio_file: str,
+        known_speakers: List[Tuple[int, str, np.ndarray]],
+        threshold: float,
+        db_session,
+        cluster_speakers: Optional[bool],
+        diarize: bool,
+        tracks: Optional[live_tracking.SessionTracks],
+        audio: Optional[Dict],
+        include_emotion: bool,
+        identify_speakers: bool,
+    ) -> Dict:
+        # Run transcription and diarization IN PARALLEL using a persistent 2-worker pool.
         logger.info("Running transcription and diarization in parallel...")
         start_time = time.time()
 
-        audio = _in_memory(audio_file)  # decoded once for Parakeet, pyannote and the voice embeddings
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            # Submit both tasks to run concurrently
+        if audio is None:
+            audio = _in_memory(audio_file)  # decoded once for Parakeet, pyannote, voice embeddings, and emotion
+        if diarize:
+            executor = self._get_parallel_executor()
             transcription_future = executor.submit(self.transcribe, audio_file, audio)
-            diarization_future = executor.submit(self.diarize, audio_file, audio) if diarize else None
-
-            # Wait for both to complete
+            diarization_future = executor.submit(self.diarize, audio_file, audio)
             transcription_segments = transcription_future.result()
-            diarization_result = diarization_future.result() if diarize else _one_speaker(transcription_segments)
+            diarization_result = diarization_future.result()
+        else:
+            transcription_segments = self.transcribe(audio_file, audio)
+            diarization_result = _one_speaker(transcription_segments)
 
         elapsed = time.time() - start_time
         logger.info(f"Parallel processing completed in {elapsed:.2f}s")
@@ -1368,9 +1805,7 @@ class SpeakerRecognitionEngine:
             transcription_segments = _split_by_speaker(transcription_segments, turns)
             logger.info(f"Word-level speakers: {before} transcription segments -> {len(transcription_segments)}")
 
-        # Explicit cleanup after parallel processing to free VRAM before emotion extraction
-        del transcription_future, diarization_future
-        gc.collect()
+        # Threshold-gated async GPU cleanup only (no blocking mid-request gc.collect())
         self.clear_gpu_cache_async("parallel")
 
         # Hoist settings lookups out of the per-segment loops.
@@ -1391,14 +1826,19 @@ class SpeakerRecognitionEngine:
             label = trans_seg.get("speaker_label") or _label_at_midpoint(trans_seg, diarization_result["segments"])
             kept.append(dict(trans_seg, speaker_label=label))
         widened = _snap_to_turns(kept, diarization_result["segments"]) if SNAP_TO_TURNS else kept
-        segments = [(out, out["speaker_label"], self._segment_embedding_or_none(audio, seg))
-                    for seg, out in zip(kept, widened)]
+        if identify_speakers or (OVERLAP_SEPARATION and diarize):
+            segments = [(out, out["speaker_label"], self._segment_embedding_or_none(audio, seg))
+                        for seg, out in zip(kept, widened)]
+        else:
+            segments = [(out, out["speaker_label"], None) for out in widened]
         if OVERLAP_SEPARATION and diarize:
             segments = self._recover_overlapped_speech(audio, segments, diarization_result)
 
         # Pass 2: who is speaking in each segment.
-        if tracks is not None:
-            identities = self._identify_tracks(audio, segments, diarization_result, tracks, db_session)
+        if not identify_speakers:
+            speakers = [self._speaker(label or "SPEAKER_00") for _, label, _ in segments]
+        elif tracks is not None:
+            identities = self._identify_tracks(audio, segments, diarization_result, tracks, db_session, diarize=diarize)
             speakers = [identities.get(label) or self._speaker("Unknown") for _, label, _ in segments]
         elif cluster_speakers:
             identities = self._identify_clusters(audio, segments, diarization_result, known_speakers,
@@ -1407,31 +1847,27 @@ class SpeakerRecognitionEngine:
         else:
             speakers = self._identify_segments(segments, known_speakers, threshold, db_session)
 
-        # Pass 3: emotion, then the output segment.
-        # Decode/resample the conversation audio ONCE for the emotion pass
-        # (lazy: only if any segment actually needs emotion extraction).
-        preloaded_emotion_audio = None
-        emotion_preload_failed = False
+        # Pass 3: batched emotion directly from the already-decoded 16 kHz waveform (+ optional text fusion).
+        wav_16k = audio["waveform"][0].numpy() if audio is not None and "waveform" in audio else None
+        if include_emotion and segments:
+            spans = [(trans_seg["start"], trans_seg["end"]) for trans_seg, _, _ in segments]
+            raw_emotions = self._extract_emotions_batch(
+                wav_16k, spans, audio_file, extract_embedding=enable_personalized_emotions
+            )
+            text_emotions = (
+                self._extract_text_emotions_batch([trans_seg.get("text", "") for trans_seg, _, _ in segments])
+                if EMOTION_TEXT_MODEL else [None] * len(segments)
+            )
+        else:
+            raw_emotions = [None] * len(segments)
+            text_emotions = [None] * len(segments)
+
         transcribed_with_speakers = []
         calibrations: Dict[int, Optional[emotion_calibration.Calibration]] = {}   # per speaker, for this file / chunk
 
-        for (trans_seg, speaker_label, embedding), who in zip(segments, speakers):
-            if preloaded_emotion_audio is None and not emotion_preload_failed:
-                try:
-                    preloaded_emotion_audio = self.preload_emotion_audio(audio_file)
-                    if preloaded_emotion_audio is None:
-                        emotion_preload_failed = True
-                except Exception as e:  # noqa: BLE001 - decoder/model failures use per-segment fallback
-                    logger.info(f"Emotion preload failed ({e}); falling back to per-segment decode")
-                    emotion_preload_failed = True
-
-            emotion_data = self.extract_emotion(
-                audio_file,
-                trans_seg["start"],
-                trans_seg["end"],
-                extract_embedding=enable_personalized_emotions,
-                preloaded_audio=preloaded_emotion_audio,
-            )
+        for (trans_seg, speaker_label, embedding), who, emotion_data, tx_probs in zip(
+            segments, speakers, raw_emotions, text_emotions
+        ):
             if emotion_data and enable_personalized_emotions and db_session is not None:
                 # The speaker's emotion corrections adjust how the model's scores are read for them
                 speaker_id = who.get("speaker_id")
@@ -1441,6 +1877,8 @@ class SpeakerRecognitionEngine:
                 if personal:
                     emotion_data.update(emotion_category=personal["emotion"], emotion_confidence=personal["confidence"],
                                         detector_breakdown=personal["breakdown"])
+            if tx_probs is not None:
+                emotion_data = self._fuse_multimodal_emotion(emotion_data, tx_probs)
 
             segment_data = {
                 "start": trans_seg["start"],
@@ -1621,7 +2059,7 @@ class SpeakerRecognitionEngine:
         return identities
 
     def _identify_tracks(self, audio_file, segments, diarization_result, tracks: live_tracking.SessionTracks,
-                         db_session) -> Dict[Optional[str], Dict]:
+                         db_session, diarize: bool = True) -> Dict[Optional[str], Dict]:
         """Live sessions: each diarization speaker of this chunk joins the session track of its voice and is named
         after it (live_tracking.SessionTracks.identify): a stored speaker its voice clearly matches, else another
         track's Unknown of this session, else the track's own Unknown. Decides only: nothing is written here (the
@@ -1663,6 +2101,25 @@ class SpeakerRecognitionEngine:
             who = self._speaker(name, track.speaker_id, is_known=track.speaker_id is not None
                                 and not name.startswith("Unknown_"), confidence=similarity)
             identities[label] = dict(who, track=track)
+        # In one-speaker sessions (diarize=False), a reply too short to embed (e.g. a lone "yes")
+        # inherits the session's active speaker track instead of turning into an unassigned Unknown.
+        if not diarize and len(tracks.tracks) == 1:
+            sole_track = tracks.tracks[0]
+            if db_session is not None:
+                self._follow_user([sole_track], db_session, names, tracks.conversation_id)
+            sole_name = names.get(sole_track.speaker_id, "Unknown")
+            sole_who = dict(
+                self._speaker(
+                    sole_name,
+                    sole_track.speaker_id,
+                    is_known=sole_track.speaker_id is not None and not sole_name.startswith("Unknown_"),
+                    confidence=1.0,
+                ),
+                track=sole_track,
+            )
+            for _, label, _ in segments:
+                if label not in identities:
+                    identities[label] = dict(sole_who)
         return identities
 
     @staticmethod
